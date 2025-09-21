@@ -1,0 +1,155 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{amsmath, amssymb}
+\usepackage{listings}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.6em}{}
+
+\title{\LARGE Design and Implementation of TBCX:\\ A Bytecode Serialization Framework for Tcl 9.1}
+\author{\normalsize Miguel Bañón}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This paper presents \texttt{tbcx}, a library that serializes and deserializes Tcl~9.1 bytecode into a compact, portable binary format (TBCX). The library allows scripts to be compiled once and then stored, transmitted, and quickly restored into a running interpreter. We describe the Tcl 9.1 bytecode model, the full save/load pipeline (\texttt{tbcx::save}, \texttt{tbcx::load}), the function-level architecture, and performance/portability considerations (including a little-endian fast path). We also provide guidance for future maintainers and an executable appendix for hands-on testing using \texttt{tbcx::savefile}/\texttt{tbcx::loadfile}.
+\end{abstract}
+
+\section{Introduction}
+Tcl compiles scripts to bytecode at runtime and caches the result, but this compiled form traditionally does not persist across processes. \texttt{tbcx} addresses that gap with a robust serializer and loader for Tcl~9.1 bytecode. The accompanying disassembler (\texttt{tbcxdump.c}) helps validate and inspect generated TBCX streams.
+
+\section{Tcl 9.1 Bytecode Compiler (Background)}
+A compiled script is represented by a \texttt{ByteCode} structure holding: (i) a linear instruction array, (ii) a literal table of \texttt{Tcl\_Obj} constants, (iii) \texttt{AuxData} (e.g., jump tables, dict update descriptors, foreach metadata), (iv) exception ranges, and (v) metadata (max stack, number of locals, namespace). The dumper shows the instruction set and decoded structures for analysis.
+
+\section{Serialization with \texttt{tbcx::save}}
+The serializer lives in \texttt{tbcxsave.c} and is orchestrated by \texttt{EmitTopLevelAndProcs}, which scans, compiles, and emits all components of a script to a TBCX stream.
+
+\subsection{Entry Points and High-Level Flow}
+User-facing commands (all funneled through \texttt{EmitTopLevelAndProcs} after opening/obtaining a Tcl channel): \texttt{tbcx::save}, \texttt{tbcx::savechan}, and \texttt{tbcx::savefile}.
+
+\begin{enumerate}
+  \item \textbf{Proc capture (static + dynamic).} Static \texttt{proc} forms are parsed by \texttt{CollectProcsFromScript}; dynamic forms (created at runtime) are captured by running the script in a child interpreter via \texttt{CollectProcsByEval}; lists are deduplicated with \texttt{MergeProcLists}.
+  \item \textbf{Top-level filtering and compile.} The script is filtered to remove redundant proc creation forms (\texttt{BuildTopLevelFiltered}) and compiled to \texttt{ByteCode} with \texttt{GetByteCodeFromScript}.
+  \item \textbf{Header and core blocks.} \texttt{WriteHeaderEx} emits the \texttt{TbcxHeader} (magic/format/flags, lengths, counts, locals, stack). Then the raw bytecode, literals (\texttt{WriteLiteral}), supported AuxData (\texttt{WriteAux}), and exception ranges are written; \texttt{AssertAuxCoverage} ensures only supported Aux kinds appear.
+  \item \textbf{Procedures.} Each proc body is compiled via \texttt{CompileProcBodyForSave} (backed by the core compiler), optionally patched by \texttt{PeepholeNeutralizeProcCreates} to neutralize embedded \texttt{proc} creation sequences, and then emitted (code, literals, aux, ranges, max stack, local count).
+  \item \textbf{OO constructs.} Classes/methods are collected both statically (\texttt{CollectOOFromScript}) and dynamically (\texttt{CollectOOByEval}); lists are merged via \texttt{MergeClassLists}/\texttt{MergeMethLists}; method bodies are compiled with \texttt{CompileMethodBodyForSave} prior to emission.
+  \item \textbf{Namespace bodies.} \texttt{ScanNamespaceEvalBodies} finds \texttt{namespace eval} sites by scanning bytecode; \texttt{CompileNsBodyForSave} compiles those bodies and they are serialized with their target namespace and literal index for reattachment on load.
+\end{enumerate}
+
+\subsection{Serialization Helpers}
+Low-level writers \texttt{wr}/\texttt{wr1}/\texttt{wr4}/\texttt{wr8} wrap \texttt{Tcl\_WriteRaw}; \texttt{WriteLiteral} handles booleans/ints/doubles/bignums/bytearrays/lists/dicts/strings; \texttt{WriteAux\_*} serializes jump tables (string/num), dict-update, and foreach metadata; \texttt{AssertAuxCoverage} checks completeness.
+
+\subsection{Lambda Serialization and Upgrade}
+Anonymous functions (“lambdas”) are represented as list literals like \texttt{\{argList body\}} (optionally with namespace). \textbf{On save}, lambdas are not tagged specially; they are serialized as ordinary lists by \texttt{WriteLiteral}, keeping the format simple.
+\textbf{On load}, lambdas are “upgraded” by \texttt{PrewarmLambdaLiterals}, which scans literal tables and converts lambda-shaped values to compiled bytecode (\texttt{tbcxTyLambda $\rightarrow$ tbcxTyBytecode}) so later calls are fast.
+
+\section{Deserialization and Execution with \texttt{tbcx::load}}
+Loading lives in \texttt{tbcxload.c}. Both \texttt{tbcx::loadfile} and \texttt{tbcx::loadchan} call \texttt{LoadFromChannel}, which reconstructs all blocks and then executes the top-level.
+
+\subsection{Top-Level Flow}
+\begin{enumerate}
+  \item \textbf{Header and validation.} Read/validate \texttt{TbcxHeader} (magic/format/bounds).
+  \item \textbf{Top-level \texttt{ByteCode}.} \texttt{ReadByteCode} allocates a fresh \texttt{ByteCode}, copies raw instruction bytes, rebuilds literals (\texttt{ReadOneLiteral}), decodes AuxData (\texttt{GetAuxTypeByKind}), exception ranges, and finalizes. \texttt{TbcxFinalizeByteCode} marks it precompiled and wires interpreter/namespace epochs.
+  \item \textbf{Procedures.} For each proc, \texttt{ReadByteCode} loads the body; \texttt{InstallPrecompiledProc} creates a proc, attaches the precompiled body (\texttt{ByteCodeSetInternalRep}), and sets \texttt{numCompiledLocals}.
+  \item \textbf{Classes/methods.} Classes via \texttt{oo::class create}, superclasses via \texttt{oo::define superclass}; methods are bound by wrapping compiled bodies in \texttt{Tcl\_Obj}s and issuing \texttt{oo::define method/constructor/destructor}.
+  \item \textbf{Namespace bodies.} Nested \texttt{namespace eval} blocks are loaded as \texttt{ByteCode} and reattached at their literal indices; \texttt{EnsureNamespaceFromString} resolves or creates the target namespaces.
+  \item \textbf{Execution.} The top-level block is installed as a temporary proc and invoked; the wrapper is then removed.
+\end{enumerate}
+
+\subsection{Supporting Functions and Safety}
+\texttt{ReadOneLiteral} reconstructs booleans, (wide)ints, doubles, bignums, byte arrays, lists, dicts (with bounds checks). \texttt{PrewarmLambdaLiterals} upgrades lambda lists to compiled form. \texttt{FreeLoadedByteCode} cleans up on error.
+
+\section{Performance and Portability}
+\subsection{Endian-Stable Encoding with LE Fast Path}
+All multibyte integers in TBCX are serialized little-endian. On little-endian hosts, \texttt{putle32}/\texttt{putle64} become raw \texttt{memcpy} (no byte swaps); on big-endian hosts, \texttt{TBCX\_BSWAP32}/\texttt{TBCX\_BSWAP64} ensure correctness. Host endianness is detected via \texttt{tbcxHostIsLE}, and read helpers \texttt{le16}/\texttt{le32}/\texttt{le64} mirror this symmetry.
+
+\subsection{Direct Channel I/O and Minimal Copies}
+Writers \texttt{wr}/\texttt{wr1}/\texttt{wr4}/\texttt{wr8} call \texttt{Tcl\_WriteRaw} directly; readers use \texttt{ReadAll} to fetch exact blocks with bounds checks. This minimizes copies and surprises from buffering.
+
+\subsection{Precompiled Attachment \& Epoch Wiring}
+\texttt{TbcxFinalizeByteCode} marks blocks as precompiled and attaches interpreter/namespace epochs so the engine can skip parsing/compilation and keep resolution in sync. Bodies are attached via \texttt{ByteCodeSetInternalRep} where appropriate.
+
+\subsection{Semantic Peephole Patching}
+\texttt{PeepholeNeutralizeProcCreates} replaces embedded proc-creation sequences with benign forms so load does not replay definitions, preserving semantics and trimming load time.
+
+\subsection{Header Layout (for reference)}
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Header Field} & \textbf{Description} \\
+\hline
+Magic (32b) & TBCX identifier \\
+Format (32b) & Version (9 for Tcl 9.1) \\
+Flags (32b) & Reserved (V1 = 0) \\
+CodeLen (64b) & Top-level bytecode length \\
+NumCmds (32b) & Number of compiled commands \\
+NumExcept (32b) & Exception ranges \\
+NumLiterals (32b) & Literal count \\
+NumAux (32b) & Aux data count \\
+NumLocals (32b) & Local variable slots \\
+MaxStack (32b) & Maximum stack depth \\
+\hline
+\end{tabular}
+\end{center}
+\noindent See \texttt{TbcxHeader} in \texttt{tbcx.h}.
+
+\section{Guidance for Future Maintainers}
+\textbf{Types/Aux coverage.} Extend serializer/deserializer when Tcl adds new \texttt{AuxData} or literal types; see \texttt{AssertAuxCoverage} and the reader’s \texttt{GetAuxTypeByKind}.
+
+\noindent\textbf{Namespaces.} Use \texttt{EnsureNamespaceFromString} for predictable resolution/creation; avoid surprising globals.
+
+\noindent\textbf{Memory management.} Manage refcounts for literals; free Aux client data. \texttt{FreeLoadedByteCode} shows the correct teardown path.
+
+\noindent\textbf{Channels/pipelines.} Prefer \texttt{savechan}/\texttt{loadchan} to plumb compression, encryption, or authentication without changing the TBCX format. Initialization wires public commands in \texttt{tbcx.c}.
+
+\section{Conclusion}
+\texttt{tbcx} brings persistent, portable bytecode to Tcl~9.1 with a clear, symmetric save/load design and strong performance characteristics (LE fast path, precompiled attachment, and semantic patching). The library is suitable for large applications seeking faster startup, code distribution, and secure deployment, and provides a maintainable foundation for future evolution.
+
+\appendix
+\section*{Appendix: Hands-On Round-Trip (Tcl Shell)}
+\subsection*{Sample Source (\texttt{app.tcl})}
+\begin{lstlisting}[language=tcl]
+namespace eval ::demo {
+  proc greet {name} { return "Hello, $name!" }
+}
+
+oo::class create ::demo::Greeter {
+  constructor {who} { set myWho $who }
+  method hello {} { return "Hello from [info object class [self]]" }
+}
+\end{lstlisting}
+
+\subsection*{Compile \& Save}
+\begin{lstlisting}[language=tcl]
+package require tbcx
+tbcx::savefile app.tcl app.tbcx
+\end{lstlisting}
+\noindent Internally, \texttt{savefile} compiles the input and writes: header, top-level block, procs, classes/methods, and namespace bodies (\texttt{Tbcx\_SaveFileObjCmd} $\rightarrow$ \texttt{EmitTopLevelAndProcs}).
+
+\subsection*{Load \& Run}
+\begin{lstlisting}[language=tcl]
+package require tbcx
+tbcx::loadfile app.tbcx
+
+demo::greet World
+# -> Hello, World!
+
+set obj [::demo::Greeter new "Ada"]
+$obj hello
+\end{lstlisting}
+\noindent \texttt{tbcx::loadfile} reconstructs the top-level block, installs precompiled proc bodies, creates classes, binds methods, and attaches namespace-eval bodies (\texttt{LoadFromChannel}, \texttt{InstallPrecompiledProc}, \texttt{ReadByteCode}).
+
+\section*{Acknowledgments}
+Thanks to the Tcl core for public/internal APIs enabling safe precompilation and to the reviewers who improved the serializer/loader design.
+
+\end{document}

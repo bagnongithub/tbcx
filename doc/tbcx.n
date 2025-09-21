@@ -1,0 +1,210 @@
+\" -*- nroff -*-
+'\"
+'\" tbcx(n) -- Save, load, dump, and execute Tcl bytecode files (Tcl 9.1+ extension)
+'\"
+.TH tbcx n 1.0 "September 2025" "tbcx 1.0"
+.SH NAME
+tbcx \- Save, load, dump, and execute precompiled Tcl bytecode files.
+.SH SYNOPSIS
+.BS
+.PP
+.nf
+package require tbcx 1.0
+.fi
+.PP
+.nf
+\fBtbcx::save\fR \fIscript file\fR
+\fBtbcx::savefile\fR \fIsourceFile file\fR
+\fBtbcx::savechan\fR \fIscript channelId\fR
+\fBtbcx::loadfile\fR \fIfile\fR
+\fBtbcx::loadchan\fR \fIchannelId\fR
+\fBtbcx::dump\fR \fIfile\fR
+.fi
+.BE
+.SH DESCRIPTION
+.PP
+The \fBtbcx\fR package provides commands and a compact binary format
+(\fITBCX\fR) to save a Tcl script in \fIcompiled bytecode\fR form and later load
+and execute that precompiled code. This reduces startup time and enables
+distribution of Tcl code in compiled form. Files typically use the
+\fB.tbcx\fR extension.
+.PP
+When a TBCX file is \fIloaded\fR, the library creates a temporary wrapper
+procedure for the top-level bytecode, executes it, and deletes it again
+(so top-level effects are applied once). Procedures recorded in the file are
+recreated with their compiled bodies; TclOO classes and methods may also be
+recreated if present; and certain \fBnamespace eval\fR bodies are attached in
+compiled form to the corresponding string literals (see \fBFILE FORMAT OVERVIEW\fR
+below). \fBtbcx::dump\fR renders a human-readable disassembly for inspection and
+debugging.
+.SH COMMANDS
+.TP
+\fBtbcx::save \fIscript file\fR
+Compile \fIscript\fR (a string containing Tcl commands) to bytecode and write
+it to \fIfile\fR in the TBCX binary format. The output file is created or
+overwritten. The script is not executed during saving. On success the result is
+empty. Errors are reported if the script fails to compile or the file cannot be
+written.  (Implements header, top-level body, proc/OO/method sections, and
+optional \fBnamespace eval\fR bodies.)
+.TP
+\fBtbcx::savefile \fIsourceFile file\fR
+Read the Tcl script from \fIsourceFile\fR, compile it to bytecode, and write
+the result to \fIfile\fR in TBCX format. Returns the normalized output path on
+success.
+.TP
+\fBtbcx::savechan \fIscript channelId\fR
+Compile \fIscript\fR and write the resulting TBCX payload to the open writable
+channel \fIchannelId\fR. The command forces binary translation
+(\fB\-translation binary\fR). The channel remains open. The result is empty on
+success.
+.TP
+\fBtbcx::loadfile \fIfile\fR
+Open \fIfile\fR, read a TBCX payload, recreate any procs/classes contained
+within, attach precompiled \fBnamespace eval\fR bodies when available, and
+execute the top-level compiled code exactly once. The result is empty on
+success.
+.TP
+\fBtbcx::loadchan \fIchannelId\fR
+Read a TBCX payload from an already-open readable channel \fIchannelId\fR,
+recreate procs/classes, attach \fBnamespace eval\fR bodies, and execute the
+top-level code. The command forces binary translation. The channel is left open.
+The result is empty on success.
+.TP
+\fBtbcx::dump \fIfile\fR
+Read \fIfile\fR (a TBCX payload) and produce a textual dump: header, disassembly
+of the top-level bytecode (with literals/aux/exception ranges), followed by any
+compiled procs and any TclOO classes/methods stored in the file. The dump is
+intended for debugging and format exploration.
+.SH OPTIONS
+.PP
+The \fBtbcx\fR commands take only positional arguments as shown above; there are
+no additional switches.
+.SH EVALUATION CONTEXT AND NAMESPACES
+.PP
+Top-level compiled code executes in the caller's \fIcurrent namespace\fR via a
+temporary wrapper proc that is created, invoked by absolute name, and then
+deleted.
+.PP
+Procedures are recreated at their \fIfully-qualified names\fR as recorded in the
+file; their compiled bodies (ByteCode) are installed directly without
+recompiling the string body.
+.PP
+If the file contains TclOO classes and methods, the loader issues the equivalent
+of \fBoo::class create\fR and subsequent \fBoo::define ... superclass\fR and
+\fBoo::define ... method/constructor/destructor\fR calls to reconstruct them,
+using the stored compiled bodies (also retaining the original body text as the
+string representation for fallback).
+.PP
+When present, captured \fBnamespace eval\fR bodies are compiled under their
+recorded namespace and attached to the corresponding top-level literal objects
+so that subsequent evaluation uses the precompiled form while preserving the
+string rep.
+.SH FILE FORMAT OVERVIEW
+.PP
+TBCX files target Tcl 9.1 bytecodes and currently contain the following sections:
+.RS
+.IP \(bu 3
+Header (magic, format, flags, sizes).
+.IP \(bu 3
+Top-level bytecode block: code bytes, literals, supported AuxData, exception
+ranges, and bookkeeping (maxStack/locals).
+.IP \(bu 3
+Zero or more \fIproc\fR entries: each stores the fully-qualified name, its
+defining namespace, the formal argument list, and a packed bytecode block for
+the body.
+.IP \(bu 3
+Zero or more \fIclass\fR entries (TclOO): class FQN and optional list of
+superclasses.
+.IP \(bu 3
+Zero or more \fImethod\fR entries (TclOO): class FQN, kind
+(method/constructor/destructor), method name (if any), formal arguments, the
+original body text (retained as a string rep), and a packed bytecode block for
+the compiled body.
+.IP \(bu 3
+Optional \fBnamespace eval\fR body section: pairs of (literal index of the body
+in the top-level literal table, namespace name) followed by a packed bytecode
+block compiled for that namespace. On load, these are attached to the matching
+top-level literal objects.
+.RE
+.PP
+Literals supported in the stream include empty/non-empty strings, wide integers,
+doubles, bignums, unsigned 64-bit integers (widening to bignum when needed),
+booleans, bytearrays, lists, and dicts; nested aggregate literals are
+serialized recursively.
+.PP
+AuxData items currently supported in the serializer/loader include:
+\fIJumpTable[str]\fR and \fIJumpTable[num]\fR, \fIDictUpdateInfo\fR, and
+\fIForeachInfo\fR (both the modern and legacy names). Unsupported AuxData causes
+saving to fail with a descriptive error.
+.SH RETURN VALUES
+.PP
+All commands return the empty string on success (except \fBsavefile\fR, which
+returns the normalized path) and raise a Tcl error on failure.
+.SH LIMITATIONS
+.IP \(bu 3
+TBCX payloads are specific to Tcl 9.1 internal bytecode structures. There is no
+guarantee they will load under other major versions.
+.IP \(bu 3
+The loader executes top-level code immediately upon load via a temporary proc;
+this is by design and matches \fBsource\fR semantics. Load only trusted files.
+.IP \(bu 3
+Line/command location maps are not embedded; error messages may lack precise
+source line references.  (Implementation sets \fInumSrcBytes\fR and related
+fields to zero for precompiled bodies.)
+.IP \(bu 3
+The dumper currently disassembles header, top-level, procs, and OO classes /
+methods. It does not yet list the \fBnamespace eval\fR body section.
+.SH SECURITY CONSIDERATIONS
+.PP
+A TBCX file contains executable bytecode. Loading a TBCX file executes its
+top-level code and installs procedures/classes. Only load content from trusted
+sources.
+.SH EXAMPLES
+.PP
+Save a script (provided as a string) to TBCX, load it, and inspect it:
+.PP
+.nf
+set code {
+    namespace eval ::pkg {
+        proc greet {name} { puts "Hello, $name" }
+    }
+    ::pkg::greet World
+}
+
+# Save compiled payload
+tbcx::save $code hello.tbcx
+
+# ... later, possibly in a new interpreter session ...
+# Load from file
+tbcx::loadfile hello.tbcx
+
+# Dump to inspect the contents
+set dump [tbcx::dump hello.tbcx]
+puts $dump
+.fi
+.PP
+Stream to/from a channel:
+.PP
+.nf
+# Writer side
+set s [socket -server accept 0]
+proc accept {chan addr port} {
+    fconfigure $chan -translation binary
+    tbcx::savechan {proc f {} {puts ok}} $chan
+    close $chan
+}
+
+# Reader side
+set ch [socket localhost $port]
+fconfigure $ch -translation binary
+tbcx::loadchan $ch
+close $ch
+.fi
+.SH SEE ALSO
+source(n), proc(n), namespace(n), oo::class(n), oo::define(n)
+.SH KEYWORDS
+bytecode, compile, load, save, dump, channel, packaging, TclOO
+.SH COPYRIGHT
+MIT License
+
+Copyright (c) 2025 Miguel Banon
