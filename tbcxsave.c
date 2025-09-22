@@ -311,7 +311,16 @@ static void WriteLiteral(Tcl_Channel ch, Tcl_Obj *o) {
 
     if ((tp == tbcxTyBignum) || (tp && strcmp(tp->name, "bignum") == 0)) {
         mp_int big;
-        if (Tcl_GetBignumFromObj(NULL, o, &big) == TCL_OK) {
+        if (mp_count_bits(&big) <= 63) {
+            /* Fits in signed 64-bit (including negatives): emit WIDEINT */
+            Tcl_WideInt w;
+            if (Tcl_GetWideIntFromObj(NULL, o, &w) == TCL_OK) {
+                wr1(ch, (unsigned char)TBCX_LIT_WIDEINT);
+                wr8(ch, (uint64_t)w);
+                mp_clear(&big);
+                return;
+            }
+        } else if (!mp_isneg(&big) && mp_count_bits(&big) <= 64) {
             if (!mp_isneg(&big) && mp_count_bits(&big) <= 64) {
                 unsigned char be[8]   = {0};
                 size_t        n       = mp_ubin_size(&big);
@@ -2552,6 +2561,17 @@ int Tbcx_SaveObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const 
         return TCL_ERROR;
     int rc = EmitTopLevelAndProcs(interp, objv[1], ch);
     Tcl_Close(NULL, ch);
+
+    if (rc == TCL_OK) {
+        Tcl_Obj *norm = Tcl_FSGetNormalizedPath(interp, objv[2]);
+        if (norm) {
+            Tcl_IncrRefCount(norm);
+            Tcl_SetObjResult(interp, norm);
+            Tcl_DecrRefCount(norm);
+        } else {
+            Tcl_SetObjResult(interp, objv[2]);
+        }
+    }
     return rc;
 }
 

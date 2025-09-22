@@ -1,0 +1,252 @@
+# -*-Tcl-*-
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# --- Literals ---------------------------------------------------------------
+
+test sl-1.1 {LIT: STRING} -body {
+    set in  [makeFile {return "hello"} sl-11-in.tcl]
+    set out [makeFile "" sl-11-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result hello
+
+test sl-1.2 {LIT: BOOLEAN (true/false)} -body {
+    set in  [makeFile {return [list [expr {true || true}] [expr {false && false}]]} sl-12-in.tcl]
+    set out [makeFile "" sl-12-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {1 0}
+
+test sl-1.3 {LIT: WIDEINT (signed 64)} -body {
+    set in  [makeFile {return [expr {9223372036854775807}]} sl-13-in.tcl]
+    set out [makeFile "" sl-13-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 9223372036854775807
+
+test sl-1.4 {LIT: DOUBLE} -body {
+    set in  [makeFile {return [expr {1.25}]} sl-14-in.tcl]
+    set out [makeFile ""                     sl-14-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 1.25
+
+test sl-1.5 {LIT: LIST} -body {
+    set in  [makeFile {set L [list a 1 b 2]; return $L} sl-15-in.tcl]
+    set out [makeFile ""                               sl-15-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {a 1 b 2}
+
+test sl-1.6 {LIT: DICT} -body {
+    set in  [makeFile {return [dict create a 1 b 2]} sl-16-in.tcl]
+    set out [makeFile ""                             sl-16-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {a 1 b 2}
+
+test sl-1.7 {LIT: BIGNUM (>64 bits)} -body {
+    set in  [makeFile {return [expr {2**128}]} sl-17-in.tcl]
+    set out [makeFile ""                       sl-17-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 340282366920938463463374607431768211456
+
+test sl-1.8 {LIT: WIDEUINT (unsigned 64 bits)} -body {
+    set in  [makeFile {return 18446744073709551615} sl-18-in.tcl]
+    set out [makeFile ""                             sl-18-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 18446744073709551615
+
+test sl-1.9 {LIT: BYTEARRAY} -body {
+    set in  [makeFile {
+        set ba [binary format c* {1 2 3}]
+        return [binary encode hex $ba]
+    } sl-19-in.tcl]
+    set out [makeFile "" sl-19-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 010203
+
+cleanupTests
+
+# --- AuxData kinds ----------------------------------------------------------
+
+test sl-2.1 {AUX: JumpTable (string switch)} -body {
+    set in  [makeFile {
+        set x alpha
+        return [switch -exact -- $x {alpha 11 beta 22 default 33}]
+    } sl-21-in.tcl]
+    set out [makeFile "" sl-21-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 11
+
+test sl-2.2 {AUX: JumpTable (numeric switch)} -body {
+    set in  [makeFile {
+        set n 2
+        return [switch -exact -- $n {1 111 2 222 3 333 default 444}]
+    } sl-22-in.tcl]
+    set out [makeFile "" sl-22-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 222
+
+test sl-2.3 {AUX: DictUpdateInfo} -body {
+    set in  [makeFile {
+        set d [dict create a 1 b 2]
+        dict update d a av b bv {
+            set av 10
+            set bv 20
+        }
+        return [list $d $av $bv]
+    } sl-23-in.tcl]
+    set out [makeFile "" sl-23-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {{a 10 b 20} 10 20}
+
+test sl-2.4 {AUX: ForeachInfo (multiple lists)} -body {
+    set in  [makeFile {
+        set sum 0
+        foreach i {1 2} j {3 4} {
+            incr sum $i
+            incr sum $j
+        }
+        return $sum
+    } sl-24-in.tcl]
+    set out [makeFile "" sl-24-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 10
+
+cleanupTests
+
+# --- Procs & Namespace bodies ----------------------------------------------
+
+test sl-3.1 {PROC: static proc} -body {
+    set in  [makeFile {
+        proc up {s} {string toupper $s}
+        return [up hello]
+    } sl-31-in.tcl]
+    set out [makeFile "" sl-31-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result HELLO
+
+test sl-3.2 {PROC: dynamic proc (name/args/body at runtime)} -body {
+    set in  [makeFile {
+        set cname dyn2
+        set cargs {x}
+        set cbody {format "dyn2:%s" $x}
+        proc $cname $cargs $cbody
+        return [$cname 5]
+    } sl-32-in.tcl]
+    set out [makeFile "" sl-32-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {dyn2:5}
+
+test sl-3.3 {NAMESPACE BODY: namespace eval body compiled + executed} -body {
+    set in  [makeFile {
+        namespace eval N {
+            proc nsproc {x} {format "ns:%s" $x}
+        }
+        return [N::nsproc hi]
+    } sl-33-in.tcl]
+    set out [makeFile "" sl-33-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {ns:hi}
+
+cleanupTests
+
+# --- OO: classes, methods, ctor/dtor, superclass ---------------------------
+
+test sl-4.1 {OO: class with method in body} -body {
+    set in  [makeFile {
+        oo::class create C {
+            method add {a b} {expr {$a + $b}}
+        }
+        set o [C new]
+        set r [$o add 2 3]
+        $o destroy
+        return $r
+    } sl-41-in.tcl]
+    set out [makeFile "" sl-41-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 5
+
+test sl-4.2 {OO: method added via oo::define} -body {
+    set in  [makeFile {
+        oo::class create D {}
+        oo::define D method mul {a b} {expr {$a * $b}}
+        set o [D new]
+        set r [$o mul 3 4]
+        $o destroy
+        return $r
+    } sl-42-in.tcl]
+    set out [makeFile "" sl-42-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 12
+
+test sl-4.3 {OO: constructor runs} -body {
+    set in  [makeFile {
+        set ::ctor 0
+        oo::class create E {
+            constructor {x} { set ::ctor $x }
+        }
+        set o [E new 7]
+        $o destroy
+        return $::ctor
+    } sl-43-in.tcl]
+    set out [makeFile "" sl-43-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 7
+
+test sl-4.4 {OO: destructor runs} -body {
+    set in  [makeFile {
+        set ::dtor 0
+        oo::class create F {
+            destructor { set ::dtor 1 }
+        }
+        set o [F new]
+        $o destroy
+        return $::dtor
+    } sl-44-in.tcl]
+    set out [makeFile "" sl-44-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 1
+
+test sl-4.5 {OO: superclass recorded and restored} -body {
+    set in  [makeFile {
+        oo::class create P {}
+        oo::class create Q {}
+        oo::define Q superclass P
+        return [lindex [info class superclasses Q] 0]
+    } sl-45-in.tcl]
+    set out [makeFile "" sl-45-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result ::P
+
+cleanupTests
+
+# --- Lambdas ---------------------------------------------------------------
+
+test sl-5.1 {LAMBDA: apply} -body {
+    set in  [makeFile {return [apply {x} {expr {$x * 3}} 14]} sl-51-in.tcl]
+    set out [makeFile "" sl-51-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 42
+
+cleanupTests

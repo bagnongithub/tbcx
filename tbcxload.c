@@ -2,10 +2,6 @@
  * tbcxload.c
  */
 
-/* ==========================================================================
- * Section: Namespace & ByteCode lifecycle
- * ========================================================================== */
-
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -14,11 +10,11 @@
 
 #include "tbcx.h"
 
-#ifndef TCL_CREATE_NS_IF_UNKNOWN
-#define TCL_CREATE_NS_IF_UNKNOWN 0
-#endif
-
 typedef enum { TBCX_SRC_TOP, TBCX_SRC_PROC } TbcxBCSource;
+
+/* ==========================================================================
+ * Section: Namespace & ByteCode lifecycle
+ * ========================================================================== */
 
 /*
  * EnsureNamespaceFromString
@@ -33,7 +29,7 @@ static Tcl_Namespace *EnsureNamespaceFromString(Tcl_Interp *interp, const char *
     Namespace  *containerNs = NULL, *dummyActual = NULL, *dummyAlt = NULL;
     const char *simple = NULL;
 
-    TclGetNamespaceForQualName(interp, nsName, (Namespace *)Tcl_GetGlobalNamespace(interp), TCL_CREATE_NS_IF_UNKNOWN, &containerNs, &dummyAlt, &dummyActual, &simple);
+    TclGetNamespaceForQualName(interp, nsName, (Namespace *)Tcl_GetGlobalNamespace(interp), 0, &containerNs, &dummyAlt, &dummyActual, &simple);
     (void)simple;
 
     if (!containerNs) {
@@ -109,42 +105,6 @@ static void TbcxFinalizeByteCode(ByteCode *bc, Tcl_Interp *interp, size_t codeLe
 /* ==========================================================================
  * Section: Deserialization helpers (I/O + literals)
  * ========================================================================== */
-
-static void PrewarmLambdaLiterals(Tcl_Interp *interp, Tcl_Obj **lits, Tcl_Size n) {
-    if (!lits || n <= 0 || !tbcxTyLambda)
-        return;
-
-    for (Tcl_Size i = 0; i < n; ++i) {
-        Tcl_Obj *o = lits[i];
-        if (!o)
-            continue;
-
-        Tcl_Size  ll = 0;
-        Tcl_Obj **ve = NULL;
-        if (Tcl_ListObjGetElements(NULL, o, &ll, &ve) != TCL_OK) {
-            continue;
-        }
-        if (ll != 2 && ll != 3)
-            continue;
-
-        Tcl_Size argsN = 0;
-        (void)Tcl_ListObjLength(NULL, ve[0], &argsN);
-
-        if (Tcl_ConvertToType(interp, o, tbcxTyLambda) != TCL_OK) {
-            Tcl_ResetResult(interp);
-            continue;
-        }
-
-        const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(o, tbcxTyLambda);
-        if (!ir)
-            continue;
-        Proc *procPtr = (Proc *)ir->twoPtrValue.ptr1;
-        if (procPtr && procPtr->bodyPtr) {
-            (void)Tcl_ConvertToType(interp, procPtr->bodyPtr, tbcxTyBytecode);
-            Tcl_ResetResult(interp);
-        }
-    }
-}
 
 /*
  * ReadAll
@@ -400,17 +360,61 @@ static int ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj) 
  * Section: Deserialization: ByteCode blocks
  * ========================================================================== */
 
-/*
- * ReadByteCode
- * Deserialize a ByteCode block (top-level or nested) from TBCX.
- */
-
 #define R(n, buf)                                                                                                                                                                                      \
     do {                                                                                                                                                                                               \
         if (!ReadAll(ch, (unsigned char *)(buf), (Tcl_Size)(n)))                                                                                                                                       \
             goto io_fail;                                                                                                                                                                              \
     } while (0)
 #define R1(b) R(1, &(b))
+
+/*
+ * PrewarmLambdaLiterals
+ *
+ * Pre-scan a list of candidate lambda literals, validate their list form, convert them to the
+ * custom lambda internal rep, and JIT/byte-compile their bodies upfront to prime the interpreter
+ * and avoid runtime conversion costs.
+ */
+
+static void PrewarmLambdaLiterals(Tcl_Interp *interp, Tcl_Obj **lits, Tcl_Size n) {
+    if (!lits || n <= 0 || !tbcxTyLambda)
+        return;
+
+    for (Tcl_Size i = 0; i < n; ++i) {
+        Tcl_Obj *o = lits[i];
+        if (!o)
+            continue;
+
+        Tcl_Size  ll = 0;
+        Tcl_Obj **ve = NULL;
+        if (Tcl_ListObjGetElements(NULL, o, &ll, &ve) != TCL_OK) {
+            continue;
+        }
+        if (ll != 2 && ll != 3)
+            continue;
+
+        Tcl_Size argsN = 0;
+        (void)Tcl_ListObjLength(NULL, ve[0], &argsN);
+
+        if (Tcl_ConvertToType(interp, o, tbcxTyLambda) != TCL_OK) {
+            Tcl_ResetResult(interp);
+            continue;
+        }
+
+        const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(o, tbcxTyLambda);
+        if (!ir)
+            continue;
+        Proc *procPtr = (Proc *)ir->twoPtrValue.ptr1;
+        if (procPtr && procPtr->bodyPtr) {
+            (void)Tcl_ConvertToType(interp, procPtr->bodyPtr, tbcxTyBytecode);
+            Tcl_ResetResult(interp);
+        }
+    }
+}
+
+/*
+ * ReadByteCode
+ * Deserialize a ByteCode block (top-level or nested) from TBCX.
+ */
 
 static int ReadByteCode(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *nsPtr, TbcxBCSource src, const TbcxHeader *topHdr, uint32_t formatIfProc, ByteCode **out, uint32_t *outNumLocals) {
     unsigned char   b4[4];
@@ -679,7 +683,7 @@ io_fail:
 static int InstallPrecompiledProc(Tcl_Interp *interp, Tcl_Namespace *targetNs, const char *fqName, const char *argSpec, ByteCode *bc, uint32_t numLocals, Tcl_Command *outTok) {
     Namespace  *containerNs = NULL, *dummyActual = NULL, *dummyAlt = NULL;
     const char *simple = NULL;
-    TclGetNamespaceForQualName(interp, fqName, (Namespace *)targetNs, TCL_CREATE_NS_IF_UNKNOWN, &containerNs, &dummyAlt, &dummyActual, &simple);
+    TclGetNamespaceForQualName(interp, fqName, (Namespace *)targetNs, 0, &containerNs, &dummyAlt, &dummyActual, &simple);
     if (!containerNs) {
         containerNs = (Namespace *)targetNs;
     }
