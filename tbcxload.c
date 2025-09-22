@@ -1189,63 +1189,57 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
     topBC->compileEpoch = ((Interp *)interp)->compileEpoch;
     topBC->nsEpoch      = topBC->nsPtr ? topBC->nsPtr->resolverEpoch : 0;
 
-    {
-        static unsigned long tbcxTopSeq = 0;
-        char                 simpleName[64];
-        snprintf(simpleName, sizeof(simpleName), "__tbcx_top_%lu", ++tbcxTopSeq);
+    Tcl_Obj *scriptObj  = Tcl_NewObj();
+    if (scriptObj == NULL) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: OOM creating script object", -1));
+        goto fail_top;
+    }
+    Tcl_IncrRefCount(scriptObj);
+    topBC->refCount = 1;
+    ByteCodeSetInternalRep(scriptObj, tbcxTyBytecode, topBC);
+    topBC              = NULL;
 
-        Tcl_Command createdTok = NULL;
+    const char *nsFull = ((Namespace *)nsPtr)->fullName;
+    if (!nsFull)
+        nsFull = "::";
+    Tcl_Obj *nsNameObj = Tcl_NewStringObj(nsFull, -1);
+    if (nsNameObj == NULL) {
+        Tcl_DecrRefCount(scriptObj);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: OOM creating namespace name", -1));
+        goto fail_top;
+    }
+    Tcl_IncrRefCount(nsNameObj);
 
-        if (InstallPrecompiledProc(interp, nsPtr, simpleName, "", topBC, (uint32_t)H.numLocals, &createdTok) != TCL_OK) {
+    Tcl_Obj *argv[4];
+    argv[0] = Tcl_NewStringObj("::namespace", -1);
+    argv[1] = Tcl_NewStringObj("eval", -1);
+    argv[2] = nsNameObj;
+    argv[3] = scriptObj;
+    for (int i = 0; i < 4; ++i) {
+        if (argv[i] == NULL) {
+            for (int j = 0; j <= i; ++j) {
+                if (argv[j])
+                    Tcl_DecrRefCount(argv[j]);
+            }
+            Tcl_DecrRefCount(nsNameObj);
+            Tcl_DecrRefCount(scriptObj);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: OOM building argv", -1));
             goto fail_top;
         }
-        topBC             = NULL;
-
-        Tcl_Obj *fullName = Tcl_NewObj();
-        Tcl_IncrRefCount(fullName);
-        if (createdTok) {
-            Tcl_GetCommandFullName(interp, createdTok, fullName);
-        }
-        if (Tcl_GetCharLength(fullName) == 0) {
-            const char *nsFull = ((Namespace *)nsPtr)->fullName;
-            if (nsFull && nsFull[0] == ':' && nsFull[1] == ':' && nsFull[2] == '\0') {
-                Tcl_SetStringObj(fullName, "::", -1);
-                Tcl_AppendToObj(fullName, simpleName, -1);
-            } else {
-                Tcl_SetStringObj(fullName, nsFull ? nsFull : "::", -1);
-                Tcl_AppendToObj(fullName, "::", 2);
-                Tcl_AppendToObj(fullName, simpleName, -1);
-            }
-        }
-        if (Tcl_GetCharLength(fullName) == 0) {
-            Tcl_DecrRefCount(fullName);
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: assert failed: could not compute absolute name for top-level wrapper", -1));
-            (void)Tcl_DeleteCommandFromToken(interp, createdTok);
-            return TCL_ERROR;
-        }
-        createdTok = NULL;
-
-        Tcl_Obj *argv[1];
-        argv[0] = fullName;
-        {
-            int         code = Tcl_EvalObjv(interp, 1, argv, TCL_EVAL_DIRECT);
-            Tcl_Command live = Tcl_FindCommand(interp, Tcl_GetString(fullName), NULL, TCL_GLOBAL_ONLY);
-            if (live) {
-                if (Tcl_DeleteCommandFromToken(interp, live) != TCL_OK) {
-                    if (code == TCL_OK) {
-                        Tcl_DecrRefCount(fullName);
-                        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: warning: failed to delete temporary top-level proc", -1));
-                        return TCL_ERROR;
-                    }
-                }
-            }
-            Tcl_DecrRefCount(fullName);
-            if (code != TCL_OK) {
-                return code;
-            }
-        }
-        return TCL_OK;
+        Tcl_IncrRefCount(argv[i]);
     }
+
+    int code = Tcl_EvalObjv(interp, 4, argv, TCL_EVAL_DIRECT);
+
+    for (int i = 0; i < 4; ++i)
+        Tcl_DecrRefCount(argv[i]);
+    Tcl_DecrRefCount(nsNameObj);
+    Tcl_DecrRefCount(scriptObj);
+
+    if (code != TCL_OK) {
+        return code;
+    }
+    return TCL_OK;
 
 io_fail:
     Tcl_SetObjResult(interp, Tcl_NewStringObj("unexpected EOF in bytecode block", -1));
