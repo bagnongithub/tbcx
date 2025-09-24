@@ -8,6 +8,13 @@
 #define PKG_TBCX "tbcx"
 #define PKG_TBCX_VER "1.0"
 
+EXTERN int         Tbcx_SaveObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int         Tbcx_SaveChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int         Tbcx_SaveFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int         Tbcx_LoadChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int         Tbcx_LoadFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int         Tbcx_DumpFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+
 const Tcl_ObjType *tbcxTyBignum      = NULL;
 const Tcl_ObjType *tbcxTyBoolean     = NULL;
 const Tcl_ObjType *tbcxTyByteArray   = NULL;
@@ -114,14 +121,7 @@ void Tbcx_InitTypes(Tcl_Interp *interp) {
     Tcl_MutexUnlock(&tbcxTypeMutex);
 }
 
-EXTERN int Tbcx_SaveObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int Tbcx_SaveChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int Tbcx_SaveFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int Tbcx_LoadChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int Tbcx_LoadFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int Tbcx_DumpFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-
-int        tbcx_Init(Tcl_Interp *interp) {
+int tbcx_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, TCL_VERSION, 1) == NULL) {
         return TCL_ERROR;
     }

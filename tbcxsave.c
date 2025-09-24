@@ -5,9 +5,12 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "tbcx.h"
+
+/* ==========================================================================
+ * Type definitions
+ * ========================================================================== */
 
 typedef struct ProcEntry {
     Tcl_Obj *name;
@@ -65,37 +68,6 @@ typedef struct DynNsBodyCap {
     int        cap;
 } DynNsBodyCap;
 
-static void DynNsInit(DynNsBodyCap *c) {
-    c->list  = NULL;
-    c->count = 0;
-    c->cap   = 0;
-}
-static void DynNsPush(DynNsBodyCap *c, const NsBodyRec *e) {
-    if (c->count == c->cap) {
-        c->cap  = c->cap ? c->cap * 2 : 8;
-        c->list = (NsBodyRec *)Tcl_Realloc((char *)c->list, sizeof(NsBodyRec) * (size_t)c->cap);
-    }
-    c->list[c->count++] = *e;
-}
-static void FreeNsBodyArray(NsBodyRec *arr, int n) {
-    if (!arr)
-        return;
-    for (int i = 0; i < n; ++i) {
-        Tcl_DecrRefCount(arr[i].ns);
-        Tcl_DecrRefCount(arr[i].body);
-    }
-    Tcl_Free((char *)arr);
-}
-
-static int NsBodiesContainsLit(const DynNsBodyCap *c, uint32_t idx) {
-    if (!c || !c->list)
-        return 0;
-    for (int i = 0; i < c->count; ++i)
-        if (c->list[i].litIndex == idx)
-            return 1;
-    return 0;
-}
-
 typedef struct DefBodyBind {
     unsigned char kind;      /* 0=PROC, 1=CLASS_METHOD, 2=INSTANCE_METHOD */
     Tcl_Obj      *A;         /* PROC: proc FQN; METHODs: class FQN */
@@ -110,57 +82,55 @@ typedef struct DefBodyBindVec {
 } DefBodyBindVec;
 
 /* ==========================================================================
- * Section: Forward Declarations
+ * Forward Declarations
  * ========================================================================== */
 
-static void       WriteHeaderEx(Tcl_Channel ch, const ByteCode *bc, uint32_t numAuxToWrite);
-static void       WriteLiteral(Tcl_Channel ch, Tcl_Obj *o);
-static void       WriteAux(Tcl_Channel ch, const AuxData *ad);
-static int        CanWriteAux(const AuxData *ad);
-static void       WriteAux_JTStr(Tcl_Channel ch, const JumptableInfo *info);
-static void       WriteAux_JTNum(Tcl_Channel ch, const JumptableInfo *info);
-static void       WriteAux_DictUpd(Tcl_Channel ch, const DictUpdateInfo *info);
-static void       WriteAux_Foreach(Tcl_Channel ch, const ForeachInfo *info);
-
-static int        ScanNamespaceEvalBodies(const ByteCode *bc, DynNsBodyCap *out);
-static int        CompileNsBodyForSave(Tcl_Interp *interp, Tcl_Obj *nsFqn, Tcl_Obj *bodyObj, Tcl_Obj **outBodyObj, int *outNumLocals);
-
-static int        UnknownGuardCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static int        CollectProcsByEval(Tcl_Interp *interp, Tcl_Obj *script, ProcEntry **outEntries, int *outCount);
-static void       FreeProcEntryArray(ProcEntry *arr, int n);
-static Tcl_Token *WordToken(const Tcl_Parse *p, int wordIndex);
-static int        TokenEquals(const char *s, int len, const char *lit);
-static int        NameEndsWith(const char *s, int len, const char *tail);
-static int        IsProcCmdName(const char *s, int len);
-static int        IsOoDefineCmdName(const char *s, int len);
-static int        IsOoClassCmdName(const char *s, int len);
-static int        IsClassBodyMethodCmd(const char *s, int len);
-static int        IsNamespaceCmdName(const char *s, int len);
-static Tcl_Obj   *QualifyInNs(Tcl_Obj *nameObj, Tcl_Obj *nsPrefix);
-static int        GetByteCodeFromScript(Tcl_Interp *, Tcl_Obj *, ByteCode **);
-static int        ReadWholeFile(Tcl_Interp *, const char *, Tcl_Obj **);
-static int        CollectProcsFromScript(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry **, int *);
-static int        MergeProcLists(Tcl_Interp *interp, ProcEntry **base, int *nBase, ProcEntry *extra, int nExtra);
-static Tcl_Obj   *BuildTopLevelFiltered(Tcl_Interp *, Tcl_Obj *, ProcEntry *, int);
-static Tcl_Obj   *FilterScriptInNs(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry *, int, int dropAllProcForms, int inClassBody);
-static Tcl_Obj   *BuildBodyFilteredInNs(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry *, int);
-static uint32_t   CountWritableAux(const ByteCode *bc);
 static int        AssertAuxCoverage(Tcl_Interp *interp, const ByteCode *bc, uint32_t *outCount);
-static int        EmitTopLevelAndProcs(Tcl_Interp *, Tcl_Obj *, Tcl_Channel);
-static uint32_t   ComputeRequiredLocalsFromAux(const ByteCode *bc);
-static int        CollectOOFromScript(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Obj *nsDefault, DynClassCap *outClasses, DynMethCap *outMethods);
+static Tcl_Obj   *BuildBodyFilteredInNs(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry *, int);
+static Tcl_Obj   *BuildTopLevelFiltered(Tcl_Interp *, Tcl_Obj *, ProcEntry *, int);
+static int        BuildUnifiedDefBodyMap(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, ClassEntry *classes, int nClasses, DefBodyBindVec *out);
+static int        CanWriteAux(const AuxData *ad);
 static int        CollectOOByEval(Tcl_Interp *interp, Tcl_Obj *script, DynClassCap *outClasses, DynMethCap *outMethods);
+static int        CollectOOFromScript(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Obj *nsDefault, DynClassCap *outClasses, DynMethCap *outMethods);
+static int        CollectProcsByEval(Tcl_Interp *interp, Tcl_Obj *script, ProcEntry **outEntries, int *outCount);
+static int        CollectProcsFromScript(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry **, int *);
+static int        CompileMethodBodyForSave(Tcl_Interp *interp, Tcl_Obj *clsFqn, Tcl_Obj *methName, unsigned char kind, Tcl_Obj *argsObj, Tcl_Obj *bodyObj, Tcl_Obj **outBodyObj, int *outNumLocals);
+static int        CompileNsBodyForSave(Tcl_Interp *interp, Tcl_Obj *nsFqn, Tcl_Obj *bodyObj, Tcl_Obj **outBodyObj, int *outNumLocals);
+static uint32_t   CountWritableAux(const ByteCode *bc);
+static int        EmitTopLevelAndProcs(Tcl_Interp *, Tcl_Obj *, Tcl_Channel);
+static Tcl_Obj   *FilterScriptInNs(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry *, int, int dropAllProcForms, int inClassBody);
+static int        FindEmptyStringLiteralIndex(const ByteCode *bc);
 static void       FreeClassEntryArray(ClassEntry *arr, int n);
 static void       FreeMethEntryArray(MethEntry *arr, int n);
+static void       FreeProcEntryArray(ProcEntry *arr, int n);
+static int        GetByteCodeFromScript(Tcl_Interp *, Tcl_Obj *, ByteCode **);
+static int        IsClassBodyMethodCmd(const char *s, int len);
+static int        IsNamespaceCmdName(const char *s, int len);
+static int        IsOoClassCmdName(const char *s, int len);
+static int        IsOoDefineCmdName(const char *s, int len);
+static int        IsProcCmdName(const char *s, int len);
+static uint32_t   LocalsFromAux(const ByteCode *bc);
 static int        MergeClassLists(DynClassCap *base, DynClassCap *extra);
 static int        MergeMethLists(DynMethCap *base, DynMethCap *extra);
-static int        CompileMethodBodyForSave(Tcl_Interp *interp, Tcl_Obj *clsFqn, Tcl_Obj *methName, unsigned char kind, Tcl_Obj *argsObj, Tcl_Obj *bodyObj, Tcl_Obj **outBodyObj, int *outNumLocals);
-static int        FindEmptyStringLiteralIndex(const ByteCode *bc);
-static int        PeepholeNeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, unsigned char **outPatched, size_t *outLen, int *outRewrites);
-static int        BuildUnifiedDefBodyMap(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, ClassEntry *classes, int nClasses, DefBodyBindVec *out);
+static int        MergeProcLists(Tcl_Interp *interp, ProcEntry **base, int *nBase, ProcEntry *extra, int nExtra);
+static int        NameEndsWith(const char *s, int len, const char *tail);
+static int        NeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, unsigned char **outPatched, size_t *outLen, int *outRewrites);
+static Tcl_Obj   *QualifyInNs(Tcl_Obj *nameObj, Tcl_Obj *nsPrefix);
+static int        ReadWholeFile(Tcl_Interp *, const char *, Tcl_Obj **);
+static int        ScanNamespaceEvalBodies(const ByteCode *bc, DynNsBodyCap *out);
+static int        TokenEquals(const char *s, int len, const char *lit);
+static int        UnknownGuardCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
+static Tcl_Token *WordToken(const Tcl_Parse *p, int wordIndex);
+static void       WriteAux(Tcl_Channel ch, const AuxData *ad);
+static void       WriteAux_DictUpd(Tcl_Channel ch, const DictUpdateInfo *info);
+static void       WriteAux_Foreach(Tcl_Channel ch, const ForeachInfo *info);
+static void       WriteAux_JTNum(Tcl_Channel ch, const JumptableInfo *info);
+static void       WriteAux_JTStr(Tcl_Channel ch, const JumptableInfo *info);
+static void       WriteHeaderEx(Tcl_Channel ch, const ByteCode *bc, uint32_t numAuxToWrite);
+static void       WriteLiteral(Tcl_Channel ch, Tcl_Obj *o);
 
 /* ==========================================================================
- * Section: Def-body map
+ * Def-body map
  * ========================================================================== */
 
 static void       BindVecInit(DefBodyBindVec *v) {
@@ -197,8 +167,41 @@ static void BindVecFree(DefBodyBindVec *v) {
 }
 
 /* ==========================================================================
- * Section: Containers (OO capture)
+ * Containers (OO capture)
  * ========================================================================== */
+
+static void DynNsInit(DynNsBodyCap *c) {
+    c->list  = NULL;
+    c->count = 0;
+    c->cap   = 0;
+}
+
+static void DynNsPush(DynNsBodyCap *c, const NsBodyRec *e) {
+    if (c->count == c->cap) {
+        c->cap  = c->cap ? c->cap * 2 : 8;
+        c->list = (NsBodyRec *)Tcl_Realloc((char *)c->list, sizeof(NsBodyRec) * (size_t)c->cap);
+    }
+    c->list[c->count++] = *e;
+}
+
+static void FreeNsBodyArray(NsBodyRec *arr, int n) {
+    if (!arr)
+        return;
+    for (int i = 0; i < n; ++i) {
+        Tcl_DecrRefCount(arr[i].ns);
+        Tcl_DecrRefCount(arr[i].body);
+    }
+    Tcl_Free((char *)arr);
+}
+
+static int NsBodiesContainsLit(const DynNsBodyCap *c, uint32_t idx) {
+    if (!c || !c->list)
+        return 0;
+    for (int i = 0; i < c->count; ++i)
+        if (c->list[i].litIndex == idx)
+            return 1;
+    return 0;
+}
 
 /*
  * DynClassInit
@@ -249,7 +252,7 @@ static void DynMethPush(DynMethCap *c, const MethEntry *e) {
 }
 
 /* ==========================================================================
- * Section: Low-level I/O helpers
+ * Low-level I/O helpers
  * ========================================================================== */
 
 /*
@@ -300,7 +303,7 @@ static inline void wr8(Tcl_Channel ch, uint64_t v) {
 }
 
 /* ==========================================================================
- * Section: Serialization: header/literals/aux
+ * Serialization: header/literals/aux
  * ========================================================================== */
 
 /*
@@ -316,11 +319,11 @@ static void WriteHeaderEx(Tcl_Channel ch, const ByteCode *bc, uint32_t numAuxToW
     putle32(b + 4, TBCX_FORMAT);
     putle32(b + 8, TBCX_FLAGS_V1);
     putle64(b + 12, (uint64_t)bc->numCodeBytes);
-    putle32(b + 20, (uint32_t)0);
+    putle32(b + 20, (uint32_t)bc->numCommands);
     putle32(b + 24, (uint32_t)bc->numExceptRanges);
     putle32(b + 28, (uint32_t)bc->numLitObjects);
     putle32(b + 32, (uint32_t)numAuxToWrite);
-    uint32_t topNumLocals = (uint32_t)(bc->procPtr ? bc->procPtr->numCompiledLocals : ComputeRequiredLocalsFromAux(bc));
+    uint32_t topNumLocals = (uint32_t)(bc->procPtr ? bc->procPtr->numCompiledLocals : LocalsFromAux(bc));
     putle32(b + 36, topNumLocals);
     putle32(b + 40, (uint32_t)bc->maxStackDepth);
     wr(ch, b, sizeof b);
@@ -552,7 +555,7 @@ static void WriteAux(Tcl_Channel ch, const AuxData *ad) {
 }
 
 /* ==========================================================================
- * Section: Bytecode analysis/coverage
+ * Bytecode analysis/coverage
  * ========================================================================== */
 
 /*
@@ -606,11 +609,11 @@ static int AssertAuxCoverage(Tcl_Interp *interp, const ByteCode *bc, uint32_t *o
 }
 
 /*
- * ComputeRequiredLocalsFromAux
+ * LocalsFromAux
  * Infer required number of compiled locals from AuxData when no procPtr.
  */
 
-static uint32_t ComputeRequiredLocalsFromAux(const ByteCode *bc) {
+static uint32_t LocalsFromAux(const ByteCode *bc) {
     uint32_t maxIx = 0u;
     int      seen  = 0;
 
@@ -657,7 +660,7 @@ static uint32_t ComputeRequiredLocalsFromAux(const ByteCode *bc) {
 }
 
 /* ==========================================================================
- * Section: Compilation helpers
+ * Compilation helpers
  * ========================================================================== */
 
 static int ScanNamespaceEvalBodies(const ByteCode *bc, DynNsBodyCap *out) {
@@ -747,7 +750,7 @@ static int CompileNsBodyForSave(Tcl_Interp *interp, Tcl_Obj *nsFqn, Tcl_Obj *bod
     int       rc = GetByteCodeFromScript(interp, dup, &bc);
     if (rc == TCL_OK) {
         *outBodyObj   = dup;
-        *outNumLocals = (int)ComputeRequiredLocalsFromAux(bc);
+        *outNumLocals = (int)LocalsFromAux(bc);
     } else {
         Tcl_DecrRefCount(dup);
     }
@@ -842,7 +845,7 @@ static int GetByteCodeFromScript(Tcl_Interp *interp, Tcl_Obj *scriptObj, ByteCod
 }
 
 /* ==========================================================================
- * Section: OO parse/capture (static + dynamic) and merges
+ * OO parse/capture (static + dynamic) and merges
  * ========================================================================== */
 
 /*
@@ -1400,7 +1403,7 @@ static int CollectOOByEval(Tcl_Interp *interp, Tcl_Obj *script, DynClassCap *out
 }
 
 /* ==========================================================================
- * Section: Token/name utilities
+ * Token/name utilities
  * ========================================================================== */
 
 /*
@@ -1524,7 +1527,7 @@ static Tcl_Obj *QualifyInNs(Tcl_Obj *nameObj, Tcl_Obj *nsPrefix) {
 }
 
 /* ==========================================================================
- * Section: Proc capture & script filtering
+ * Proc capture & script filtering
  * ========================================================================== */
 
 /*
@@ -1533,14 +1536,47 @@ static Tcl_Obj *QualifyInNs(Tcl_Obj *nameObj, Tcl_Obj *nsPrefix) {
  */
 
 static int ProcTripleMatches(const ProcEntry *e, Tcl_Obj *fqName, Tcl_Obj *args, Tcl_Obj *body) {
-    Tcl_Size    ln1, ln2, la1, la2, lb1, lb2;
-    const char *n1 = Tcl_GetStringFromObj(e->name, &ln1), *n2 = Tcl_GetStringFromObj(fqName, &ln2);
-    if (ln1 != ln2 || memcmp(n1, n2, (size_t)ln1) != 0)
+    /* --- name: must match byte-for-byte --- */
+    Tcl_Size    ln1, ln2;
+    const char *n1 = Tcl_GetStringFromObj(e->name, &ln1);
+    const char *n2 = Tcl_GetStringFromObj(fqName, &ln2);
+    if (ln1 != ln2 || memcmp(n1, n2, (size_t)ln1) != 0) {
         return 0;
-    const char *a1 = Tcl_GetStringFromObj(e->args, &la1), *a2 = Tcl_GetStringFromObj(args, &la2);
-    if (la1 != la2 || memcmp(a1, a2, (size_t)la1) != 0)
+    }
+
+    /* --- args: compare as Tcl lists so {} == "" and whitespace canonicalizes --- */
+    Tcl_Size    la1, la2;
+    const char *a1s       = Tcl_GetStringFromObj(e->args, &la1);
+    const char *a2s       = Tcl_GetStringFromObj(args, &la2);
+    int         argsEqual = 0;
+    if (la1 == la2 && memcmp(a1s, a2s, (size_t)la1) == 0) {
+        argsEqual = 1; /* fast path: identical strings */
+    } else {
+        Tcl_Size nA = 0, nB = 0;
+        if (Tcl_ListObjLength(NULL, e->args, &nA) == TCL_OK && Tcl_ListObjLength(NULL, args, &nB) == TCL_OK && nA == nB) {
+            Tcl_Obj **EA = NULL, **EB = NULL;
+            if (Tcl_ListObjGetElements(NULL, e->args, &nA, &EA) == TCL_OK && Tcl_ListObjGetElements(NULL, args, &nB, &EB) == TCL_OK) {
+                argsEqual = 1;
+                for (int i = 0; i < nA; ++i) {
+                    Tcl_Size    l1, l2;
+                    const char *s1 = Tcl_GetStringFromObj(EA[i], &l1);
+                    const char *s2 = Tcl_GetStringFromObj(EB[i], &l2);
+                    if (l1 != l2 || memcmp(s1, s2, (size_t)l1) != 0) {
+                        argsEqual = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!argsEqual) {
         return 0;
-    const char *b1 = Tcl_GetStringFromObj(e->body, &lb1), *b2 = Tcl_GetStringFromObj(body, &lb2);
+    }
+
+    /* --- body: must match byte-for-byte --- */
+    Tcl_Size    lb1, lb2;
+    const char *b1 = Tcl_GetStringFromObj(e->body, &lb1);
+    const char *b2 = Tcl_GetStringFromObj(body, &lb2);
     return (lb1 == lb2) && (memcmp(b1, b2, (size_t)lb1) == 0);
 }
 
@@ -2018,7 +2054,7 @@ static Tcl_Obj *BuildBodyFilteredInNs(Tcl_Interp *interp, Tcl_Obj *body, Tcl_Obj
 }
 
 /* ==========================================================================
- * Section: File helpers
+ * File helpers
  * ========================================================================== */
 
 /*
@@ -2086,7 +2122,7 @@ static Tcl_Obj *QualifyNameString(Tcl_Obj *nameStr, Tcl_Obj *nsPrefix) {
     return fq;
 }
 
-static int PeepholeNeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, unsigned char **outPatched, size_t *outLen, int *outRewrites) {
+static int NeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, unsigned char **outPatched, size_t *outLen, int *outRewrites) {
     *outPatched = NULL;
     *outLen     = 0;
     if (outRewrites)
@@ -2184,7 +2220,7 @@ static int PeepholeNeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEn
 }
 
 /* ==========================================================================
- * Section: High-level emitter
+ * High-level emitter
  * ========================================================================== */
 
 static int BuildUnifiedDefBodyMap(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, ClassEntry *classes, int nClasses, DefBodyBindVec *out) {
@@ -2400,7 +2436,7 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
         unsigned char *patched    = NULL;
         size_t         patchedLen = 0;
         int            rewrites   = 0;
-        (void)PeepholeNeutralizeProcCreates(pbc, procs[i].ns, procs, nProcs, &patched, &patchedLen, &rewrites);
+        (void)NeutralizeProcCreates(pbc, procs[i].ns, procs, nProcs, &patched, &patchedLen, &rewrites);
         if (patched) {
             wr4(ch, (uint32_t)patchedLen);
             wr(ch, patched, (Tcl_Size)patchedLen);
@@ -2534,7 +2570,7 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
         unsigned char *patched    = NULL;
         size_t         patchedLen = 0;
         int            rewrites   = 0;
-        (void)PeepholeNeutralizeProcCreates(pbc, methodsS.list[i].clsFqn, procs, nProcs, &patched, &patchedLen, &rewrites);
+        (void)NeutralizeProcCreates(pbc, methodsS.list[i].clsFqn, procs, nProcs, &patched, &patchedLen, &rewrites);
         if (patched) {
             wr4(ch, (uint32_t)patchedLen);
             wr(ch, patched, (Tcl_Size)patchedLen);
@@ -2638,7 +2674,7 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
             unsigned char *patched    = NULL;
             size_t         patchedLen = 0;
             int            rewrites   = 0;
-            (void)PeepholeNeutralizeProcCreates(pbc, nsBodies.list[i].ns, procs, nProcs, &patched, &patchedLen, &rewrites);
+            (void)NeutralizeProcCreates(pbc, nsBodies.list[i].ns, procs, nProcs, &patched, &patchedLen, &rewrites);
             if (patched) {
                 wr4(ch, (uint32_t)patchedLen);
                 wr(ch, patched, (Tcl_Size)patchedLen);
@@ -2694,7 +2730,7 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
 }
 
 /* ==========================================================================
- * Section: Tcl commands
+ * Tcl commands
  * ========================================================================== */
 
 /*

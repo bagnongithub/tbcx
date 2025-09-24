@@ -6,27 +6,31 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "tbcx.h"
 
+/* ==========================================================================
+ * Type definitions
+ * ========================================================================== */
+
 typedef enum { TBCX_SRC_TOP, TBCX_SRC_PROC } TbcxBCSource;
 
-/* ===== Forward declarations (2eaf9.tbcxload.c) ===== */
+/* ==========================================================================
+ * Forward Declarations
+ * ========================================================================== */
 
 static Tcl_Namespace *EnsureNamespace(Tcl_Interp *interp, const char *nsName, Tcl_Namespace *fallback);
-static void           FreeLoadedByteCode(ByteCode *bc);
-static void           TbcxFinalizeByteCode(ByteCode *bc, Tcl_Interp *interp, size_t codeLen);
-static int            ReadAll(Tcl_Channel ch, unsigned char *dst, Tcl_Size need);
-static int            ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj);
-static void           LambdaLiterals(Tcl_Interp *interp, Tcl_Obj **lits, Tcl_Size n);
-static int            ReadByteCode(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *nsPtr, TbcxBCSource src, const TbcxHeader *topHdr, uint32_t formatIfProc, ByteCode **out, uint32_t *outNumLocals);
-static int            InstallPrecompiled(Tcl_Interp *interp, Tcl_Namespace *targetNs, const char *fqName, const char *argSpec, ByteCode *bc, uint32_t numLocals, Tcl_Command *outTok);
 static int            EvalInNamespace(Tcl_Interp *interp, Tcl_Namespace *nsPtr, Tcl_Obj *scriptObj);
+static void           FreeLoadedByteCode(ByteCode *bc);
+static int            InstallPrecompiled(Tcl_Interp *interp, Tcl_Namespace *targetNs, const char *fqName, const char *argSpec, ByteCode *bc, uint32_t numLocals, Tcl_Command *outTok);
+static void           LambdaLiterals(Tcl_Interp *interp, Tcl_Obj **lits, Tcl_Size n);
 static int            LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *nsPtr);
-
-int                   Tbcx_LoadFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+static int            ReadAll(Tcl_Channel ch, unsigned char *dst, Tcl_Size need);
+static int            ReadByteCode(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *nsPtr, TbcxBCSource src, const TbcxHeader *topHdr, uint32_t formatIfProc, ByteCode **out, uint32_t *outNumLocals);
+static int            ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj);
+static void           TbcxFinalizeByteCode(ByteCode *bc, Tcl_Interp *interp, size_t codeLen);
 int                   Tbcx_LoadChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+int                   Tbcx_LoadFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 
 /* C11 sanity: we assume opcodes are byte-sized */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -34,7 +38,7 @@ _Static_assert(sizeof(((unsigned char)0)) == 1, "opcode byte size guard");
 #endif
 
 /* ==========================================================================
- * Section: Namespace & ByteCode lifecycle
+ * Namespace & ByteCode lifecycle
  * ========================================================================== */
 
 static Tcl_HashTable  tbcxMethReg;
@@ -127,7 +131,7 @@ static void TbcxFinalizeByteCode(ByteCode *bc, Tcl_Interp *interp, size_t codeLe
 }
 
 /* ==========================================================================
- * Section: Deserialization helpers (I/O + literals)
+ * Deserialization helpers (I/O + literals)
  * ========================================================================== */
 
 /*
@@ -360,7 +364,7 @@ static int ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj) 
 }
 
 /* ==========================================================================
- * Section: Deserialization: ByteCode blocks
+ * Deserialization: ByteCode blocks
  * ========================================================================== */
 
 #define R(n, buf)                                                                                                                                                                                      \
@@ -708,7 +712,7 @@ io_fail:
 }
 
 /* ==========================================================================
- * Section: Proc support
+ * Proc support
  * ========================================================================== */
 
 /*
@@ -824,7 +828,7 @@ static void tbcxClearMethodRegistry(void) {
 }
 
 /* ==========================================================================
- * Section: High-level loader
+ * High-level loader
  * ========================================================================== */
 
 static int EvalInNamespace(Tcl_Interp *interp, Tcl_Namespace *nsPtr, Tcl_Obj *scriptObj) {
@@ -1315,7 +1319,7 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
                     const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(procPtr->bodyPtr, tbcxTyBytecode);
                     if (ir && ir->twoPtrValue.ptr1) {
                         ByteCode *pbcIR = (ByteCode *)ir->twoPtrValue.ptr1;
-                        pbcIR->refCount = 1;
+                        pbcIR->refCount++;
                         ByteCodeSetInternalRep(lit, tbcxTyBytecode, pbcIR);
                     }
                 } else {
@@ -1339,7 +1343,7 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
                         const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(bodyObj, tbcxTyBytecode);
                         if (ir && ir->twoPtrValue.ptr1) {
                             ByteCode *pbcIR = (ByteCode *)ir->twoPtrValue.ptr1;
-                            pbcIR->refCount = 1;
+                            pbcIR->refCount++;
                             ByteCodeSetInternalRep(lit, tbcxTyBytecode, pbcIR);
                         }
                     } else {
@@ -1452,7 +1456,7 @@ fail_top:
 }
 
 /* ==========================================================================
- * Section: Tcl commands
+ * Tcl commands
  * ========================================================================== */
 
 /*
