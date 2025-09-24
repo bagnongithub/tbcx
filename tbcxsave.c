@@ -88,7 +88,6 @@ typedef struct DefBodyBindVec {
 static int        AssertAuxCoverage(Tcl_Interp *interp, const ByteCode *bc, uint32_t *outCount);
 static Tcl_Obj   *BuildBodyFilteredInNs(Tcl_Interp *, Tcl_Obj *, Tcl_Obj *, ProcEntry *, int);
 static Tcl_Obj   *BuildTopLevelFiltered(Tcl_Interp *, Tcl_Obj *, ProcEntry *, int);
-static int        BuildUnifiedDefBodyMap(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, ClassEntry *classes, int nClasses, DefBodyBindVec *out);
 static int        CanWriteAux(const AuxData *ad);
 static int        CollectOOByEval(Tcl_Interp *interp, Tcl_Obj *script, DynClassCap *outClasses, DynMethCap *outMethods);
 static int        CollectOOFromScript(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Obj *nsDefault, DynClassCap *outClasses, DynMethCap *outMethods);
@@ -128,43 +127,6 @@ static void       WriteAux_JTNum(Tcl_Channel ch, const JumptableInfo *info);
 static void       WriteAux_JTStr(Tcl_Channel ch, const JumptableInfo *info);
 static void       WriteHeaderEx(Tcl_Channel ch, const ByteCode *bc, uint32_t numAuxToWrite);
 static void       WriteLiteral(Tcl_Channel ch, Tcl_Obj *o);
-
-/* ==========================================================================
- * Def-body map
- * ========================================================================== */
-
-static void       BindVecInit(DefBodyBindVec *v) {
-    v->list  = NULL;
-    v->count = 0;
-    v->cap   = 0;
-}
-static void BindVecPush(DefBodyBindVec *v, unsigned char kind, Tcl_Obj *A, Tcl_Obj *B, uint32_t litIx) {
-    if (v->count == v->cap) {
-        v->cap  = v->cap ? v->cap * 2 : 8;
-        v->list = (DefBodyBind *)Tcl_Realloc((char *)v->list, sizeof(DefBodyBind) * (size_t)v->cap);
-    }
-    DefBodyBind e;
-    e.kind      = kind;
-    e.A         = A;
-    e.B         = B;
-    e.bodyLitIx = litIx;
-    Tcl_IncrRefCount(e.A);
-    if (e.B)
-        Tcl_IncrRefCount(e.B);
-    v->list[v->count++] = e;
-}
-static void BindVecFree(DefBodyBindVec *v) {
-    if (!v->list)
-        return;
-    for (int i = 0; i < v->count; ++i) {
-        Tcl_DecrRefCount(v->list[i].A);
-        if (v->list[i].B)
-            Tcl_DecrRefCount(v->list[i].B);
-    }
-    Tcl_Free((char *)v->list);
-    v->list  = NULL;
-    v->count = v->cap = 0;
-}
 
 /* ==========================================================================
  * Containers (OO capture)
@@ -2223,89 +2185,6 @@ static int NeutralizeProcCreates(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *pro
  * High-level emitter
  * ========================================================================== */
 
-static int BuildUnifiedDefBodyMap(ByteCode *bc, Tcl_Obj *nsPrefix, ProcEntry *procs, int nProcs, ClassEntry *classes, int nClasses, DefBodyBindVec *out) {
-    if (!bc || !bc->codeStart || bc->numLitObjects <= 0 || !out)
-        return TCL_OK;
-
-    unsigned char *code = bc->codeStart;
-    size_t         n    = (size_t)bc->numCodeBytes;
-
-    for (size_t i = 0; i + 10 < n; ++i) {
-        if (code[i] != (unsigned char)INST_PUSH)
-            continue;
-        uint32_t lit0 = get_u4(code + i + 1);
-        if (lit0 >= (uint32_t)bc->numLitObjects)
-            continue;
-
-        Tcl_Obj *cmd0 = bc->objArrayPtr[lit0];
-        if (!cmd0)
-            continue;
-        const char *c0 = Tcl_GetString(cmd0);
-
-        /* --- PROC pattern --- */
-        if (c0) {
-            size_t L0     = strlen(c0);
-            int    isProc = (L0 >= 4 && memcmp(c0 + (L0 - 4), "proc", 4) == 0);
-            if (isProc) {
-                size_t p1 = i + 5, p2 = p1 + 5, p3 = p2 + 5, p4 = p3 + 5;
-                if (p4 < n && code[p1] == INST_PUSH && code[p2] == INST_PUSH && code[p3] == INST_PUSH && code[p4] == INST_INVOKE_STK && code[p4 + 1] == 4) {
-                    uint32_t litName = get_u4(code + p1 + 1), litArgs = get_u4(code + p2 + 1), litBody = get_u4(code + p3 + 1);
-                    if (litName < (uint32_t)bc->numLitObjects && litArgs < (uint32_t)bc->numLitObjects && litBody < (uint32_t)bc->numLitObjects) {
-                        Tcl_Obj *fq    = QualifyInNs(bc->objArrayPtr[litName], nsPrefix);
-                        int      match = 0;
-                        for (int m = 0; m < nProcs && !match; ++m)
-                            match = ProcTripleMatches(&procs[m], fq, bc->objArrayPtr[litArgs], bc->objArrayPtr[litBody]);
-                        if (match) {
-                            BindVecPush(out, 0 /*PROC*/, fq, Tcl_NewStringObj("", 0), litBody);
-                        }
-                        Tcl_DecrRefCount(fq);
-                        i = p4 + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        /* --- OO define patterns --- */
-        if (c0) {
-            size_t L0       = strlen(c0);
-            int    isDefine = (L0 >= 10 && memcmp(c0 + (L0 - 10), "oo::define", 10) == 0);
-            int    isObjDef = (L0 >= 12 && memcmp(c0 + (L0 - 12), "oo::objdefine", 12) == 0);
-            if (isDefine || isObjDef) {
-                int    isDefine = (strcmp(c0, "oo::define") == 0);
-                size_t pT = i + 5, pSub = pT + 5;
-                if (pSub + 5 >= n || code[pT] != INST_PUSH || code[pSub] != INST_PUSH)
-                    continue;
-
-                uint32_t litTarget = get_u4(code + pT + 1), litSub = get_u4(code + pSub + 1);
-                if (litTarget >= (uint32_t)bc->numLitObjects || litSub >= (uint32_t)bc->numLitObjects)
-                    continue;
-
-                const char *sub         = Tcl_GetString(bc->objArrayPtr[litSub]);
-                int         isClassMeth = (sub && strcmp(sub, "classmethod") == 0);
-                int         isMethod    = isClassMeth || (sub && strcmp(sub, "method") == 0);
-                if (!isMethod)
-                    continue;
-
-                size_t pName = pSub + 5, pArgs = pName + 5, pBody = pArgs + 5, pCall = pBody + 5;
-                if (pCall < n && code[pName] == INST_PUSH && code[pArgs] == INST_PUSH && code[pBody] == INST_PUSH && code[pCall] == INST_INVOKE_STK && code[pCall + 1] >= 6) {
-                    uint32_t litName = get_u4(code + pName + 1), litBody = get_u4(code + pBody + 1);
-                    if (litName < (uint32_t)bc->numLitObjects && litBody < (uint32_t)bc->numLitObjects) {
-                        Tcl_Obj *cls   = bc->objArrayPtr[litTarget];
-                        Tcl_Obj *clsFq = isDefine ? QualifyInNs(cls, nsPrefix) : Tcl_DuplicateObj(cls);
-                        Tcl_IncrRefCount(clsFq);
-                        Tcl_Obj *mname = bc->objArrayPtr[litName];
-                        BindVecPush(out, isClassMeth ? 1 : 2, clsFq, mname, litBody);
-                        Tcl_DecrRefCount(clsFq);
-                        i = pCall + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-    return TCL_OK;
-}
-
 /*
  * EmitTopLevelAndProcs
  * Serialize top-level bytecode, then proc and OO sections to a channel.
@@ -2480,6 +2359,10 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
         wr4(ch, (uint32_t)pbc->maxStackDepth);
         wr4(ch, (uint32_t)0);
         wr4(ch, (uint32_t)numLocals);
+
+        /* Per-block def-body registrations for this proc (none for now; format reserved) */
+        wr4(ch, (uint32_t)0);
+
         Tcl_DecrRefCount(bodyObj);
     }
 
@@ -2610,29 +2493,12 @@ static int EmitTopLevelAndProcs(Tcl_Interp *interp, Tcl_Obj *script, Tcl_Channel
         wr4(ch, (uint32_t)pbc->maxStackDepth);
         wr4(ch, (uint32_t)0);
         wr4(ch, (uint32_t)numLocals);
+
+        /* Per-block def-body registrations for this proc (none for now; format reserved) */
+        wr4(ch, (uint32_t)0);
+
         Tcl_DecrRefCount(bodyObj);
     }
-
-    DefBodyBindVec dbm;
-    BindVecInit(&dbm);
-    (void)BuildUnifiedDefBodyMap(bc, procs && nProcs > 0 && procs[0].ns ? procs[0].ns : Tcl_NewStringObj("::", 2), procs, nProcs, classesS.list, classesS.count, &dbm);
-
-    wr4(ch, (uint32_t)dbm.count);
-    for (int i = 0; i < dbm.count; ++i) {
-        wr1(ch, dbm.list[i].kind);
-        Tcl_Size    LA = 0;
-        const char *A  = Tcl_GetStringFromObj(dbm.list[i].A, &LA);
-        wr4(ch, (uint32_t)LA);
-        if (LA)
-            wr(ch, A, (Tcl_Size)LA);
-        Tcl_Size    LB = 0;
-        const char *B  = dbm.list[i].B ? Tcl_GetStringFromObj(dbm.list[i].B, &LB) : "";
-        wr4(ch, (uint32_t)LB);
-        if (LB)
-            wr(ch, B, (Tcl_Size)LB);
-        wr4(ch, (uint32_t)dbm.list[i].bodyLitIx);
-    }
-    BindVecFree(&dbm);
 
     {
         DynNsBodyCap nsBodies;

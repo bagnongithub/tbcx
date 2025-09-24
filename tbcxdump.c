@@ -10,45 +10,55 @@
 
 #include "tbcx.h"
 
-#define TCL_INSTRUCTION_ENTRY(name, stack)                                                                                                                                                             \
-    {                                                                                                                                                                                                  \
-        name, 1, stack, 0, {                                                                                                                                                                           \
-            OPERAND_NONE, OPERAND_NONE                                                                                                                                                                 \
-        }                                                                                                                                                                                              \
+/* clang-format off */
+#define TCL_INSTRUCTION_ENTRY(name, stack)\
+    {                                     \
+        name, 1, stack, 0, {              \
+            OPERAND_NONE, OPERAND_NONE    \
+        }                                 \
     }
-#define TCL_INSTRUCTION_ENTRY1(name, size, stack, type1)                                                                                                                                               \
-    {                                                                                                                                                                                                  \
-        name, size, stack, 1, {                                                                                                                                                                        \
-            type1, OPERAND_NONE                                                                                                                                                                        \
-        }                                                                                                                                                                                              \
+#define TCL_INSTRUCTION_ENTRY1(name, size, stack, type1)\
+    {                                     \
+        name, size, stack, 1, {           \
+            type1, OPERAND_NONE           \
+        }                                 \
     }
-#define TCL_INSTRUCTION_ENTRY2(name, size, stack, type1, type2)                                                                                                                                        \
-    {                                                                                                                                                                                                  \
-        name, size, stack, 2, {                                                                                                                                                                        \
-            type1, type2                                                                                                                                                                               \
-        }                                                                                                                                                                                              \
+#define TCL_INSTRUCTION_ENTRY2(name, size, stack, type1, type2)\
+    {                                     \
+        name, size, stack, 2, {           \
+            type1, type2                  \
+        }                                 \
     }
-#define DEPRECATED_INSTRUCTION_ENTRY(name, stack)                                                                                                                                                      \
-    {                                                                                                                                                                                                  \
-        NULL, 1, 0, 0, {                                                                                                                                                                               \
-            OPERAND_NONE, OPERAND_NONE                                                                                                                                                                 \
-        }                                                                                                                                                                                              \
+#define DEPRECATED_INSTRUCTION_ENTRY(name, stack)\
+    {                                     \
+        NULL, 1, 0, 0, {                  \
+            OPERAND_NONE, OPERAND_NONE    \
+        }                                 \
     }
-#define DEPRECATED_INSTRUCTION_ENTRY1(name, size, stack, type1)                                                                                                                                        \
-    {                                                                                                                                                                                                  \
-        NULL, size, 0, 0, {                                                                                                                                                                            \
-            OPERAND_NONE, OPERAND_NONE                                                                                                                                                                 \
-        }                                                                                                                                                                                              \
+#define DEPRECATED_INSTRUCTION_ENTRY1(name, size, stack, type1)\
+    {                                     \
+        NULL, size, 0, 0, {               \
+            OPERAND_NONE, OPERAND_NONE    \
+        }                                 \
     }
-#define DEPRECATED_INSTRUCTION_ENTRY2(name, size, stack, type1, type2)                                                                                                                                 \
-    {                                                                                                                                                                                                  \
-        NULL, size, 0, 0, {                                                                                                                                                                            \
-            OPERAND_NONE, OPERAND_NONE                                                                                                                                                                 \
-        }                                                                                                                                                                                              \
+#define DEPRECATED_INSTRUCTION_ENTRY2(name, size, stack, type1, type2)\
+    {                                     \
+        NULL, size, 0, 0, {               \
+            OPERAND_NONE, OPERAND_NONE    \
+        }                                 \
     }
+#define ENSURE_ROOM_OR_BREAK(_pc, _need)  \
+    do {                                  \
+        if (!SafeHave(bc->code, bc->codeLen, (_pc) + (_need))) {  \
+            AppendPrintf(out, "    %04zu: [decoder error: need %zu bytes, have %zu]\n", (size_t)(_pc), (size_t)(_need), (size_t)(bc->codeLen - (_pc)));\
+            pc = bc->codeLen;             \
+            goto done_dis;                \
+        }                                 \
+    } while (0)
+/* clang-format on */
 
 static const InstructionDesc tbcxInstructionTable[] = {
-    /*  Name	      Bytes stackEffect	  Operand types */
+    /*  Name   Bytes stackEffect      Operand types */
     TCL_INSTRUCTION_ENTRY("done", -1),
     /* Finish ByteCode execution and return stktop (top stack item) */
     DEPRECATED_INSTRUCTION_ENTRY1("push1", 2, +1, OPERAND_LIT1),
@@ -69,7 +79,6 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Evaluate command in stktop using Tcl_EvalObj. */
     TCL_INSTRUCTION_ENTRY("exprStk", 0),
     /* Execute expression in stktop using Tcl_ExprStringObj. */
-
     DEPRECATED_INSTRUCTION_ENTRY1("loadScalar1", 2, 1, OPERAND_LVT1),
     /* Load scalar variable at index op1 <= 255 in call frame */
     TCL_INSTRUCTION_ENTRY1("loadScalar", 5, 1, OPERAND_LVT4),
@@ -135,45 +144,45 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Jump relative to (pc + op4) if stktop expr object is false */
 
     TCL_INSTRUCTION_ENTRY("bitor", -1),
-    /* Bitwise or:	push (stknext | stktop) */
+    /* Bitwise or:  push (stknext | stktop) */
     TCL_INSTRUCTION_ENTRY("bitxor", -1),
-    /* Bitwise xor	push (stknext ^ stktop) */
+    /* Bitwise xor  push (stknext ^ stktop) */
     TCL_INSTRUCTION_ENTRY("bitand", -1),
-    /* Bitwise and:	push (stknext & stktop) */
+    /* Bitwise and: push (stknext & stktop) */
     TCL_INSTRUCTION_ENTRY("eq", -1),
-    /* Equal:	push (stknext == stktop) */
+    /* Equal:   push (stknext == stktop) */
     TCL_INSTRUCTION_ENTRY("neq", -1),
-    /* Not equal:	push (stknext != stktop) */
+    /* Not equal:   push (stknext != stktop) */
     TCL_INSTRUCTION_ENTRY("lt", -1),
-    /* Less:	push (stknext < stktop) */
+    /* Less:    push (stknext < stktop) */
     TCL_INSTRUCTION_ENTRY("gt", -1),
-    /* Greater:	push (stknext > stktop) */
+    /* Greater: push (stknext > stktop) */
     TCL_INSTRUCTION_ENTRY("le", -1),
     /* Less or equal: push (stknext <= stktop) */
     TCL_INSTRUCTION_ENTRY("ge", -1),
     /* Greater or equal: push (stknext >= stktop) */
     TCL_INSTRUCTION_ENTRY("lshift", -1),
-    /* Left shift:	push (stknext << stktop) */
+    /* Left shift:  push (stknext << stktop) */
     TCL_INSTRUCTION_ENTRY("rshift", -1),
-    /* Right shift:	push (stknext >> stktop) */
+    /* Right shift: push (stknext >> stktop) */
     TCL_INSTRUCTION_ENTRY("add", -1),
-    /* Add:		push (stknext + stktop) */
+    /* Add:     push (stknext + stktop) */
     TCL_INSTRUCTION_ENTRY("sub", -1),
-    /* Sub:		push (stkext - stktop) */
+    /* Sub:     push (stkext - stktop) */
     TCL_INSTRUCTION_ENTRY("mult", -1),
-    /* Multiply:	push (stknext * stktop) */
+    /* Multiply:    push (stknext * stktop) */
     TCL_INSTRUCTION_ENTRY("div", -1),
-    /* Divide:	push (stknext / stktop) */
+    /* Divide:  push (stknext / stktop) */
     TCL_INSTRUCTION_ENTRY("mod", -1),
-    /* Mod:		push (stknext % stktop) */
+    /* Mod:     push (stknext % stktop) */
     TCL_INSTRUCTION_ENTRY("uplus", 0),
-    /* Unary plus:	push +stktop */
+    /* Unary plus:  push +stktop */
     TCL_INSTRUCTION_ENTRY("uminus", 0),
-    /* Unary minus:	push -stktop */
+    /* Unary minus: push -stktop */
     TCL_INSTRUCTION_ENTRY("bitnot", 0),
-    /* Bitwise not:	push ~stktop */
+    /* Bitwise not: push ~stktop */
     TCL_INSTRUCTION_ENTRY("not", 0),
-    /* Logical not:	push !stktop */
+    /* Logical not: push !stktop */
     TCL_INSTRUCTION_ENTRY("tryCvtToNumeric", 0),
     /* Try converting stktop to first int then double if possible. */
 
@@ -195,24 +204,24 @@ static const InstructionDesc tbcxInstructionTable[] = {
      * object onto the stack. */
 
     TCL_INSTRUCTION_ENTRY("streq", -1),
-    /* Str Equal:	push (stknext eq stktop) */
+    /* Str Equal:   push (stknext eq stktop) */
     TCL_INSTRUCTION_ENTRY("strneq", -1),
-    /* Str !Equal:	push (stknext neq stktop) */
+    /* Str !Equal:  push (stknext neq stktop) */
     TCL_INSTRUCTION_ENTRY("strcmp", -1),
-    /* Str Compare:	push (stknext cmp stktop) */
+    /* Str Compare: push (stknext cmp stktop) */
     TCL_INSTRUCTION_ENTRY("strlen", 0),
-    /* Str Length:	push (strlen stktop) */
+    /* Str Length:  push (strlen stktop) */
     TCL_INSTRUCTION_ENTRY("strindex", -1),
-    /* Str Index:	push (strindex stknext stktop) */
+    /* Str Index:   push (strindex stknext stktop) */
     TCL_INSTRUCTION_ENTRY1("strmatch", 2, -1, OPERAND_INT1),
-    /* Str Match:	push (strmatch stknext stktop) opnd == nocase */
+    /* Str Match:   push (strmatch stknext stktop) opnd == nocase */
 
     TCL_INSTRUCTION_ENTRY1("list", 5, INT_MIN, OPERAND_UINT4),
-    /* List:	push (stk1 stk2 ... stktop) */
+    /* List:    push (stk1 stk2 ... stktop) */
     TCL_INSTRUCTION_ENTRY("listIndex", -1),
-    /* List Index:	push (listindex stknext stktop) */
+    /* List Index:  push (listindex stknext stktop) */
     TCL_INSTRUCTION_ENTRY("listLength", 0),
-    /* List Len:	push (listlength stktop) */
+    /* List Len:    push (listlength stktop) */
 
     DEPRECATED_INSTRUCTION_ENTRY1("appendScalar1", 2, 0, OPERAND_LVT1),
     /* Append scalar variable at op1<=255 in frame; value is stktop */
@@ -275,9 +284,9 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Invoke the command marked by the last 'expandStart' */
 
     TCL_INSTRUCTION_ENTRY1("listIndexImm", 5, 0, OPERAND_IDX4),
-    /* List Index:	push (lindex stktop op4) */
+    /* List Index:  push (lindex stktop op4) */
     TCL_INSTRUCTION_ENTRY2("listRangeImm", 9, 0, OPERAND_IDX4, OPERAND_IDX4),
-    /* List Range:	push (lrange stktop op4 op4) */
+    /* List Range:  push (lrange stktop op4 op4) */
     TCL_INSTRUCTION_ENTRY2("startCommand", 9, 0, OPERAND_OFFSET4, OPERAND_UINT4),
     /* Start of bytecoded command: op is the length of the cmd's code, op2
      * is number of commands here */
@@ -367,7 +376,7 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Reverse the order of the arg elements at the top of stack */
 
     TCL_INSTRUCTION_ENTRY1("regexp", 2, -1, OPERAND_INT1),
-    /* Regexp:	push (regexp stknext stktop) opnd == nocase */
+    /* Regexp:  push (regexp stknext stktop) opnd == nocase */
 
     TCL_INSTRUCTION_ENTRY1("existScalar", 5, 1, OPERAND_LVT4),
     /* Test if scalar variable at index op1 in call frame exists */
@@ -384,7 +393,7 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Do nothing */
     DEPRECATED_INSTRUCTION_ENTRY("returnCodeBranch1", -1),
     /* Jump to next instruction based on the return code on top of stack
-     * ERROR: +1;	RETURN: +3;	BREAK: +5;	CONTINUE: +7;
+     * ERROR: +1;   RETURN: +3; BREAK: +5;  CONTINUE: +7;
      * Other non-OK: +9 */
 
     TCL_INSTRUCTION_ENTRY2("unsetScalar", 6, 0, OPERAND_UNSF1, OPERAND_LVT4),
@@ -540,7 +549,7 @@ static const InstructionDesc tbcxInstructionTable[] = {
      * that pushed the iterTracker and info values. MUST be followed
      * immediately by a foreach_end.
      * Stack: ... listObjs... iterTracker info =>
-     *				... listObjs... iterTracker info */
+     *              ... listObjs... iterTracker info */
     TCL_INSTRUCTION_ENTRY("foreach_end", 0),
     /* Clean up a foreach loop by dropping the info value, the tracker
      * value and the lists that were being iterated over.
@@ -549,7 +558,7 @@ static const InstructionDesc tbcxInstructionTable[] = {
     /* Appends the value at the top of the stack to the list located on
      * the stack the "other side" of the foreach-related values.
      * Stack: ... collector listObjs... iterTracker info value =>
-     *			... collector listObjs... iterTracker info */
+     *          ... collector listObjs... iterTracker info */
 
     TCL_INSTRUCTION_ENTRY("strtrim", -1),
     /* [string trim] core: removes the characters (designated by the value
@@ -570,7 +579,7 @@ static const InstructionDesc tbcxInstructionTable[] = {
     TCL_INSTRUCTION_ENTRY1("concatStk", 5, INT_MIN, OPERAND_UINT4),
     /* Wrapper round Tcl_ConcatObj(), used for [concat] and [eval]. opnd
      * is number of values to concatenate.
-     * Operation:	push concat(stk1 stk2 ... stktop) */
+     * Operation:   push concat(stk1 stk2 ... stktop) */
 
     TCL_INSTRUCTION_ENTRY("strcaseUpper", 0),
     /* [string toupper] core: converts whole string to upper case using
@@ -654,13 +663,13 @@ static const InstructionDesc tbcxInstructionTable[] = {
      * Stack:  ... dict key1 ... keyN default => ... value */
 
     TCL_INSTRUCTION_ENTRY("strlt", -1),
-    /* String Less:			push (stknext < stktop) */
+    /* String Less:         push (stknext < stktop) */
     TCL_INSTRUCTION_ENTRY("strgt", -1),
-    /* String Greater:		push (stknext > stktop) */
+    /* String Greater:      push (stknext > stktop) */
     TCL_INSTRUCTION_ENTRY("strle", -1),
-    /* String Less or equal:	push (stknext <= stktop) */
+    /* String Less or equal:    push (stknext <= stktop) */
     TCL_INSTRUCTION_ENTRY("strge", -1),
-    /* String Greater or equal:	push (stknext >= stktop) */
+    /* String Greater or equal: push (stknext >= stktop) */
     TCL_INSTRUCTION_ENTRY2("lreplace", 6, INT_MIN, OPERAND_UINT4, OPERAND_LRPL1),
     /* Operands: number of arguments, flags
      * flags: Combination of TCL_LREPLACE_* flags
@@ -769,7 +778,41 @@ static const InstructionDesc tbcxInstructionTable[] = {
 _Static_assert((sizeof(tbcxInstructionTable) / sizeof(tbcxInstructionTable[0])) == (size_t)LAST_INST_OPCODE, "tbcx: opcode table size mismatch vs LAST_INST_OPCODE");
 #endif
 
-static void AppendPrintf(Tcl_Obj *dst, const char *fmt, ...) {
+typedef struct DumpAuxSummary {
+    unsigned char kind;
+    Tcl_Obj      *summary;
+} DumpAuxSummary;
+
+typedef struct DumpExcept {
+    unsigned char type;
+    uint32_t      nesting;
+    uint32_t      codeFrom, codeTo;
+    uint32_t      cont, brk, cat;
+} DumpExcept;
+
+typedef struct DumpBC {
+    unsigned char  *code;
+    size_t          codeLen;
+    Tcl_Obj       **lits;
+    uint32_t        numLits;
+    DumpAuxSummary *aux;
+    uint32_t        numAux;
+    DumpExcept     *xr;
+    uint32_t        numEx;
+    uint32_t        maxStack;
+    uint32_t        numLocals;
+} DumpBC;
+
+static void        AppendEscaped(Tcl_Obj *dst, const char *buf, Tcl_Size n);
+static void        AppendPrintf(Tcl_Obj *dst, const char *fmt, ...);
+static void        DisassembleBC(Tcl_Obj *out, const char *title, const DumpBC *bc);
+static int         DumpFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj);
+static const char *MethKindName(unsigned char k);
+static inline int  SafeHave(const unsigned char *base, size_t codeLen, size_t needFromPc);
+static void        ScanLabels(Tcl_HashTable *labels, const unsigned char *code, size_t codeLen, Tcl_Obj **lits, uint32_t numLits);
+int                Tbcx_DumpFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+
+static void        AppendPrintf(Tcl_Obj *dst, const char *fmt, ...) {
     char    stackbuf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -822,32 +865,7 @@ static int ReadAll(Tcl_Channel ch, unsigned char *dst, Tcl_Size need) {
     return 1;
 }
 
-static int ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj);
-
-typedef struct DumpAuxSummary {
-    unsigned char kind;
-    Tcl_Obj      *summary;
-} DumpAuxSummary;
-
-typedef struct DumpExcept {
-    unsigned char type;
-    uint32_t      nesting;
-    uint32_t      codeFrom, codeTo;
-    uint32_t      cont, brk, cat;
-} DumpExcept;
-
-typedef struct DumpBC {
-    unsigned char  *code;
-    size_t          codeLen;
-    Tcl_Obj       **lits;
-    uint32_t        numLits;
-    DumpAuxSummary *aux;
-    uint32_t        numAux;
-    DumpExcept     *xr;
-    uint32_t        numEx;
-    uint32_t        maxStack;
-    uint32_t        numLocals;
-} DumpBC;
+static int  ReadOneLiteral(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj);
 
 static void FreeDumpBC(DumpBC *bc) {
     if (!bc)
@@ -1475,15 +1493,6 @@ static inline int SafeHave(const unsigned char *base, size_t codeLen, size_t nee
     return needFromPc <= codeLen;
 }
 
-#define ENSURE_ROOM_OR_BREAK(_pc, _need)                                                                                                                                                               \
-    do {                                                                                                                                                                                               \
-        if (!SafeHave(bc->code, bc->codeLen, (_pc) + (_need))) {                                                                                                                                       \
-            AppendPrintf(out, "    %04zu: [decoder error: need %zu bytes, have %zu]\n", (size_t)(_pc), (size_t)(_need), (size_t)(bc->codeLen - (_pc)));                                                \
-            pc = bc->codeLen;                                                                                                                                                                          \
-            goto done_dis;                                                                                                                                                                             \
-        }                                                                                                                                                                                              \
-    } while (0)
-
 static inline void SkipOperand(InstOperandType tp, size_t *cursor) {
     *cursor +=
         (tp == OPERAND_INT1 || tp == OPERAND_UINT1 || tp == OPERAND_LVT1 || tp == OPERAND_LIT1 || tp == OPERAND_SCLS1 || tp == OPERAND_UNSF1 || tp == OPERAND_CLK1 || tp == OPERAND_LRPL1) ? 1 : 4;
@@ -1715,6 +1724,26 @@ static int DumpFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj)
         AppendPrintf(out, "\nProc: %s\n  ns=%s\n  args=%s\n", name, ns, args);
         DisassembleBC(out, "  Body", &pbc);
         FreeDumpBC(&pbc);
+        /* Per-proc registrations */
+        {
+            uint32_t nRegs = 0;
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_DecrRefCount(out);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: proc-reg count", -1));
+                return TCL_ERROR;
+            }
+            nRegs = le32(nb);
+            AppendPrintf(out, "  ProcRegs: %u", nRegs);
+            for (uint32_t rr = 0; rr < nRegs; ++rr) {
+                if (!ReadAll(ch, nb, 4)) {
+                    Tcl_DecrRefCount(out);
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: proc-reg litIx", -1));
+                    return TCL_ERROR;
+                }
+                uint32_t litIx = le32(nb);
+                AppendPrintf(out, "    - litIx=%u", litIx);
+            }
+        }
 
         Tcl_Free(name);
         Tcl_Free(ns);
@@ -1876,6 +1905,26 @@ static int DumpFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj)
         }
         DisassembleBC(out, "  Compiled", &mbc);
         FreeDumpBC(&mbc);
+        /* Per-method registrations */
+        {
+            uint32_t nRegs = 0;
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_DecrRefCount(out);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: method-reg count", -1));
+                return TCL_ERROR;
+            }
+            nRegs = le32(nb);
+            AppendPrintf(out, "  MethodRegs: %u", nRegs);
+            for (uint32_t rr = 0; rr < nRegs; ++rr) {
+                if (!ReadAll(ch, nb, 4)) {
+                    Tcl_DecrRefCount(out);
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: method-reg litIx", -1));
+                    return TCL_ERROR;
+                }
+                uint32_t litIx = le32(nb);
+                AppendPrintf(out, "    - litIx=%u", litIx);
+            }
+        }
 
         Tcl_Free(args);
         Tcl_Free(name);
@@ -1883,12 +1932,8 @@ static int DumpFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj)
     }
     {
         uint32_t numBinds = 0;
-        if (!ReadAll(ch, nb, 4)) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body map count", -1));
-            Tcl_DecrRefCount(out);
-            return TCL_ERROR;
-        }
-        numBinds = le32(nb);
+        if (!ReadAll(ch, nb, 4))
+            numBinds = le32(nb);
         AppendPrintf(out, "\nDefBodyMap: %u bindings\n", numBinds);
 
         for (uint32_t i = 0; i < numBinds; ++i) {

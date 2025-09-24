@@ -958,6 +958,7 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
             goto fail_top;
         }
         Tcl_Command createdTok = NULL;
+
         if (InstallPrecompiled(interp, nsPtr, name, args, pbc, pbcNumLocals, &createdTok) != TCL_OK) {
             FreeLoadedByteCode(pbc);
             Tcl_Free(name);
@@ -968,6 +969,34 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
         Tcl_Free(name);
         Tcl_Free(ns);
         Tcl_Free(args);
+
+        /* Per-proc registration list (top-level literal indexes that should adopt this body) */
+        {
+            uint32_t nRegs = 0;
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: proc-reg count", -1));
+                goto fail_top;
+            }
+            nRegs = le32(nb);
+            for (uint32_t rr = 0; rr < nRegs; ++rr) {
+                if (!ReadAll(ch, nb, 4)) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: proc-reg litIx", -1));
+                    goto fail_top;
+                }
+                uint32_t litIx = le32(nb);
+                if (litIx >= (uint32_t)topBC->numLitObjects) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid proc-reg litIx", -1));
+                    goto fail_top;
+                }
+                Tcl_Obj *L = topBC->objArrayPtr[litIx];
+                if (L) {
+                    /* Attach the same ByteCode to this literal as a precompiled body */
+                    ByteCode *bcToShare = pbc;
+                    bcToShare->refCount++;
+                    Tcl_StoreInternalRep(L, tbcxTyBytecode, &(Tcl_ObjInternalRep){.twoPtrValue = {bcToShare, NULL}});
+                }
+            }
+        }
     }
 
     uint32_t numClasses = 0;
@@ -1240,6 +1269,32 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
                 Tcl_DecrRefCount(argv[a]);
         }
 
+        /* Per-method registration list (top-level literal indexes that should adopt this body) */
+        {
+            uint32_t nRegs = 0;
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: method-reg count", -1));
+                goto fail_top;
+            }
+            nRegs = le32(nb);
+            for (uint32_t rr = 0; rr < nRegs; ++rr) {
+                if (!ReadAll(ch, nb, 4)) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: method-reg litIx", -1));
+                    goto fail_top;
+                }
+                uint32_t litIx = le32(nb);
+                if (litIx >= (uint32_t)topBC->numLitObjects) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid method-reg litIx", -1));
+                    goto fail_top;
+                }
+                Tcl_Obj *L = topBC->objArrayPtr[litIx];
+                if (L) {
+                    ByteCode *bcToShare = pbc;
+                    bcToShare->refCount++;
+                    Tcl_StoreInternalRep(L, tbcxTyBytecode, &(Tcl_ObjInternalRep){.twoPtrValue = {bcToShare, NULL}});
+                }
+            }
+        }
         Tcl_DecrRefCount(bodyObj);
         Tcl_Free(bodyStr);
         Tcl_Free(args);
@@ -1248,113 +1303,6 @@ static int LoadFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Namespace *ns
         Tcl_Free(cls);
         if (rc != TCL_OK)
             goto fail_top;
-    }
-
-    uint32_t numDefBinds = 0;
-    if (!ReadAll(ch, nb, 4))
-        goto fail_top;
-    numDefBinds = le32(nb);
-
-    for (uint32_t i = 0; i < numDefBinds; ++i) {
-        unsigned char kind = 0; /* 0=PROC, 1=CLASS_METHOD, 2=INSTANCE_METHOD */
-        if (!ReadAll(ch, &kind, 1))
-            goto fail_top;
-        /* A */
-        if (!ReadAll(ch, nb, 4))
-            goto fail_top;
-        uint32_t LA = le32(nb);
-        if (LA > TBCX_MAX_STR)
-            goto fail_top;
-        char *A = (char *)Tcl_Alloc(LA + 1);
-        if (LA && !ReadAll(ch, (unsigned char *)A, LA)) {
-            Tcl_Free(A);
-            goto fail_top;
-        }
-        A[LA] = 0;
-        /* B */
-        if (!ReadAll(ch, nb, 4)) {
-            Tcl_Free(A);
-            goto fail_top;
-        }
-        uint32_t LB = le32(nb);
-        if (LB > TBCX_MAX_STR) {
-            Tcl_Free(A);
-            goto fail_top;
-        }
-        char *B = (char *)Tcl_Alloc(LB + 1);
-        if (LB && !ReadAll(ch, (unsigned char *)B, LB)) {
-            Tcl_Free(A);
-            Tcl_Free(B);
-            goto fail_top;
-        }
-        B[LB] = 0;
-        /* body literal index */
-        if (!ReadAll(ch, nb, 4)) {
-            Tcl_Free(A);
-            Tcl_Free(B);
-            goto fail_top;
-        }
-        uint32_t litIx = le32(nb);
-
-        if (!topBC || litIx >= (uint32_t)topBC->numLitObjects) {
-            Tcl_Free(A);
-            Tcl_Free(B);
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: def-body literal index out of range", -1));
-            goto fail_top;
-        }
-        Tcl_Obj *lit = topBC->objArrayPtr[litIx];
-        if (!lit) {
-            Tcl_Free(A);
-            Tcl_Free(B);
-            goto fail_top;
-        }
-
-        if (kind == 0) {
-            /* PROC: A=proc FQN; B="" */
-            Tcl_Command tok = Tcl_FindCommand(interp, A, NULL, 0);
-            if (tok) {
-                Command *cmdPtr  = (Command *)tok;
-                Proc    *procPtr = (Proc *)cmdPtr->objClientData;
-                if (procPtr && procPtr->bodyPtr && Tcl_ConvertToType(interp, procPtr->bodyPtr, tbcxTyBytecode) == TCL_OK) {
-                    const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(procPtr->bodyPtr, tbcxTyBytecode);
-                    if (ir && ir->twoPtrValue.ptr1) {
-                        ByteCode *pbcIR = (ByteCode *)ir->twoPtrValue.ptr1;
-                        pbcIR->refCount++;
-                        ByteCodeSetInternalRep(lit, tbcxTyBytecode, pbcIR);
-                    }
-                } else {
-                    Tcl_ResetResult(interp);
-                }
-            }
-        } else {
-            /* CLASS/INSTANCE METHOD: A=class FQN; B=method name */
-            if (tbcxMethRegInit) {
-                Tcl_DString k;
-                Tcl_DStringInit(&k);
-                Tcl_DStringAppend(&k, "K:", 2);
-                Tcl_DStringAppend(&k, (kind == 1) ? "1:" : "0:", 2);
-                Tcl_DStringAppend(&k, A, -1);
-                Tcl_DStringAppend(&k, "\x1f", 1);
-                Tcl_DStringAppend(&k, B, -1);
-                Tcl_HashEntry *hPtr = Tcl_FindHashEntry(&tbcxMethReg, Tcl_DStringValue(&k));
-                if (hPtr) {
-                    Tcl_Obj *bodyObj = (Tcl_Obj *)Tcl_GetHashValue(hPtr);
-                    if (Tcl_ConvertToType(interp, bodyObj, tbcxTyBytecode) == TCL_OK) {
-                        const Tcl_ObjInternalRep *ir = Tcl_FetchInternalRep(bodyObj, tbcxTyBytecode);
-                        if (ir && ir->twoPtrValue.ptr1) {
-                            ByteCode *pbcIR = (ByteCode *)ir->twoPtrValue.ptr1;
-                            pbcIR->refCount++;
-                            ByteCodeSetInternalRep(lit, tbcxTyBytecode, pbcIR);
-                        }
-                    } else {
-                        Tcl_ResetResult(interp);
-                    }
-                }
-                Tcl_DStringFree(&k);
-            }
-        }
-        Tcl_Free(A);
-        Tcl_Free(B);
     }
 
     uint32_t numNsBodies = 0;
