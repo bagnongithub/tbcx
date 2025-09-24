@@ -155,9 +155,10 @@ static inline void putbe32(unsigned char *p, uint32_t v) {
     } while (0)
 
 #define TBCX_MAX_CODE (1024u * 1024u * 1024u)
-#define TBCX_MAX_LITERALS (50u * 1000u * 1000u)
-#define TBCX_MAX_AUX (50u * 1000u * 1000u)
-#define TBCX_MAX_EXCEPT (50u * 1000u * 1000u)
+#define TBCX_MAX_LITERALS (64u * 1024u * 1024u)
+#define TBCX_MAX_AUX (64u * 1024u * 1024u)
+#define TBCX_MAX_EXCEPT (64u * 1024u * 1024u)
+#define TBCX_MAX_STR (16u * 1024u * 1024u)
 
 extern const Tcl_ObjType *tbcxTyBignum;
 extern const Tcl_ObjType *tbcxTyBoolean;
