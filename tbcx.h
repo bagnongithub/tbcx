@@ -34,8 +34,9 @@
 #define TBCX_AUX_FOREACH 4u
 
 #define TBCX_METH_INST 0u
-#define TBCX_METH_CTOR 1u
-#define TBCX_METH_DTOR 2u
+#define TBCX_METH_CLASS 1u
+#define TBCX_METH_CTOR 2u
+#define TBCX_METH_DTOR 3u
 
 #pragma pack(push, 1)
 typedef struct TbcxHeader {

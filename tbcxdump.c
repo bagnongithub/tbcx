@@ -1597,6 +1597,8 @@ static const char *MethKindName(unsigned char k) {
     switch (k) {
     case TBCX_METH_INST:
         return "method";
+    case TBCX_METH_CLASS:
+        return "classmethod";
     case TBCX_METH_CTOR:
         return "constructor";
     case TBCX_METH_DTOR:
@@ -1879,6 +1881,137 @@ static int DumpFromChannel(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj)
         Tcl_Free(name);
         Tcl_Free(cls);
     }
+    {
+        uint32_t numBinds = 0;
+        if (!ReadAll(ch, nb, 4)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body map count", -1));
+            Tcl_DecrRefCount(out);
+            return TCL_ERROR;
+        }
+        numBinds = le32(nb);
+        AppendPrintf(out, "\nDefBodyMap: %u bindings\n", numBinds);
+
+        for (uint32_t i = 0; i < numBinds; ++i) {
+            unsigned char kind = 0;
+            if (!ReadAll(ch, &kind, 1)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body kind", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            /* A */
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body A len", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            uint32_t aL = le32(nb);
+            char    *A  = (char *)Tcl_Alloc(aL + 1);
+            if (aL && !ReadAll(ch, (unsigned char *)A, aL)) {
+                Tcl_Free(A);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body A", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            A[aL] = 0;
+            /* B */
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_Free(A);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body B len", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            uint32_t bL = le32(nb);
+            char    *B  = (char *)Tcl_Alloc(bL + 1);
+            if (bL && !ReadAll(ch, (unsigned char *)B, bL)) {
+                Tcl_Free(A);
+                Tcl_Free(B);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body B", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            B[bL] = 0;
+            /* bodyLitIx */
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_Free(A);
+                Tcl_Free(B);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: def-body lit index", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            uint32_t litIx = le32(nb);
+
+            /* Pretty-print one line per binding */
+            switch (kind) {
+            case 0: /* PROC */
+                AppendPrintf(out, "  [PROC]    name=%s  bodyLit=#%u\n", A, litIx);
+                break;
+            case 1: /* CLASS_METHOD */
+                AppendPrintf(out, "  [CLASS]   class=%s  method=%s  bodyLit=#%u\n", A, (bL ? B : ""), litIx);
+                break;
+            case 2: /* INSTANCE_METHOD */
+                AppendPrintf(out, "  [METHOD]  class=%s  method=%s  bodyLit=#%u\n", A, (bL ? B : ""), litIx);
+                break;
+            default:
+                AppendPrintf(out, "  [UNKNOWN kind=%u] A=%s B=%s bodyLit=#%u\n", (unsigned)kind, A, (bL ? B : ""), litIx);
+                break;
+            }
+
+            Tcl_Free(A);
+            Tcl_Free(B);
+        }
+    }
+    /* === Namespace bodies (compiled blocks attached to top-level literals) === */
+    {
+        uint32_t nNs = 0;
+        if (!ReadAll(ch, nb, 4)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: ns-bodies count", -1));
+            Tcl_DecrRefCount(out);
+            return TCL_ERROR;
+        }
+        nNs = le32(nb);
+        AppendPrintf(out, "\nNamespaceBodies: %u\n", nNs);
+
+        for (uint32_t i = 0; i < nNs; ++i) {
+            /* lit index */
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: ns-body lit index", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            uint32_t litIx = le32(nb);
+            /* ns name */
+            if (!ReadAll(ch, nb, 4)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: ns-body name len", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            uint32_t nsL = le32(nb);
+            char    *ns  = (char *)Tcl_Alloc(nsL + 1);
+            if (nsL && !ReadAll(ch, (unsigned char *)ns, nsL)) {
+                Tcl_Free(ns);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("short read: ns-body name", -1));
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            ns[nsL] = 0;
+
+            /* compiled bytecode block for this ns-body */
+            DumpBC mbc;
+            memset(&mbc, 0, sizeof(mbc));
+            uint32_t numLocals = 0;
+            if (ReadDumpBC_Block(interp, ch, /*packedHasCounts*/ 1, &H, &mbc, &numLocals) != TCL_OK) {
+                Tcl_Free(ns);
+                Tcl_DecrRefCount(out);
+                return TCL_ERROR;
+            }
+            AppendPrintf(out, "  [nsbody] lit=#%u ns=%s codeLen=%u lits=%u locals=%u maxStack=%u\n", litIx, ns, (unsigned)mbc.codeLen, (unsigned)mbc.numLits, (unsigned)mbc.numLocals,
+                         (unsigned)mbc.maxStack);
+            /* Optionally disassemble a few ops; or keep summary concise */
+            FreeDumpBC(&mbc);
+            Tcl_Free(ns);
+        }
+    }
+
     *outObj = out;
     return TCL_OK;
 }
