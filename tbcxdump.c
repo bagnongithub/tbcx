@@ -1,5 +1,5 @@
 /* ==========================================================================
- * tbcxdump.c — Disassemble and print bytecode saved in .tbcx files 
+ * tbcxdump.c — Disassemble and print bytecode saved in .tbcx files
  * ========================================================================== */
 
 #include "tbcx.h"
@@ -361,9 +361,9 @@ static int R_LPString(Reader *r, unsigned char **bufOut, uint32_t *lenOut, Tcl_O
         Tcl_AppendToObj(err, "LPString too large", -1);
         return TCL_ERROR;
     }
-    unsigned char *buf = (unsigned char *)ckalloc(n ? n : 1);
+    unsigned char *buf = (unsigned char *)Tcl_Alloc(n ? n : 1);
     if (n && R_Bytes(r, buf, n, err) != TCL_OK) {
-        ckfree(buf);
+        Tcl_Free(buf);
         return TCL_ERROR;
     }
     *bufOut = buf;
@@ -393,7 +393,7 @@ static void FreeLitPreviewArray(LitPreview *arr, uint32_t n) {
         if (arr[i].preview)
             Tcl_DecrRefCount(arr[i].preview);
     }
-    ckfree(arr);
+    Tcl_Free(arr);
 }
 
 static Tcl_Obj *MakeHexBytes(const unsigned char *p, Tcl_Size n, Tcl_Size maxShow) {
@@ -445,7 +445,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         Tcl_AppendPrintfToObj(out, "  [%u] STRING len=%u value=", idx, n);
         AppendQuoted(out, buf, n);
         Tcl_AppendToObj(out, "\n", 1);
-        ckfree(buf);
+        Tcl_Free(buf);
         break;
     }
     case LIT_WIDEINT: {
@@ -494,7 +494,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         Tcl_Obj *pv  = MakeHexBytes(buf, n, 16);
         dst->preview = pv;
         Tcl_AppendPrintfToObj(out, "  [%u] BYTEARRAY len=%u data=%s\n", idx, n, Tcl_GetString(pv));
-        ckfree(buf);
+        Tcl_Free(buf);
         break;
     }
     case LIT_BIGNUM: {
@@ -505,9 +505,9 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
             return TCL_ERROR;
         if (R_U32(r, &n, err) != TCL_OK)
             return TCL_ERROR;
-        unsigned char *buf = ckalloc(n);
+        unsigned char *buf = Tcl_Alloc(n);
         if (R_Bytes(r, buf, n, err) != TCL_OK) {
-            ckfree(buf);
+            Tcl_Free(buf);
             return TCL_ERROR;
         }
         Tcl_Obj *pv = Tcl_NewObj();
@@ -516,7 +516,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         Tcl_AppendObjToObj(pv, MakeHexBytes(buf, n, 16));
         dst->preview = pv;
         Tcl_AppendPrintfToObj(out, "  [%u] BIGNUM %s (len=%u)\n", idx, Tcl_GetString(pv), n);
-        ckfree(buf);
+        Tcl_Free(buf);
         break;
     }
     case LIT_DICT: {
@@ -571,7 +571,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         /* numArgs + args (each: LPString name, u8 hasDefault, then maybe default literal) */
         uint32_t nArgs = 0;
         if (R_U32(r, &nArgs, err) != TCL_OK) {
-            ckfree(ns);
+            Tcl_Free(ns);
             return TCL_ERROR;
         }
         Tcl_Obj *pv = Tcl_NewObj();
@@ -583,7 +583,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         Tcl_AppendPrintfToObj(out, "  [%u] LAMBDA ns=", idx);
         AppendQuoted(out, ns, nsLen);
         Tcl_AppendPrintfToObj(out, " args=%u\n", nArgs);
-        ckfree(ns);
+        Tcl_Free(ns);
         for (uint32_t i = 0; i < nArgs; i++) {
             unsigned char *name    = NULL;
             uint32_t       nameLen = 0;
@@ -591,12 +591,12 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
             if (R_LPString(r, &name, &nameLen, err) != TCL_OK)
                 return TCL_ERROR;
             if (R_U8(r, &hasDef, err) != TCL_OK) {
-                ckfree(name);
+                Tcl_Free(name);
                 return TCL_ERROR;
             }
             Tcl_AppendToObj(out, "    arg ", -1);
             AppendQuoted(out, name, nameLen);
-            ckfree(name);
+            Tcl_Free(name);
             if (hasDef) {
                 Tcl_AppendToObj(out, " default=", -1);
                 LitPreview tmp = {0, NULL};
@@ -630,7 +630,7 @@ static int ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx
         Tcl_AppendPrintfToObj(out, "  [%u] BYTECODE ns=", idx);
         AppendQuoted(out, nm, nameLen);
         Tcl_AppendToObj(out, "\n", 1);
-        ckfree(nm);
+        Tcl_Free(nm);
         if (DumpCompiledBlock(r, out, err) != TCL_OK)
             return TCL_ERROR;
         break;
@@ -796,13 +796,13 @@ static int DumpOneAux(Reader *r, Tcl_Obj *out, Tcl_Obj *err, uint32_t idx) {
             if (R_LPString(r, &key, &kL, err) != TCL_OK)
                 return TCL_ERROR;
             if (R_U32(r, &off, err) != TCL_OK) {
-                ckfree(key);
+                Tcl_Free(key);
                 return TCL_ERROR;
             }
             Tcl_AppendToObj(out, "    key=", -1);
             AppendQuoted(out, key, kL);
             Tcl_AppendPrintfToObj(out, " -> %u\n", off);
-            ckfree(key);
+            Tcl_Free(key);
         }
         break;
     }
@@ -875,9 +875,10 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     uint32_t codeLen;
     if (R_U32(r, &codeLen, err) != TCL_OK)
         return TCL_ERROR;
-    unsigned char *code = ckalloc(codeLen);
-    if (R_Bytes(r, code, codeLen, err) != TCL_OK) {
-        ckfree(code);
+    /* Be robust when codeLen==0 (mirror loader's alloc-at-least-1 policy) */
+    unsigned char *code = Tcl_Alloc(codeLen ? codeLen : 1u);
+    if (codeLen && R_Bytes(r, code, codeLen, err) != TCL_OK) {
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "  codeLen=%u\n", codeLen);
@@ -885,17 +886,17 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     /* Literals */
     uint32_t nLits;
     if (R_U32(r, &nLits, err) != TCL_OK) {
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "  literals=%u\n", nLits);
-    LitPreview *lits = (nLits ? (LitPreview *)ckalloc(sizeof(LitPreview) * nLits) : NULL);
+    LitPreview *lits = (nLits ? (LitPreview *)Tcl_Alloc(sizeof(LitPreview) * nLits) : NULL);
     for (uint32_t i = 0; i < nLits; i++) {
         lits[i].tag     = 0;
         lits[i].preview = NULL;
         if (ReadOneLiteral(r, &lits[i], out, i, err) != TCL_OK) {
             FreeLitPreviewArray(lits, nLits);
-            ckfree(code);
+            Tcl_Free(code);
             return TCL_ERROR;
         }
     }
@@ -904,14 +905,14 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     uint32_t nAux;
     if (R_U32(r, &nAux, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "  auxData=%u\n", nAux);
     for (uint32_t i = 0; i < nAux; i++) {
         if (DumpOneAux(r, out, err, i) != TCL_OK) {
             FreeLitPreviewArray(lits, nLits);
-            ckfree(code);
+            Tcl_Free(code);
             return TCL_ERROR;
         }
     }
@@ -919,7 +920,7 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     /* Disassemble the buffered code (AFTER collecting literal previews). */
     if (DisassembleCode(out, code, codeLen, lits, nLits, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
 
@@ -927,7 +928,7 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     uint32_t nExc;
     if (R_U32(r, &nExc, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "  exceptions=%u\n", nExc);
@@ -951,7 +952,7 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
         continue;
     exc_fail:
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
 
@@ -959,23 +960,23 @@ static int DumpCompiledBlock(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     uint32_t maxStack = 0, reserved = 0, numLocals = 0;
     if (R_U32(r, &maxStack, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     if (R_U32(r, &reserved, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     if (R_U32(r, &numLocals, err) != TCL_OK) {
         FreeLitPreviewArray(lits, nLits);
-        ckfree(code);
+        Tcl_Free(code);
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "  epilogue: maxStack=%u reserved=%u numLocals=%u\n", maxStack, reserved, numLocals);
 
     FreeLitPreviewArray(lits, nLits);
-    ckfree(code);
+    Tcl_Free(code);
     return TCL_OK;
 }
 
@@ -1019,30 +1020,30 @@ static int DumpOneMethod(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     /* kind */
     unsigned char kind = 0;
     if (R_U8(r, &kind, err) != TCL_OK) {
-        ckfree(cls);
+        Tcl_Free(cls);
         return TCL_ERROR;
     }
     /* name (LPString; may be empty for ctor/dtor) */
     unsigned char *name  = NULL;
     uint32_t       nameL = 0;
     if (R_LPString(r, &name, &nameL, err) != TCL_OK) {
-        ckfree(cls);
+        Tcl_Free(cls);
         return TCL_ERROR;
     }
     /* args (LPString) */
     unsigned char *args  = NULL;
     uint32_t       argsL = 0;
     if (R_LPString(r, &args, &argsL, err) != TCL_OK) {
-        ckfree(cls);
-        ckfree(name);
+        Tcl_Free(cls);
+        Tcl_Free(name);
         return TCL_ERROR;
     }
     /* bodyTextLen (ignored) */
     uint32_t bodyTextLen = 0;
     if (R_U32(r, &bodyTextLen, err) != TCL_OK) {
-        ckfree(cls);
-        ckfree(name);
-        ckfree(args);
+        Tcl_Free(cls);
+        Tcl_Free(name);
+        Tcl_Free(args);
         return TCL_ERROR;
     }
     Tcl_AppendToObj(out, "method class=", -1);
@@ -1052,9 +1053,9 @@ static int DumpOneMethod(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
     Tcl_AppendToObj(out, " args=", -1);
     AppendQuoted(out, args, argsL);
     Tcl_AppendToObj(out, "\n", 1);
-    ckfree(cls);
-    ckfree(name);
-    ckfree(args);
+    Tcl_Free(cls);
+    Tcl_Free(name);
+    Tcl_Free(args);
     return DumpCompiledBlock(r, out, err);
 }
 
@@ -1066,7 +1067,7 @@ static int DumpOneClass(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
         return TCL_ERROR;
     uint32_t nSupers = 0;
     if (R_U32(r, &nSupers, err) != TCL_OK) {
-        ckfree(name);
+        Tcl_Free(name);
         return TCL_ERROR;
     }
     Tcl_AppendToObj(out, "class ", -1);
@@ -1076,15 +1077,15 @@ static int DumpOneClass(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
         unsigned char *sup = NULL;
         uint32_t       sL  = 0;
         if (R_LPString(r, &sup, &sL, err) != TCL_OK) {
-            ckfree(name);
+            Tcl_Free(name);
             return TCL_ERROR;
         }
         Tcl_AppendToObj(out, " ", -1);
         AppendQuoted(out, sup, sL);
-        ckfree(sup);
+        Tcl_Free(sup);
     }
     Tcl_AppendToObj(out, "\n", 1);
-    ckfree(name);
+    Tcl_Free(name);
     return TCL_OK;
 }
 
@@ -1117,12 +1118,12 @@ static int DumpFile(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj) {
         if (R_LPString(&R, &name, &nL, err) != TCL_OK)
             goto fail;
         if (R_LPString(&R, &ns, &sL, err) != TCL_OK) {
-            ckfree(name);
+            Tcl_Free(name);
             goto fail;
         }
         if (R_LPString(&R, &args, &aL, err) != TCL_OK) {
-            ckfree(name);
-            ckfree(ns);
+            Tcl_Free(name);
+            Tcl_Free(ns);
             goto fail;
         }
         Tcl_AppendToObj(out, " proc ", -1);
@@ -1132,9 +1133,9 @@ static int DumpFile(Tcl_Interp *interp, Tcl_Channel ch, Tcl_Obj **outObj) {
         Tcl_AppendToObj(out, " args=", -1);
         AppendQuoted(out, args, aL);
         Tcl_AppendToObj(out, "\n", 1);
-        ckfree(name);
-        ckfree(ns);
-        ckfree(args);
+        Tcl_Free(name);
+        Tcl_Free(ns);
+        Tcl_Free(args);
         if (DumpCompiledBlock(&R, out, err) != TCL_OK)
             goto fail;
     }
@@ -1175,16 +1176,32 @@ fail:
 
 int Tbcx_DumpFileObjCmd(ClientData cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
     if (objc != 2) {
-        Tcl_WrongNumArgs(interp, 1, objv, "channelId");
+        Tcl_WrongNumArgs(interp, 1, objv, "filename");
         return TCL_ERROR;
     }
-    Tcl_Channel ch = Tcl_GetChannel(interp, Tcl_GetString(objv[1]), NULL);
-    if (!ch)
+
+    Tcl_Channel ch = Tcl_FSOpenFileChannel(interp, objv[1], "r", 0);
+    if (ch == NULL)
         return TCL_ERROR;
 
-    Tcl_Obj *out = NULL;
-    if (DumpFile(interp, ch, &out) != TCL_OK)
+    if (CheckBinaryChan(interp, ch) != TCL_OK) {
+        Tcl_Close(NULL, ch);
         return TCL_ERROR;
-    Tcl_SetObjResult(interp, out);
-    return TCL_OK;
+    }
+
+    Tcl_Obj *out = NULL;
+    int      rc  = DumpFile(interp, ch, &out);
+
+    if (rc == TCL_OK) {
+        if (Tcl_Close(interp, ch) != TCL_OK) {
+            if (out)
+                Tcl_DecrRefCount(out);
+            return TCL_ERROR;
+        }
+        Tcl_SetObjResult(interp, out);
+        return TCL_OK;
+    } else {
+        Tcl_Close(NULL, ch);
+        return TCL_ERROR;
+    }
 }
