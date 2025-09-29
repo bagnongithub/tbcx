@@ -1,8 +1,12 @@
-/* tbcx.h - TBCX shared declarations for Tcl 9.1+ */
+/* ==========================================================================
+ * tbcx.h - TBCX shared declarations for Tcl 9.1
+ * ========================================================================== */
 
 #ifndef TBCX_H
 #define TBCX_H
 
+#include <assert.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>

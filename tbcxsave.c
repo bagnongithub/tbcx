@@ -1,6 +1,6 @@
-/* tbcx_save.c — TBCX saver for Tcl 9.1
- *
- */
+/* ==========================================================================
+ * tbcxsave.c — TBCX compile+save for Tcl 9.1
+ * ========================================================================== */
 
 #include "tbcx.h"
 
@@ -56,12 +56,18 @@ typedef struct {
  * Forward Declarations
  * ========================================================================== */
 
+static void                    CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsVec *classes);
 int                            CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
+static int                     CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_Obj *argsList, Tcl_Obj *bodyObj, const char *whereTag);
 static uint32_t                ComputeNumLocalsFromAux(ByteCode *bc);
+static void                    CV_Free(ClsVec *cv);
+static void                    CV_Init(ClsVec *cv);
+static void                    CV_PushUnique(ClsVec *cv, Tcl_Obj *clsFqn);
 static void                    DV_Free(DefVec *dv);
 static void                    DV_Init(DefVec *dv);
 static void                    DV_Push(DefVec *dv, DefRec r);
 static int                     EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w);
+static Tcl_Obj                *FqnUnder(Tcl_Obj *curNs, Tcl_Obj *name);
 static void                    Lit_Bignum(TbcxOut *w, Tcl_Obj *o);
 static void                    Lit_Bytecode(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj);
 static void                    Lit_Dict(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *o);
