@@ -29,15 +29,18 @@ const AuxDataType *tbcxAuxJTStr      = NULL;
 const AuxDataType *tbcxAuxJTNum      = NULL;
 const AuxDataType *tbcxAuxDictUpdate = NULL;
 const AuxDataType *tbcxAuxForeach    = NULL;
+const AuxDataType *tbcxAuxNewForeach = NULL;
 
 static int         tbcxTypesLoaded   = 0;
+int                tbcxHostIsLE      = 1;
+
 TCL_DECLARE_MUTEX(tbcxTypeMutex);
 
-#if defined(WORDS_BIGENDIAN) || (defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)) || (defined(BYTE_ORDER) && (BYTE_ORDER == BIG_ENDIAN))
-int tbcxHostIsLE = 0;
-#else
-int tbcxHostIsLE = 1;
-#endif
+uint32_t PackTclVersion(void) {
+    int maj, min, pat, typ;
+    Tcl_GetVersion(&maj, &min, &pat, &typ);
+    return ((uint32_t)maj << 24) | ((uint32_t)min << 16) | ((uint32_t)pat << 8) | (uint32_t)typ;
+}
 
 void TbcxInitEndian(Tcl_Interp *interp) {
     int isLE = -1;
@@ -69,7 +72,7 @@ static const Tcl_ObjType *NeedObjType(const char *name) {
         Tcl_Obj *probe = NULL;
         if (strcmp(name, "bignum") == 0) {
             mp_int z;
-            if (mp_init(&z) != MP_OKAY)
+            if (TclBN_mp_init(&z) != MP_OKAY)
                 Tcl_Panic("tommath: mp_init failed");
             probe = Tcl_NewBignumObj(&z);
         } else if (strcmp(name, "boolean") == 0) {
@@ -94,7 +97,9 @@ static const Tcl_ObjType *NeedObjType(const char *name) {
 void Tbcx_InitTypes(Tcl_Interp *interp) {
     if (tbcxTypesLoaded)
         return;
+
     Tcl_MutexLock(&tbcxTypeMutex);
+
     if (tbcxTypesLoaded) {
         Tcl_MutexUnlock(&tbcxTypeMutex);
         return;
@@ -115,9 +120,11 @@ void Tbcx_InitTypes(Tcl_Interp *interp) {
     tbcxAuxJTStr      = TclGetAuxDataType("JumptableInfo");
     tbcxAuxJTNum      = TclGetAuxDataType("JumptableNumInfo");
     tbcxAuxDictUpdate = TclGetAuxDataType("DictUpdateInfo");
-    tbcxAuxForeach    = TclGetAuxDataType("NewForeachInfo");
+    tbcxAuxForeach    = TclGetAuxDataType("ForeachInfo");
+    tbcxAuxNewForeach = TclGetAuxDataType("NewForeachInfo");
 
     tbcxTypesLoaded   = 1;
+
     Tcl_MutexUnlock(&tbcxTypeMutex);
 }
 
