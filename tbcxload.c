@@ -1218,15 +1218,6 @@ static Tcl_Obj *ReadCompiledBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDef
     /* Build bytecode object */
     Tcl_Obj *bc = TBCX_NewByteCodeObjFromParts(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack);
 
-    /* Clean transient arrays (TBCX_NewByteCodeObjFromParts copied & freed them) */
-    if (lits)
-        Tcl_Free(lits);
-    if (auxArr)
-        Tcl_Free(auxArr);
-    if (exArr)
-        Tcl_Free(exArr);
-    Tcl_Free((char *)code);
-
     return bc;
 }
 
@@ -1519,8 +1510,10 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
 
     /* Build proc shim registry and fill from section */
     ProcShim shim;
-    if (InstallProcShim(ip, &shim) != TCL_OK)
-        return TCL_ERROR;
+    if (numProcs) {
+        if (InstallProcShim(ip, &shim) != TCL_OK)
+            return TCL_ERROR;
+    }
 
     for (uint32_t i = 0; i < numProcs; i++) {
         if (ReadOneProcAndRegister(&r, ip, &shim) != TCL_OK) {
@@ -1565,22 +1558,30 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
         return TCL_ERROR;
     }
     OOShim ooshim;
-    if (InstallOOShim(ip, &ooshim) != TCL_OK) {
-        UninstallProcShim(ip, &shim);
-        return TCL_ERROR;
+    if (numMethods) {
+        if (InstallOOShim(ip, &ooshim) != TCL_OK) {
+            if (numProcs)
+                UninstallProcShim(ip, &shim);
+            return TCL_ERROR;
+        }
     }
     for (uint32_t m = 0; m < numMethods; m++) {
         if (ReadOneMethodAndRegister(&r, ip, &ooshim) != TCL_OK) {
-            UninstallOOShim(ip, &ooshim);
-            UninstallProcShim(ip, &shim);
+            if (numMethods)
+                UninstallOOShim(ip, &ooshim);
+            if (numProcs)
+                UninstallProcShim(ip, &shim);
             return TCL_ERROR;
         }
     }
 
+    Tcl_IncrRefCount(topBC);
     int rc = Tcl_EvalObjEx(ip, topBC, TCL_EVAL_GLOBAL);
     Tcl_DecrRefCount(topBC);
-    UninstallOOShim(ip, &ooshim);
-    UninstallProcShim(ip, &shim);
+    if (numMethods)
+        UninstallOOShim(ip, &ooshim);
+    if (numProcs)
+        UninstallProcShim(ip, &shim);
     return rc;
 }
 

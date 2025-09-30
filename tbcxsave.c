@@ -942,9 +942,14 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
     while (remain > 0) {
         if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK)
             break;
-        if (p.numWords >= 1) {                     /* first token is TCL_TOKEN_COMMAND; words follow */
-            const Tcl_Token *w0  = p.tokenPtr + 1; /* first word */
-            Tcl_Obj         *cmd = WordLiteralObj(ip, w0);
+        if (p.numWords >= 1) {
+            /* In 9.x the stream may or may not begin with TCL_TOKEN_COMMAND.
+             * Step over it only when present so w0 is really the first word. */
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND) {
+                w0++; /* first word */
+            }
+            Tcl_Obj *cmd = WordLiteralObj(ip, w0);
             if (cmd) {
                 const char *cmdStr = Tcl_GetString(cmd);
                 if (p.numWords == 4 && strcmp(cmdStr, "proc") == 0) {
@@ -1139,6 +1144,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     WriteHeaderTop(w, top);
     if (w->err) {
         Tcl_DecrRefCount(srcCopy);
+        Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
         CV_Free(&classes);
         return TCL_ERROR;
@@ -1148,6 +1154,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     WriteCompiledBlock(w, &ctx, scriptObj);
     if (w->err) {
         Tcl_DecrRefCount(srcCopy);
+        Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
         CV_Free(&classes);
         return TCL_ERROR;
@@ -1175,6 +1182,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
             /* Compile body offline (proc semantics) and emit */
             if (CompileProcLikeAndEmit(w, &ctx, defs.v[i].ns, defs.v[i].args, defs.v[i].body, "body of proc") != TCL_OK) {
                 Tcl_DecrRefCount(srcCopy);
+                Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
                 CV_Free(&classes);
                 return TCL_ERROR;
@@ -1221,6 +1229,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
             /* Compile & emit block (proc semantics) */
             if (CompileProcLikeAndEmit(w, &ctx, defs.v[i].cls, defs.v[i].args, defs.v[i].body, "body of method") != TCL_OK) {
                 Tcl_DecrRefCount(srcCopy);
+                Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
                 CV_Free(&classes);
                 return TCL_ERROR;
@@ -1229,6 +1238,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     DV_Free(&defs);
     CV_Free(&classes);
     Tcl_DecrRefCount(srcCopy);
+    Tcl_DecrRefCount(rootNs);
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 }
 
