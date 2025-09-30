@@ -1,0 +1,16 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test interp.1 {multi-interpreter: load & eval in child interp} -body {
+    set in  [makeFile {return "child-ok"} interp.1-in.tcl]
+    set out [makeFile "" interp.1-out.tbcx]
+    tbcx::savefile $in $out
+    interp create I
+    set res [interp eval I [list package require tbcx \; tbcx::loadfile $out]]
+    interp delete I
+    set res
+} -result child-ok
+
+cleanupTests

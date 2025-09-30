@@ -1,0 +1,19 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+testConstraint haveThread [expr {![catch {package require Thread}]}]
+
+test thread.1 {thread: load & eval} -constraints haveThread -body {
+    set in  [makeFile {return "thread-ok"} thread.1-in.tcl]
+    set out [makeFile "" thread.1-out.tbcx]
+    tbcx::savefile $in $out
+    set script [list package require tbcx \; tbcx::loadfile $out]
+    set tid [thread::create]
+    set res [thread::send $tid $script]
+    thread::release $tid
+    set res
+} -result thread-ok
+
+cleanupTests

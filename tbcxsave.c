@@ -12,7 +12,6 @@ typedef struct {
     Tcl_Interp *interp;
     Tcl_Channel chan;
     int         err; /* TCL_OK or TCL_ERROR */
-    Tcl_WideInt written;
 } TbcxOut;
 
 typedef struct TbcxCtx {
@@ -111,7 +110,6 @@ static inline void W_Bytes(TbcxOut *w, const void *p, size_t n) {
         W_Error(w, "tbcx: short write");
         return;
     }
-    w->written += (Tcl_WideInt)n;
 }
 
 static inline void W_U8(TbcxOut *w, uint8_t v) {
@@ -663,7 +661,7 @@ static void WriteAux_DictUpdate(TbcxOut *w, AuxData *ad) {
         return;
     }
     W_U32(w, (uint32_t)info->length);
-    for (int i = 0; i < info->length; i++)
+    for (Tcl_Size i = 0; i < info->length; i++)
         W_U32(w, (uint32_t)info->varIndices[i]);
 }
 
@@ -946,8 +944,10 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
     Tcl_Size    remain = len >= 0 ? len : (Tcl_Size)strlen(script);
 
     while (remain > 0) {
-        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK)
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
             break;
+        }
         if (p.numWords >= 1) {
             /* In 9.x the stream may or may not begin with TCL_TOKEN_COMMAND.
              * Step over it only when present so w0 is really the first word. */
@@ -1275,7 +1275,7 @@ int Tbcx_SaveChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *co
     if (CheckBinaryChan(interp, ch) != TCL_OK)
         return TCL_ERROR;
 
-    TbcxOut w  = {interp, ch, TCL_OK, 0};
+    TbcxOut w  = {interp, ch, TCL_OK};
     int     rc = EmitTbcxStream(interp, script, &w);
     return rc;
 }
@@ -1301,7 +1301,7 @@ int Tbcx_SaveObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const 
         return TCL_ERROR;
     }
 
-    TbcxOut w  = {interp, ch, TCL_OK, 0};
+    TbcxOut w  = {interp, ch, TCL_OK};
     int     rc = EmitTbcxStream(interp, script, &w);
     if (Tcl_Close(interp, ch) != TCL_OK)
         rc = TCL_ERROR;
@@ -1353,7 +1353,7 @@ int Tbcx_SaveFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *co
         return TCL_ERROR;
     }
 
-    TbcxOut w  = {interp, out, TCL_OK, 0};
+    TbcxOut w  = {interp, out, TCL_OK};
     int     rc = EmitTbcxStream(interp, script, &w);
     Tcl_DecrRefCount(script);
     if (Tcl_Close(interp, out) != TCL_OK)

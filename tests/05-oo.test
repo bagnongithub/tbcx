@@ -1,0 +1,30 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test oo.1 {oo: instance method} -body {
+    set in  [makeFile {
+        oo::class create C
+        oo::define C method m {} {return ok}
+        set o [C new]
+        return [$o m]
+    } oo.1-in.tcl]
+    set out [makeFile "" oo.1-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result ok
+
+test oo.2 {oo: constructor passes args} -body {
+    set in  [makeFile {
+        oo::class create D
+        oo::define D constructor {x} {set ::ctor $x}
+        set o [D new hello]
+        return $::ctor
+    } oo.2-in.tcl]
+    set out [makeFile "" oo.2-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result hello
+
+cleanupTests

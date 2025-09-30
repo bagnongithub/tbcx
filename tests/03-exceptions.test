@@ -1,0 +1,19 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test exc.1 {exception ranges: try/catch} -body {
+    set in  [makeFile {
+        try {
+            error FOO
+        } on error {msg} {
+            return $msg
+        }
+    } exc.1-in.tcl]
+    set out [makeFile "" exc.1-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result FOO
+
+cleanupTests

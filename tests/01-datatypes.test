@@ -1,0 +1,86 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# STRING
+test literal.0 {LIT: STRING} -body {
+    set in  [makeFile {return "hello"} literal.0-in.tcl]
+    set out [makeFile "" literal.0-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result hello
+
+# BOOLEAN
+test literal.1 {LIT: BOOLEAN (true/false)} -body {
+    set in  [makeFile {return [list [expr {true || true}] [expr {false && false}]]} literal.1-in.tcl]
+    set out [makeFile "" literal.1-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {1 0}
+
+# LIST
+test literal.2 {LIT: LIST} -body {
+    set in  [makeFile {return [list a b c]} literal.2-in.tcl]
+    set out [makeFile "" literal.2-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result {a b c}
+
+# DICT (keys emitted in sorted order internally; semantics preserved)
+test literal.3 {LIT: DICT} -body {
+    set in  [makeFile {return [dict get [dict create z 1 a 2 m 3] a]} literal.3-in.tcl]
+    set out [makeFile "" literal.3-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 2
+
+# DOUBLE
+test literal.4 {LIT: DOUBLE} -body {
+    set in  [makeFile {return [expr {1.25 * 2.0}]} literal.4-in.tcl]
+    set out [makeFile "" literal.4-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 2.5
+
+# WIDEINT (negative)
+test literal.5 {LIT: WIDEINT -} -body {
+    set in  [makeFile {return [expr {-9223372036854775807 - 1}]} literal.5-in.tcl]
+    set out [makeFile "" literal.5-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result -9223372036854775808
+
+# WIDEUINT (non-negative wide value)
+test literal.6 {LIT: WIDEUINT +} -body {
+    set in  [makeFile {return [expr {9223372036854775807}]} literal.6-in.tcl]
+    set out [makeFile "" literal.6-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 9223372036854775807
+
+# BIGNUM (beyond 64-bit)
+test literal.7 {LIT: BIGNUM} -body {
+    set in  [makeFile {return [expr {2**80 - 5}]} literal.7-in.tcl]
+    set out [makeFile "" literal.7-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 1208925819614629174706171
+
+# BYTEARRAY
+test literal.8 {LIT: BYTEARRAY} -body {
+    set in  [makeFile {return [binary format c* {1 2 255}]} literal.8-in.tcl]
+    set out [makeFile "" literal.8-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result \x01\x02\xFF
+
+# LAMBDA_BC (apply compiles lambda to bytecode literal)
+test literal.9 {LIT: LAMBDA_BC} -body {
+    set in  [makeFile {return [apply {x {expr {$x + 1}}} 41]} literal.9-in.tcl]
+    set out [makeFile "" literal.9-out.tbcx]
+    tbcx::savefile $in $out
+    tbcx::loadfile $out
+} -result 42
+
+cleanupTests

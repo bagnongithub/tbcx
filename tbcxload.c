@@ -11,8 +11,7 @@
 typedef struct {
     Tcl_Interp *interp;
     Tcl_Channel chan;
-    int         err;  /* TCL_OK / TCL_ERROR */
-    Tcl_WideInt read; /* bytes read */
+    int         err; /* TCL_OK / TCL_ERROR */
 } TbcxIn;
 
 typedef struct { /* minimal prefix used by TclInitByteCodeObj in our path */
@@ -30,12 +29,10 @@ typedef struct { /* minimal prefix used by TclInitByteCodeObj in our path */
 } TBCX_CompileEnvMin;
 
 typedef struct {
-    Tcl_Interp   *interp;
     Tcl_HashTable procsByFqn; /* key: FQN Tcl_Obj*, val: procbody Tcl_Obj* */
 } ProcShim;
 
 typedef struct {
-    Tcl_Interp   *interp;
     Tcl_HashTable methodsByKey; /* key: Tcl_Obj* "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
 
 } OOShim;
@@ -91,7 +88,6 @@ static inline int R_Bytes(TbcxIn *r, void *p, size_t n) {
         R_Error(r, "tbcx: short read");
         return 0;
     }
-    r->read += (Tcl_WideInt)n;
     return 1;
 }
 
@@ -171,10 +167,11 @@ static int Tbcx_OODefineShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_
         return rc;
     }
     Tcl_Obj    *cls = objv[1], *sub = objv[2];
-    const char *subc   = Tcl_GetString(sub);
+    const char *subc         = Tcl_GetString(sub);
     /* Compute class FQN under current ns if relative */
-    Tcl_Obj    *clsFqn = NULL;
-    const char *nm     = Tcl_GetString(cls);
+    Tcl_Obj    *clsFqn       = NULL;
+    const char *nm           = Tcl_GetString(cls);
+    Tcl_Obj    *tmpEmptyArgs = NULL; /* for destructor(empty-args) lifetime */
     if (nm[0] == ':' && nm[1] == ':') {
         clsFqn = cls;
     } else {
@@ -225,6 +222,8 @@ static int Tbcx_OODefineShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_
             bodyIdx     = 3;
             /* Treat as empty-args form */
             runtimeArgs = Tcl_NewStringObj("", 0);
+            Tcl_IncrRefCount(runtimeArgs);
+            tmpEmptyArgs = runtimeArgs;
         }
         if (bodyIdx >= 0) {
             key       = BuildMethodKey(ip, clsFqn, kind, NULL);
@@ -263,6 +262,8 @@ static int Tbcx_OODefineShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_
             Tcl_DecrRefCount(argv0);
             if (clsFqn != cls)
                 Tcl_DecrRefCount(clsFqn);
+            if (tmpEmptyArgs)
+                Tcl_DecrRefCount(tmpEmptyArgs);
             return rc;
         }
     }
@@ -273,12 +274,13 @@ static int Tbcx_OODefineShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_
         Tcl_DecrRefCount(key);
     if (clsFqn != cls)
         Tcl_DecrRefCount(clsFqn);
+    if (tmpEmptyArgs)
+        Tcl_DecrRefCount(tmpEmptyArgs);
     return rc;
 }
 
 static int InstallOOShim(Tcl_Interp *ip, OOShim *os) {
     memset(os, 0, sizeof(*os));
-    os->interp = ip;
     Tcl_InitObjHashTable(&os->methodsByKey);
     if (TclRenameCommand(ip, "oo::define", "::tbcx::__oo_define_orig__") != TCL_OK)
         return TCL_ERROR;
@@ -627,6 +629,7 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_ListObjAppendElement(ip, pair, procBodyObj);
     Tcl_IncrRefCount(pair);
     Tcl_SetHashValue(he, pair);
+    Tcl_DecrRefCount(key);
     /* keep key & value alive in the table */
     Tcl_DecrRefCount(nameObj);
     Tcl_DecrRefCount(clsFqn);
@@ -733,21 +736,13 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
         uint32_t cnt = 0;
         if (!R_U32(r, &cnt))
             return NULL;
-        Tcl_Obj *pairs = Tcl_NewListObj(0, NULL);
+        Tcl_Obj *d = Tcl_NewDictObj();
         for (uint32_t i = 0; i < cnt; i++) {
             Tcl_Obj *k = ReadLiteral(r, ip);
             Tcl_Obj *v = ReadLiteral(r, ip);
             if (!k || !v)
                 return NULL;
-            Tcl_ListObjAppendElement(ip, pairs, k);
-            Tcl_ListObjAppendElement(ip, pairs, v);
-        }
-        Tcl_Obj  *d = Tcl_NewDictObj();
-        Tcl_Size  nPairs;
-        Tcl_Obj **vPairs;
-        Tcl_ListObjGetElements(ip, pairs, &nPairs, &vPairs);
-        for (Tcl_Size i = 0; i < nPairs; i += 2) {
-            Tcl_DictObjPut(ip, d, vPairs[i], vPairs[i + 1]);
+            Tcl_DictObjPut(ip, d, k, v);
         }
         return d;
     }
@@ -1218,6 +1213,14 @@ static Tcl_Obj *ReadCompiledBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDef
     /* Build bytecode object */
     Tcl_Obj *bc = TBCX_NewByteCodeObjFromParts(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack);
 
+    if (exArr)
+        Tcl_Free(exArr);
+    if (auxArr)
+        Tcl_Free(auxArr);
+    if (lits)
+        Tcl_Free(lits);
+    if (code)
+        Tcl_Free(code);
     return bc;
 }
 
@@ -1296,7 +1299,6 @@ static int Tbcx_ProcShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj 
 
 static int InstallProcShim(Tcl_Interp *ip, ProcShim *ps) {
     memset(ps, 0, sizeof(*ps));
-    ps->interp = ip;
     Tcl_InitObjHashTable(&ps->procsByFqn);
 
     Tcl_Command orig = Tcl_FindCommand(ip, "proc", NULL, 0);
@@ -1349,6 +1351,17 @@ static int ReadHeader(TbcxIn *r, TbcxHeader *H) {
     if (H->magic != TBCX_MAGIC || H->format != TBCX_FORMAT) {
         R_Error(r, "tbcx: bad header");
         return 0;
+    }
+    {
+        uint32_t rt   = PackTclVersion();
+        int      hMaj = (int)((H->tcl_version >> 24) & 0xFFu);
+        int      hMin = (int)((H->tcl_version >> 16) & 0xFFu);
+        int      rMaj = (int)((rt >> 24) & 0xFFu);
+        int      rMin = (int)((rt >> 16) & 0xFFu);
+        if (hMaj != rMaj || hMin > rMin) {
+            R_Error(r, "tbcx: incompatible Tcl version");
+            return 0;
+        }
     }
     return 1;
 }
@@ -1487,7 +1500,7 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
 }
 
 static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
-    TbcxIn     r = {ip, ch, TCL_OK, 0};
+    TbcxIn     r = {ip, ch, TCL_OK};
     TbcxHeader H;
 
     if (CheckBinaryChan(ip, ch) != TCL_OK)

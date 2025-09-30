@@ -1,0 +1,13 @@
+# -*-Tcl-*-
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test pkg.1 {package lifecycle: require -> forget -> require} -body {
+    set v1 [package require tbcx]
+    package forget tbcx
+    # Require again after forgetting; should succeed (commands may already exist)
+    set v2 [package require tbcx]
+    expr {$v1 eq $v2}
+} -result 1
+
+cleanupTests

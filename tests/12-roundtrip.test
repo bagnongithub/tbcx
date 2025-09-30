@@ -1,0 +1,18 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test rt.1 {roundtrip: compile->save->load->eval->dump} -body {
+    set in  [makeFile {proc p {} {return ok}; return [p]} rt.1-in.tcl]
+    set out [makeFile "" rt.1-out.tbcx]
+    # 1) save
+    tbcx::savefile $in $out
+    # 2) load+eval
+    set r [tbcx::loadfile $out]
+    # 3) dump
+    set d [tbcx::dumpfile $out]
+    expr {$r eq "ok" && [string match "tbcx:*" $d]}
+} -result 1
+
+cleanupTests

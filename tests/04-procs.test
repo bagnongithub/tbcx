@@ -1,0 +1,17 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test proc.1 {procs: compiled body substituted} -body {
+    set in  [makeFile {
+        proc add {x y} {expr {$x + $y}}
+        return [add 3 4]
+    } proc.1-in.tcl]
+    set out [makeFile "" proc.1-out.tbcx]
+    tbcx::savefile $in $out
+    # During load, the proc shim should substitute the precompiled body
+    tbcx::loadfile $out
+} -result 7
+
+cleanupTests

@@ -1,0 +1,18 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+test args.1 {save: wrong #args} -body {
+    list [catch {tbcx::save} e] $e
+} -result {1 {wrong # args: should be "tbcx::save script outPath"}}
+
+test args.2 {loadfile: wrong #args} -body {
+    list [catch {tbcx::loadfile} e] $e
+} -result {1 {wrong # args: should be "tbcx::loadfile in.tbcx"}}
+
+test args.3 {dumpfile: wrong #args} -body {
+    list [catch {tbcx::dumpfile} e] $e
+} -result {1 {wrong # args: should be "tbcx::dumpfile filename"}}
+
+cleanupTests
