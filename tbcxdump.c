@@ -711,21 +711,23 @@ static void PrintOperand(Tcl_Obj *out, OpKind k, const unsigned char *p, Tcl_Siz
         break;
     case OP_LIT1: {
         unsigned idx = p[0];
+        Tcl_AppendPrintfToObj(out, " lit[%u]", idx);
         if (idx < nLits && lits[idx].preview) {
-            Tcl_AppendPrintfToObj(out, " lit[%u]=", idx);
+            Tcl_AppendToObj(out, "=", -1);
             Tcl_AppendToObj(out, Tcl_GetString(lits[idx].preview), -1);
-        } else {
-            Tcl_AppendPrintfToObj(out, " lit[%u]", idx);
+        } else if (idx >= nLits) {
+            Tcl_AppendToObj(out, " (out-of-range)", -1);
         }
         break;
     }
     case OP_LIT4: {
         unsigned idx = U32LE(p);
+        Tcl_AppendPrintfToObj(out, " lit[%u]", idx);
         if (idx < nLits && lits[idx].preview) {
-            Tcl_AppendPrintfToObj(out, " lit[%u]=", idx);
+            Tcl_AppendToObj(out, "=", -1);
             Tcl_AppendToObj(out, Tcl_GetString(lits[idx].preview), -1);
-        } else {
-            Tcl_AppendPrintfToObj(out, " lit[%u]", idx);
+        } else if (idx >= nLits) {
+            Tcl_AppendToObj(out, " (out-of-range)", -1);
         }
         break;
     }
@@ -1006,8 +1008,8 @@ static int DumpHeader(Reader *r, Tcl_Obj *out, Tcl_Obj *err) {
         Tcl_AppendToObj(err, "bad tbcx header", -1);
         return TCL_ERROR;
     }
-    Tcl_AppendPrintfToObj(out, "tbcx: format=%u tcl=0x%08x codeLenTop=%" PRIu64 " lits=%u aux=%u locals=%u maxStack=%u\n", H.format, H.tcl_version, (unsigned long long)H.codeLenTop, H.numLitsTop,
-                          H.numAuxTop, H.numLocalsTop, H.maxStackTop);
+    Tcl_AppendPrintfToObj(out, "tbcx: format=%u tcl=0x%08x codeLenTop=%" PRIu64 " lits=%u aux=%u locals=%u maxStack=%u cmds=%u\n", H.format, H.tcl_version, (unsigned long long)H.codeLenTop,
+                          H.numLitsTop, H.numAuxTop, H.numLocalsTop, H.maxStackTop, H.numCmdsTop);
     return TCL_OK;
 }
 

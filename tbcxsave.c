@@ -894,8 +894,15 @@ static void CV_Free(ClsVec *cv) {
 }
 
 static Tcl_Obj *WordLiteralObj(Tcl_Interp *ip, const Tcl_Token *wordTok) {
-    /* Accept only SIMPLE_WORD or WORD with a single TEXT component */
-    if (wordTok->numComponents == 1) {
+    (void)ip;
+    /* 1) SIMPLE_WORD: token itself holds the bytes */
+    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD) {
+        Tcl_Obj *o = Tcl_NewStringObj(wordTok->start, wordTok->size);
+        Tcl_IncrRefCount(o);
+        return o;
+    }
+    /* 2) WORD with exactly one TEXT component (e.g., braced word) */
+    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents == 1) {
         const Tcl_Token *t = wordTok + 1;
         if (t->type == TCL_TOKEN_TEXT) {
             Tcl_Obj *o = Tcl_NewStringObj(t->start, t->size);
@@ -977,8 +984,10 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                         Tcl_Obj         *ns  = WordLiteralObj(ip, w2);
                         Tcl_Obj         *bod = WordLiteralObj(ip, w3);
                         if (ns && bod) {
-                            Tcl_Obj *nsFqn = FqnUnder(curNs, ns);
-                            CaptureStaticsRec(ip, Tcl_GetString(bod), bod->length, nsFqn, defs, classes);
+                            Tcl_Obj    *nsFqn  = FqnUnder(curNs, ns);
+                            Tcl_Size    bodLen = 0;
+                            const char *bodStr = Tcl_GetStringFromObj(bod, &bodLen);
+                            CaptureStaticsRec(ip, bodStr, bodLen, nsFqn, defs, classes);
                             Tcl_DecrRefCount(nsFqn);
                         }
                         if (ns)
@@ -1110,7 +1119,9 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     CV_Init(&classes);
     Tcl_Obj *rootNs = Tcl_NewStringObj("::", -1);
     Tcl_IncrRefCount(rootNs);
-    CaptureStaticsRec(ip, Tcl_GetString(scriptObj), scriptObj->length, rootNs, &defs, &classes);
+    Tcl_Size    scriptLen = 0;
+    const char *scriptStr = Tcl_GetStringFromObj(scriptObj, &scriptLen);
+    CaptureStaticsRec(ip, scriptStr, scriptLen, rootNs, &defs, &classes);
     Tcl_DecrRefCount(rootNs);
 
     /* 3. Header */

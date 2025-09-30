@@ -571,7 +571,7 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     ir.twoPtrValue.ptr1 = procPtr;
     ir.twoPtrValue.ptr2 = NULL;
     Tcl_StoreInternalRep(procBodyObj, Tcl_GetObjType("procbody"), &ir);
-    Tcl_IncrRefCount(procBodyObj);
+    procPtr->refCount++;
 
     /* Link ByteCode back to this Proc (parity with core procs) */
     {
@@ -670,7 +670,6 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
             }
             o = Tcl_NewBignumObj(&z);
             Tcl_Free((char *)le);
-            TclBN_mp_clear(&z);
         }
         return o;
     }
@@ -784,7 +783,6 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
                 return NULL;
             }
             Tcl_Obj *o = Tcl_NewBignumObj(&z);
-            TclBN_mp_clear(&z);
             return o;
         }
     }
@@ -1431,6 +1429,7 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     ir.twoPtrValue.ptr1 = procPtr;
     ir.twoPtrValue.ptr2 = NULL;
     Tcl_StoreInternalRep(procBodyObj, Tcl_GetObjType("procbody"), &ir);
+    procPtr->refCount++;
 
     /* Link ByteCode back to this Proc (parity with core procs) */
     {
