@@ -319,8 +319,9 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
         nsFQN = NsFqn(ctx->interp, nsPtr);
     }
     Tcl_IncrRefCount(nsFQN);
-    Tcl_Size    nsLen = 0;
-    const char *nsStr = Tcl_GetStringFromObj(nsFQN, &nsLen);
+    int         compiled_ok = 0;
+    Tcl_Size    nsLen       = 0;
+    const char *nsStr       = Tcl_GetStringFromObj(nsFQN, &nsLen);
     W_LPString(w, nsStr, nsLen);
 
     /* Marshal args & defaults from the public args list */
@@ -397,20 +398,23 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
         W_Error(w, "tbcx: lambda compile");
         goto lambda_cleanup;
     }
+    compiled_ok = 1;
     /* Emit compiled block */
     WriteCompiledBlock(w, ctx, bodyObj);
     Tcl_DecrRefCount(bodyObj);
 
 lambda_cleanup:
-    /* Drop temp Proc + locals */
-    for (CompiledLocal *cl = first; cl;) {
-        CompiledLocal *next = cl->nextPtr;
-        if (cl->defValuePtr)
-            Tcl_DecrRefCount(cl->defValuePtr);
-        Tcl_Free((char *)cl);
-        cl = next;
+    /* Drop temp Proc + locals only if the compiler did not take ownership. */
+    if (!compiled_ok) {
+        for (CompiledLocal *cl = first; cl;) {
+            CompiledLocal *next = cl->nextPtr;
+            if (cl->defValuePtr)
+                Tcl_DecrRefCount(cl->defValuePtr);
+            Tcl_Free((char *)cl);
+            cl = next;
+        }
+        Tcl_Free((char *)procPtr);
     }
-    Tcl_Free((char *)procPtr);
     Tcl_DecrRefCount(nsFQN);
 }
 
@@ -489,8 +493,10 @@ static int CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_
     }
     WriteCompiledBlock(w, ctx, bodyObj);
     Tcl_DecrRefCount(bodyObj);
+    /* Success: the Tcl compiler takes ownership of procPtr/locals in 9.1. */
+    return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 
-    /* cleanup locals/proc */
+    /* cleanup locals/proc (failure path only) */
     for (CompiledLocal *cl = first; cl;) {
         CompiledLocal *nx = cl->nextPtr;
         if (cl->defValuePtr)

@@ -272,7 +272,7 @@ cleanupTests
 # --- Lambdas ---------------------------------------------------------------
 
 test test_lambda.1 {LAMBDA: apply} -body {
-    set in  [makeFile {return [apply {x} {expr {$x * 3}} 14]} test_lambda..1-in.tcl]
+    set in  [makeFile {return [apply {x {expr {$x * 3}}} 14]} test_lambda..1-in.tcl]
     set out [makeFile "" test_lambda.1-out.tbcx]
     tbcx::savefile $in $out
     tbcx::loadfile $out
