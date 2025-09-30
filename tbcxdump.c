@@ -54,7 +54,6 @@ static int             DumpOneAux(Reader *r, Tcl_Obj *out, Tcl_Obj *err, uint32_
 static int             DumpOneClass(Reader *r, Tcl_Obj *out, Tcl_Obj *err);
 static int             DumpOneMethod(Reader *r, Tcl_Obj *out, Tcl_Obj *err);
 static void            FreeLitPreviewArray(LitPreview *arr, uint32_t n);
-static inline int32_t  I32LE(const unsigned char *p);
 static Tcl_Obj        *MakeHexBytes(const unsigned char *p, Tcl_Size n, Tcl_Size maxShow);
 static inline unsigned OpKindSize(OpKind k);
 static Tcl_Obj        *PreviewFromStringBytes(const unsigned char *s, uint32_t n);
@@ -66,7 +65,6 @@ static int             R_U64(Reader *r, uint64_t *v, Tcl_Obj *err);
 static int             R_U8(Reader *r, unsigned char *v, Tcl_Obj *err);
 static int             ReadOneLiteral(Reader *r, LitPreview *dst, Tcl_Obj *out, uint32_t idx, Tcl_Obj *err);
 int                    Tbcx_DumpFileObjCmd(ClientData cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-static inline uint32_t U32LE(const unsigned char *p);
 
 /* ==========================================================================
  * Bytecode
@@ -322,6 +320,15 @@ static int R_Bytes(Reader *r, unsigned char *buf, Tcl_Size n, Tcl_Obj *err) {
     if (r->limit >= 0)
         r->limit -= n;
     return TCL_OK;
+}
+
+/* Tcl bytecode encodes 4‑byte immediates in big‑endian order (network order). */
+static inline uint32_t BC_U32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline int32_t BC_I32(const unsigned char *p) {
+    return (int32_t)BC_U32(p);
 }
 
 static int R_U8(Reader *r, unsigned char *v, Tcl_Obj *err) {
@@ -668,46 +675,37 @@ static inline unsigned OpKindSize(OpKind k) {
     }
 }
 
-/* Reads a 4-byte little-endian (Tcl's internal byte order is defined) */
-static inline uint32_t U32LE(const unsigned char *p) {
-    return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static inline int32_t I32LE(const unsigned char *p) {
-    return (int32_t)U32LE(p);
-}
-
 static void PrintOperand(Tcl_Obj *out, OpKind k, const unsigned char *p, Tcl_Size pc, const LitPreview *lits, uint32_t nLits) {
     switch (k) {
     case OP_INT1:
         Tcl_AppendPrintfToObj(out, " %d", (int8_t)p[0]);
         break;
     case OP_INT4:
-        Tcl_AppendPrintfToObj(out, " %d", I32LE(p));
+        Tcl_AppendPrintfToObj(out, " %d", BC_I32(p));
         break;
     case OP_UINT1:
         Tcl_AppendPrintfToObj(out, " %u", (unsigned)p[0]);
         break;
     case OP_UINT4:
-        Tcl_AppendPrintfToObj(out, " %u", (unsigned)U32LE(p));
+        Tcl_AppendPrintfToObj(out, " %u", (unsigned)BC_U32(p));
         break;
     case OP_IDX4:
-        Tcl_AppendPrintfToObj(out, " %d", I32LE(p));
+        Tcl_AppendPrintfToObj(out, " %d", BC_I32(p));
         break;
     case OP_LVT1:
         Tcl_AppendPrintfToObj(out, " lvt[%u]", (unsigned)p[0]);
         break;
     case OP_LVT4:
-        Tcl_AppendPrintfToObj(out, " lvt[%u]", (unsigned)U32LE(p));
+        Tcl_AppendPrintfToObj(out, " lvt[%u]", (unsigned)BC_U32(p));
         break;
     case OP_AUX4:
-        Tcl_AppendPrintfToObj(out, " aux[%u]", (unsigned)U32LE(p));
+        Tcl_AppendPrintfToObj(out, " aux[%u]", (unsigned)BC_U32(p));
         break;
     case OP_OFF1:
         Tcl_AppendPrintfToObj(out, " ->%+" PRId64, (int64_t)(int8_t)p[0] + (int64_t)pc);
         break;
     case OP_OFF4:
-        Tcl_AppendPrintfToObj(out, " ->%+" PRId64, (int64_t)I32LE(p) + (int64_t)pc);
+        Tcl_AppendPrintfToObj(out, " ->%+" PRId64, (int64_t)BC_I32(p) + (int64_t)pc);
         break;
     case OP_LIT1: {
         unsigned idx = p[0];
@@ -721,7 +719,7 @@ static void PrintOperand(Tcl_Obj *out, OpKind k, const unsigned char *p, Tcl_Siz
         break;
     }
     case OP_LIT4: {
-        unsigned idx = U32LE(p);
+        unsigned idx = BC_U32(p);
         Tcl_AppendPrintfToObj(out, " lit[%u]", idx);
         if (idx < nLits && lits[idx].preview) {
             Tcl_AppendToObj(out, "=", -1);
@@ -751,7 +749,8 @@ static void PrintOperand(Tcl_Obj *out, OpKind k, const unsigned char *p, Tcl_Siz
 
 static int DisassembleCode(Tcl_Obj *out, const unsigned char *code, uint32_t codeLen, const LitPreview *lits, uint32_t nLits, Tcl_Obj *err) {
     Tcl_AppendToObj(out, "  code-disassembly:\n", -1);
-    Tcl_Size pc = 0;
+    Tcl_Size pc               = 0;
+    int      warnedDeprecated = 0;
     while ((uint32_t)pc < codeLen) {
         unsigned op = code[pc];
         if (op >= sizeof(opTable) / sizeof(opTable[0])) {
@@ -759,11 +758,10 @@ static int DisassembleCode(Tcl_Obj *out, const unsigned char *code, uint32_t cod
             return TCL_ERROR;
         }
         const OpInfo *d = &opTable[op];
-        if (d->deprecated) {
-            Tcl_AppendPrintfToObj(err, "deprecated opcode \"%s\" (op=%u) at pc=%" TCL_SIZE_MODIFIER "d — 9.1-only disassembler refuses to decode", d->name, op, pc);
-            return TCL_ERROR;
+        if (d->deprecated && !warnedDeprecated) {
+            Tcl_AppendToObj(out, "  ; WARNING: legacy 1-byte opcodes present; disassembling anyway\n", -1);
+            warnedDeprecated = 1;
         }
-
         Tcl_AppendPrintfToObj(out, "    %6" TCL_SIZE_MODIFIER "d: %-18s", pc, d->name);
 
         /* Gather and print operands */
@@ -774,6 +772,9 @@ static int DisassembleCode(Tcl_Obj *out, const unsigned char *code, uint32_t cod
             unsigned w = OpKindSize(d->op[i]);
             p += w;
             bytes += w;
+        }
+        if (d->deprecated) {
+            Tcl_AppendToObj(out, " ; deprecated", -1);
         }
         Tcl_AppendToObj(out, "\n", 1);
         pc += bytes;

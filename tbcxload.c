@@ -161,7 +161,12 @@ static int Tbcx_OODefineShimObjCmd(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_
     if (objc < 3) {
         Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
         Tcl_IncrRefCount(argv0);
-        int rc = Tcl_EvalObjv(ip, objc, (Tcl_Obj *const *)objv, TCL_EVAL_GLOBAL);
+        Tcl_Obj **argv2 = (Tcl_Obj **)Tcl_Alloc(sizeof(Tcl_Obj *) * (size_t)objc);
+        argv2[0]        = argv0;
+        for (Tcl_Size i = 1; i < objc; i++)
+            argv2[i] = objv[i];
+        int rc = Tcl_EvalObjv(ip, objc, argv2, TCL_EVAL_GLOBAL);
+        Tcl_Free(argv2);
         Tcl_DecrRefCount(argv0);
         return rc;
     }
@@ -319,11 +324,11 @@ static ByteCode *TbcxInitByteCodeObj(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr
     const size_t cmdLocBytes       = 0; /* no cmd-location map in this path */
 
     size_t       structureSize     = 0;
-    structureSize += TCL_ALIGN(sizeof(ByteCode)); /* align code bytes */
-    structureSize += TCL_ALIGN(codeBytes);        /* align obj array  */
-    structureSize += TCL_ALIGN(objArrayBytes);    /* align exc array  */
-    structureSize += TCL_ALIGN(exceptArrayBytes); /* align aux array  */
-    structureSize += auxDataArrayBytes;
+    structureSize += TCL_ALIGN(sizeof(ByteCode));
+    structureSize += TCL_ALIGN(codeBytes);
+    structureSize += TCL_ALIGN(objArrayBytes);
+    structureSize += TCL_ALIGN(exceptArrayBytes);
+    structureSize += TCL_ALIGN(auxDataArrayBytes);
     structureSize += cmdLocBytes;
 
     unsigned char *base    = (unsigned char *)Tcl_Alloc(structureSize);
@@ -389,7 +394,7 @@ static ByteCode *TbcxInitByteCodeObj(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr
     if (env->numAuxDataItems) {
         memcpy(p, env->auxDataArrayPtr, auxDataArrayBytes);
     }
-    p += auxDataArrayBytes;
+    p += TCL_ALIGN(auxDataArrayBytes);
 
     /* 5) No command-location map: point all cursors to the tail */
     codePtr->codeDeltaStart  = p;
@@ -472,6 +477,39 @@ static Tcl_Obj *TBCX_NewByteCodeObjFromParts(Tcl_Interp *ip, Namespace *nsPtr, c
         Tcl_Free(env.codeStart);
 
     return bcObj;
+}
+
+/* Ensure the CompiledLocal linked-list length matches 'neededCount' by
+ * appending placeholder locals (empty names, no defaults) for non-argument
+ * locals referenced by the compiled bytecode. This keeps the invariant that
+ * the list contains exactly 'numCompiledLocals' nodes, which Tcl assumes
+ * when freeing a Proc on redefinition.
+ */
+static void TbcxExtendCompiledLocals(Proc *procPtr, int neededCount) {
+    if (!procPtr)
+        return;
+    if (neededCount <= procPtr->numCompiledLocals)
+        return;
+
+    CompiledLocal *first = procPtr->firstLocalPtr;
+    CompiledLocal *last  = procPtr->lastLocalPtr;
+
+    for (int i = procPtr->numCompiledLocals; i < neededCount; i++) {
+        CompiledLocal *cl = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u);
+        memset(cl, 0, sizeof(CompiledLocal));
+        cl->nameLength = 0;
+        cl->name[0]    = '\0';
+        cl->frameIndex = i;
+        if (!first)
+            first = last = cl;
+        else {
+            last->nextPtr = cl;
+            last          = cl;
+        }
+    }
+    procPtr->firstLocalPtr     = first;
+    procPtr->lastLocalPtr      = last;
+    procPtr->numCompiledLocals = neededCount;
 }
 
 /* Install one precompiled method/ctor/dtor into OO registry */
@@ -562,8 +600,7 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     }
     procPtr->firstLocalPtr = first;
     procPtr->lastLocalPtr  = last;
-    if ((int)nLoc > procPtr->numCompiledLocals)
-        procPtr->numCompiledLocals = (int)nLoc;
+    TbcxExtendCompiledLocals(procPtr, (int)nLoc);
 
     /* Build procbody and register */
     Tcl_Obj           *procBodyObj = Tcl_NewObj();
@@ -897,8 +934,7 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
         Tcl_Obj *bodyBC        = ReadCompiledBlock(r, ip, nsPtr, &nLocalsBody);
         procPtr->bodyPtr       = bodyBC;
         Tcl_IncrRefCount(bodyBC);
-        if ((int)nLocalsBody > procPtr->numCompiledLocals)
-            procPtr->numCompiledLocals = (int)nLocalsBody;
+        TbcxExtendCompiledLocals(procPtr, (int)nLocalsBody);
 
         /* Build lambdaExpr object (internal rep: twoPtrValue { Proc*, nsObjPtr }) */
         Tcl_Obj           *lambda = Tcl_NewObj();
@@ -960,12 +996,18 @@ static int ReadAuxArray(TbcxIn *r, Tcl_Interp *ip, AuxData **auxOut, uint32_t *n
                     return 0;
                 uint32_t off = 0;
                 if (!R_U32(r, &off)) {
+                    Tcl_Free(s);
                     return 0;
                 }
+                /* IMPORTANT: Tcl does not copy string keys for TCL_STRING_KEYS tables.
+                 * We must keep a stable, heap-allocated copy alive as long as the table lives. */
+                char *stable = (char *)Tcl_Alloc(sl + 1u);
+                memcpy(stable, s, sl);
+                stable[sl] = '\0';
+                Tcl_Free(s); /* free transient buffer from R_LPString */
                 int            newEntry = 0;
-                Tcl_HashEntry *he       = Tcl_CreateHashEntry(&info->hashTable, (const char *)s, &newEntry);
+                Tcl_HashEntry *he       = Tcl_CreateHashEntry(&info->hashTable, (const char *)stable, &newEntry);
                 Tcl_SetHashValue(he, INT2PTR((int)off));
-                Tcl_Free(s);
             }
             arr[i].type       = tbcxAuxJTStr;
             arr[i].clientData = info;
@@ -1420,8 +1462,7 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     }
     procPtr->firstLocalPtr = first;
     procPtr->lastLocalPtr  = last;
-    if ((int)nLoc > procPtr->numCompiledLocals)
-        procPtr->numCompiledLocals = (int)nLoc;
+    TbcxExtendCompiledLocals(procPtr, (int)nLoc);
 
     /* Create procbody Tcl_Obj and register under nameFqn */
     Tcl_Obj           *procBodyObj = Tcl_NewObj();

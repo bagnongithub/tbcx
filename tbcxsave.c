@@ -1102,31 +1102,43 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
 static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     TbcxCtx ctx = {ip};
 
-    /* 1. Compile top-level */
-    if (TclSetByteCodeFromAny(ip, scriptObj, NULL, NULL) != TCL_OK)
-        return TCL_ERROR;
-    ByteCode *top = NULL;
-    ByteCodeGetInternalRep(scriptObj, tbcxTyBytecode, top);
-    if (!top) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to get top bytecode", -1));
-        return TCL_ERROR;
-    }
-
-    /* 2. Static capture (for header flags + proc/method/classes sections), recursive */
-    DefVec defs;
+    DefVec  defs;
     DV_Init(&defs);
     ClsVec classes;
     CV_Init(&classes);
     Tcl_Obj *rootNs = Tcl_NewStringObj("::", -1);
     Tcl_IncrRefCount(rootNs);
-    Tcl_Size    scriptLen = 0;
-    const char *scriptStr = Tcl_GetStringFromObj(scriptObj, &scriptLen);
-    CaptureStaticsRec(ip, scriptStr, scriptLen, rootNs, &defs, &classes);
-    Tcl_DecrRefCount(rootNs);
+    Tcl_Size    srcLen  = 0;
+    const char *srcStr  = Tcl_GetStringFromObj(scriptObj, &srcLen);
+    Tcl_Obj    *srcCopy = Tcl_NewStringObj(srcStr, srcLen);
+    Tcl_IncrRefCount(srcCopy);
+    if (srcLen > 0) {
+        CaptureStaticsRec(ip, srcStr, srcLen, rootNs, &defs, &classes);
+    }
+
+    /* 1. Compile top-level (after capture) */
+    if (TclSetByteCodeFromAny(ip, scriptObj, NULL, NULL) != TCL_OK) {
+        Tcl_DecrRefCount(srcCopy);
+        Tcl_DecrRefCount(rootNs);
+        DV_Free(&defs);
+        CV_Free(&classes);
+        return TCL_ERROR;
+    }
+    ByteCode *top = NULL;
+    ByteCodeGetInternalRep(scriptObj, tbcxTyBytecode, top);
+    if (!top) {
+        Tcl_DecrRefCount(srcCopy);
+        Tcl_DecrRefCount(rootNs);
+        DV_Free(&defs);
+        CV_Free(&classes);
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to get top bytecode", -1));
+        return TCL_ERROR;
+    }
 
     /* 3. Header */
     WriteHeaderTop(w, top);
     if (w->err) {
+        Tcl_DecrRefCount(srcCopy);
         DV_Free(&defs);
         CV_Free(&classes);
         return TCL_ERROR;
@@ -1135,6 +1147,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     /* 4. Top-level compiled block */
     WriteCompiledBlock(w, &ctx, scriptObj);
     if (w->err) {
+        Tcl_DecrRefCount(srcCopy);
         DV_Free(&defs);
         CV_Free(&classes);
         return TCL_ERROR;
@@ -1161,6 +1174,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
 
             /* Compile body offline (proc semantics) and emit */
             if (CompileProcLikeAndEmit(w, &ctx, defs.v[i].ns, defs.v[i].args, defs.v[i].body, "body of proc") != TCL_OK) {
+                Tcl_DecrRefCount(srcCopy);
                 DV_Free(&defs);
                 CV_Free(&classes);
                 return TCL_ERROR;
@@ -1206,14 +1220,15 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
 
             /* Compile & emit block (proc semantics) */
             if (CompileProcLikeAndEmit(w, &ctx, defs.v[i].cls, defs.v[i].args, defs.v[i].body, "body of method") != TCL_OK) {
+                Tcl_DecrRefCount(srcCopy);
                 DV_Free(&defs);
                 CV_Free(&classes);
                 return TCL_ERROR;
             }
         }
-
     DV_Free(&defs);
     CV_Free(&classes);
+    Tcl_DecrRefCount(srcCopy);
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 }
 
