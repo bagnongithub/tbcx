@@ -83,10 +83,19 @@ static inline void    R_Error(TbcxIn *r, const char *msg) {
 static inline int R_Bytes(TbcxIn *r, void *p, size_t n) {
     if (r->err)
         return 0;
-    int got = Tcl_ReadRaw(r->chan, (char *)p, (int)n);
-    if (got != (int)n) {
-        R_Error(r, "tbcx: short read");
-        return 0;
+    /* Tcl_ReadRaw asserts bytesToRead > 0 — treat 0 as a no-op. */
+    if (n == 0)
+        return 1;
+    size_t off = 0;
+    while (off < n) {
+        size_t want = n - off;
+        /* want <= INT_MAX given our upstream bounds */
+        int    got  = Tcl_ReadRaw(r->chan, (char *)p + off, (int)want);
+        if (got <= 0) {
+            R_Error(r, "tbcx: short read");
+            return 0;
+        }
+        off += (size_t)got;
     }
     return 1;
 }
@@ -128,7 +137,7 @@ static inline int R_LPString(TbcxIn *r, char **sp, uint32_t *lenp) {
         return 0;
     }
     char *buf = (char *)Tcl_Alloc(n + 1u);
-    if (!R_Bytes(r, buf, n)) {
+    if (n && !R_Bytes(r, buf, n)) {
         Tcl_Free(buf);
         return 0;
     }

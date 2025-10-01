@@ -9,7 +9,7 @@ test thread.1 {thread: load & eval} -constraints haveThread -body {
     set in  [makeFile {return "thread-ok"} thread.1-in.tcl]
     set out [makeFile "" thread.1-out.tbcx]
     tbcx::savefile $in $out
-    set script [list package require tbcx \; tbcx::loadfile $out]
+    set script [list package require tbcx ; tbcx::loadfile $out]
     set tid [thread::create]
     set res [thread::send $tid $script]
     thread::release $tid

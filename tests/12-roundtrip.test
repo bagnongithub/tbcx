@@ -13,6 +13,6 @@ test rt.1 {roundtrip: compile->save->load->eval->dump} -body {
     # 3) dump
     set d [tbcx::dumpfile $out]
     expr {$r eq "ok" && [string match "tbcx:*" $d]}
-} -result 1
+} -result ok
 
 cleanupTests

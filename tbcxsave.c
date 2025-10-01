@@ -862,10 +862,16 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
     W_U32(w, (uint32_t)bc->maxStackDepth);
     W_U32(w, 0);
     uint32_t numLocals = 0;
-    if (bc->localCachePtr)
+    /* Prefer the compiler's Proc view. localCachePtr is often NULL at save
+     * time, and AuxData does not cover ordinary compiled locals (e.g. loop
+     * temps from 'for', etc.). */
+    if (bc->procPtr) {
+        numLocals = (uint32_t)bc->procPtr->numCompiledLocals;
+    } else if (bc->localCachePtr) {
         numLocals = (uint32_t)bc->localCachePtr->numVars;
-    else
+    } else {
         numLocals = ComputeNumLocalsFromAux(bc);
+    }
     W_U32(w, numLocals);
 }
 

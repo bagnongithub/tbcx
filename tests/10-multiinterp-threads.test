@@ -9,7 +9,7 @@ test thread.2 {thread + sub-interpreter} -constraints haveThread -body {
     set in  [makeFile {return "combo-ok"} thread.2-in.tcl]
     set out [makeFile "" thread.2-out.tbcx]
     tbcx::savefile $in $out
-    set script [list interp create J \; interp eval J [list package require tbcx \; tbcx::loadfile $out] \; interp delete J]
+    set script [list interp create J ; interp eval J [list package require tbcx ; tbcx::loadfile $out] ; interp delete J]
     set tid [thread::create]
     set res [thread::send $tid $script]
     thread::release $tid
