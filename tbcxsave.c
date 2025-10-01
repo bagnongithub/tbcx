@@ -74,6 +74,7 @@ static void                    Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *l
 static void                    Lit_List(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *o);
 static inline const Tcl_Token *NextWord(const Tcl_Token *wordTok);
 static Tcl_Obj                *NsFqn(Tcl_Interp *ip, Tcl_Namespace *nsPtr);
+static Tcl_Obj                *ResolveToBytecodeObj(TbcxCtx *ctx, Tcl_Obj *cand);
 int                            Tbcx_SaveChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 int                            Tbcx_SaveFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 int                            Tbcx_SaveObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
@@ -396,9 +397,17 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
         W_Error(w, "tbcx: lambda compile");
         goto lambda_cleanup;
     }
-    compiled_ok = 1;
-    /* Emit compiled block */
-    WriteCompiledBlock(w, ctx, bodyObj);
+    compiled_ok = 1; /* compiler succeeded; it may have converted bodyObj to 'procbody' */
+    /* Resolve to the actual bytecode object (unwrap 'procbody' as needed) */
+    {
+        Tcl_Obj *cand  = procPtr->bodyPtr ? procPtr->bodyPtr : bodyObj;
+        Tcl_Obj *bcObj = ResolveToBytecodeObj(ctx, cand);
+        if (!bcObj) {
+            W_Error(w, "tbcx: proc-like compile produced no bytecode");
+        } else {
+            WriteCompiledBlock(w, ctx, bcObj);
+        }
+    }
     Tcl_DecrRefCount(bodyObj);
 
 lambda_cleanup:
@@ -489,7 +498,17 @@ static int CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_
         W_Error(w, "tbcx: proc-like compile failed");
         goto cple_fail;
     }
-    WriteCompiledBlock(w, ctx, bodyObj);
+    /* Compiler may leave bytecode in procPtr->bodyPtr and/or convert bodyObj to 'procbody'. */
+    {
+        Tcl_Obj *cand  = procPtr->bodyPtr ? procPtr->bodyPtr : bodyObj;
+        Tcl_Obj *bcObj = ResolveToBytecodeObj(ctx, cand);
+        if (!bcObj) {
+            Tcl_DecrRefCount(bodyObj);
+            W_Error(w, "tbcx: proc-like compile produced no bytecode");
+            goto cple_fail;
+        }
+        WriteCompiledBlock(w, ctx, bcObj);
+    }
     Tcl_DecrRefCount(bodyObj);
     /* Success: the Tcl compiler takes ownership of procPtr/locals in 9.1. */
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
@@ -552,6 +571,19 @@ static void WriteLiteral(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
     } else if (ty == tbcxTyBytecode) {
         W_U32(w, TBCX_LIT_BYTECODE);
         Lit_Bytecode(w, ctx, obj);
+    } else if (obj->typePtr == tbcxTyProcBody) {
+        Proc *p = (Proc *)obj->internalRep.twoPtrValue.ptr1;
+        if (p && p->bodyPtr) {
+            ByteCode *bc = NULL;
+            ByteCodeGetInternalRep(p->bodyPtr, tbcxTyBytecode, bc);
+            if (bc) {
+                W_U32(w, TBCX_LIT_BYTECODE);
+                Lit_Bytecode(w, ctx, p->bodyPtr);
+                return;
+            }
+        }
+        W_U32(w, TBCX_LIT_STRING);
+        W_LPString(w, "", 0);
     } else if (tbcxTyLambda != NULL && ty == tbcxTyLambda) {
         W_U32(w, TBCX_LIT_LAMBDA_BC);
         Lit_LambdaBC(w, ctx, obj);
@@ -714,6 +746,27 @@ static uint32_t ComputeNumLocalsFromAux(ByteCode *bc) {
         }
     }
     return (uint32_t)(maxIdx + 1);
+}
+
+static Tcl_Obj *ResolveToBytecodeObj(TbcxCtx *ctx, Tcl_Obj *cand) {
+    if (!cand)
+        return NULL;
+    /* Fast path: direct bytecode rep */
+    ByteCode *bc = NULL;
+    ByteCodeGetInternalRep(cand, tbcxTyBytecode, bc);
+    if (bc)
+        return cand;
+    if (cand->typePtr == tbcxTyProcBody) {
+        Proc *p = (Proc *)cand->internalRep.twoPtrValue.ptr1;
+        if (p && p->bodyPtr) {
+            ByteCode *bc2 = NULL;
+            ByteCodeGetInternalRep(p->bodyPtr, tbcxTyBytecode, bc2);
+            if (bc2)
+                return p->bodyPtr;
+        }
+    }
+    (void)ctx; /* reserved for future use */
+    return NULL;
 }
 
 static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
@@ -899,13 +952,7 @@ static void CV_Free(ClsVec *cv) {
 
 static Tcl_Obj *WordLiteralObj(Tcl_Interp *ip, const Tcl_Token *wordTok) {
     (void)ip;
-    /* 1) SIMPLE_WORD: token itself holds the bytes */
-    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD) {
-        Tcl_Obj *o = Tcl_NewStringObj(wordTok->start, wordTok->size);
-        Tcl_IncrRefCount(o);
-        return o;
-    }
-    /* 2) WORD with exactly one TEXT component (e.g., braced word) */
+    /* Prefer: WORD with exactly one TEXT component — already strips braces */
     if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents == 1) {
         const Tcl_Token *t = wordTok + 1;
         if (t->type == TCL_TOKEN_TEXT) {
@@ -913,6 +960,19 @@ static Tcl_Obj *WordLiteralObj(Tcl_Interp *ip, const Tcl_Token *wordTok) {
             Tcl_IncrRefCount(o);
             return o;
         }
+    }
+    /* Fallback: SIMPLE_WORD — but peel balanced braces if present */
+    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD) {
+        const char *s = wordTok->start;
+        Tcl_Size    n = wordTok->size;
+        if (n >= 2 && s[0] == '{' && s[n - 1] == '}') {
+            Tcl_Obj *o = Tcl_NewStringObj(s + 1, n - 2);
+            Tcl_IncrRefCount(o);
+            return o;
+        }
+        Tcl_Obj *o = Tcl_NewStringObj(s, n);
+        Tcl_IncrRefCount(o);
+        return o;
     }
     return NULL;
 }

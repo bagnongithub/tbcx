@@ -21,8 +21,9 @@ const Tcl_ObjType *tbcxTyBytecode    = NULL;
 const Tcl_ObjType *tbcxTyDict        = NULL;
 const Tcl_ObjType *tbcxTyDouble      = NULL;
 const Tcl_ObjType *tbcxTyInt         = NULL;
-const Tcl_ObjType *tbcxTyList        = NULL;
 const Tcl_ObjType *tbcxTyLambda      = NULL;
+const Tcl_ObjType *tbcxTyList        = NULL;
+const Tcl_ObjType *tbcxTyProcBody    = NULL;
 
 const AuxDataType *tbcxAuxJTStr      = NULL;
 const AuxDataType *tbcxAuxJTNum      = NULL;
@@ -106,15 +107,16 @@ void Tbcx_InitTypes(Tcl_Interp *interp) {
 
     TbcxInitEndian(interp);
 
+    tbcxTyBignum      = NeedObjType("bignum");
     tbcxTyBoolean     = NeedObjType("boolean");
     tbcxTyByteArray   = NeedObjType("bytearray");
     tbcxTyBytecode    = NeedObjType("bytecode");
     tbcxTyDict        = NeedObjType("dict");
     tbcxTyDouble      = NeedObjType("double");
     tbcxTyInt         = NeedObjType("int");
-    tbcxTyList        = NeedObjType("list");
-    tbcxTyBignum      = NeedObjType("bignum");
     tbcxTyLambda      = Tcl_GetObjType("lambdaExpr");
+    tbcxTyList        = NeedObjType("list");
+    tbcxTyProcBody    = NeedObjType("procbody");
 
     tbcxAuxJTStr      = TclGetAuxDataType("JumptableInfo");
     tbcxAuxJTNum      = TclGetAuxDataType("JumptableNumInfo");

@@ -609,7 +609,7 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_ObjInternalRep ir;
     ir.twoPtrValue.ptr1 = procPtr;
     ir.twoPtrValue.ptr2 = NULL;
-    Tcl_StoreInternalRep(procBodyObj, Tcl_GetObjType("procbody"), &ir);
+    Tcl_StoreInternalRep(procBodyObj, tbcxTyProcBody, &ir);
     procPtr->refCount++;
 
     /* Link ByteCode back to this Proc (parity with core procs) */
@@ -1473,7 +1473,7 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     Tcl_ObjInternalRep ir;
     ir.twoPtrValue.ptr1 = procPtr;
     ir.twoPtrValue.ptr2 = NULL;
-    Tcl_StoreInternalRep(procBodyObj, Tcl_GetObjType("procbody"), &ir);
+    Tcl_StoreInternalRep(procBodyObj, tbcxTyProcBody, &ir);
     procPtr->refCount++;
 
     /* Link ByteCode back to this Proc (parity with core procs) */

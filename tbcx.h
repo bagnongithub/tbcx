@@ -72,8 +72,9 @@ extern const Tcl_ObjType *tbcxTyBytecode;
 extern const Tcl_ObjType *tbcxTyDict;
 extern const Tcl_ObjType *tbcxTyDouble;
 extern const Tcl_ObjType *tbcxTyInt;
-extern const Tcl_ObjType *tbcxTyList;
 extern const Tcl_ObjType *tbcxTyLambda;
+extern const Tcl_ObjType *tbcxTyList;
+extern const Tcl_ObjType *tbcxTyProcBody;
 
 extern const AuxDataType *tbcxAuxJTStr;
 extern const AuxDataType *tbcxAuxJTNum;
