@@ -15,7 +15,10 @@ typedef struct {
 } TbcxOut;
 
 typedef struct TbcxCtx {
-    Tcl_Interp *interp;
+    Tcl_Interp   *interp;
+    Tcl_HashTable stripBodies; /* set of body strings to strip (by exact bytes) */
+    int           stripInit;
+    int           stripActive; /* only active when writing top-level block */
 } TbcxCtx;
 
 typedef struct {
@@ -65,6 +68,10 @@ static void                    CV_PushUnique(ClsVec *cv, Tcl_Obj *clsFqn);
 static void                    DV_Free(DefVec *dv);
 static void                    DV_Init(DefVec *dv);
 static void                    DV_Push(DefVec *dv, DefRec r);
+static void                    CtxInitStripBodies(TbcxCtx *ctx);
+static void                    CtxAddStripBody(TbcxCtx *ctx, Tcl_Obj *body);
+static void                    CtxFreeStripBodies(TbcxCtx *ctx);
+static int                     ShouldStripBody(TbcxCtx *ctx, Tcl_Obj *obj);
 static int                     EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w);
 static Tcl_Obj                *FqnUnder(Tcl_Obj *curNs, Tcl_Obj *name);
 static void                    Lit_Bignum(TbcxOut *w, Tcl_Obj *o);
@@ -140,6 +147,47 @@ static inline void W_LPString(TbcxOut *w, const char *s, Tcl_Size n) {
     }
     W_U32(w, (uint32_t)n);
     W_Bytes(w, s, (size_t)n);
+}
+
+static void CtxInitStripBodies(TbcxCtx *ctx) {
+    if (!ctx)
+        return;
+    Tcl_InitHashTable(&ctx->stripBodies, TCL_STRING_KEYS);
+    ctx->stripInit   = 1;
+    ctx->stripActive = 0;
+}
+
+static void CtxAddStripBody(TbcxCtx *ctx, Tcl_Obj *body) {
+    if (!ctx || !ctx->stripInit || !body)
+        return;
+    Tcl_Size       len   = 0;
+    const char    *s     = Tcl_GetStringFromObj(body, &len);
+    int            isNew = 0;
+    /* With TCL_STRING_KEYS tables, Tcl copies the key; we must not free it ourselves. */
+    Tcl_HashEntry *he    = Tcl_CreateHashEntry(&ctx->stripBodies, (const char *)s, &isNew);
+    if (isNew) {
+        Tcl_SetHashValue(he, (ClientData)(uintptr_t)len);
+    }
+}
+
+static int ShouldStripBody(TbcxCtx *ctx, Tcl_Obj *obj) {
+    if (!ctx || !ctx->stripInit || !ctx->stripActive || !obj)
+        return 0;
+    Tcl_Size       len = 0;
+    const char    *s   = Tcl_GetStringFromObj(obj, &len);
+    Tcl_HashEntry *he  = Tcl_FindHashEntry(&ctx->stripBodies, (const char *)s);
+    if (!he)
+        return 0;
+    uintptr_t storedLen = (uintptr_t)Tcl_GetHashValue(he);
+    return (storedLen == (uintptr_t)len) ? 1 : 0;
+}
+
+static void CtxFreeStripBodies(TbcxCtx *ctx) {
+    if (!ctx || !ctx->stripInit)
+        return;
+    Tcl_DeleteHashTable(&ctx->stripBodies);
+    ctx->stripInit   = 0;
+    ctx->stripActive = 0;
 }
 
 /* Obtain FQN for a namespace object; fallback "::" */
@@ -359,37 +407,19 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
     procPtr->refCount          = 1;
     procPtr->numArgs           = (int)argc;
     procPtr->numCompiledLocals = (int)argc;
-
-    CompiledLocal *first = NULL, *last = NULL;
-    for (Tcl_Size i = 0; i < argc; i++) {
-        Tcl_Size  nf = 0, nmLen = 0;
-        Tcl_Obj **fv = NULL;
-        if (Tcl_ListObjGetElements(ctx->interp, argv[i], &nf, &fv) != TCL_OK) {
+    /* Build compiled locals from the public args list */
+    {
+        CompiledLocal *first = NULL, *last = NULL;
+        int            numA = 0;
+        if (TbcxBuildLocalsFromArgs(ctx->interp, argsList, &first, &last, &numA) != TCL_OK) {
             W_Error(w, "tbcx: lambda args decode");
             goto lambda_cleanup;
         }
-        const char    *nm = Tcl_GetStringFromObj(fv[0], &nmLen);
-        CompiledLocal *cl = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-        memset(cl, 0, sizeof(CompiledLocal));
-        cl->nameLength = (int)nmLen;
-        memcpy(cl->name, nm, (size_t)nmLen + 1);
-        cl->frameIndex = (int)i;
-        cl->flags      = VAR_ARGUMENT;
-        if (nf == 2) {
-            cl->defValuePtr = fv[1];
-            Tcl_IncrRefCount(cl->defValuePtr);
-        }
-        if (i == argc - 1 && nmLen == 4 && memcmp(nm, "args", 4) == 0)
-            cl->flags |= VAR_IS_ARGS;
-        if (!first)
-            first = last = cl;
-        else {
-            last->nextPtr = cl;
-            last          = cl;
-        }
+        procPtr->numArgs           = numA;
+        procPtr->numCompiledLocals = numA;
+        procPtr->firstLocalPtr     = first;
+        procPtr->lastLocalPtr      = last;
     }
-    procPtr->firstLocalPtr = first;
-    procPtr->lastLocalPtr  = last;
 
     Tcl_IncrRefCount(bodyObj);
     if (TclProcCompileProc(ctx->interp, procPtr, bodyObj, (Namespace *)nsPtr, "body of lambda term", "lambdaExpr") != TCL_OK) {
@@ -413,15 +443,10 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
 lambda_cleanup:
     /* Drop temp Proc + locals only if the compiler did not take ownership. */
     if (!compiled_ok) {
-        for (CompiledLocal *cl = first; cl;) {
-            CompiledLocal *next = cl->nextPtr;
-            if (cl->defValuePtr)
-                Tcl_DecrRefCount(cl->defValuePtr);
-            Tcl_Free((char *)cl);
-            cl = next;
-        }
+        TbcxFreeCompiledLocals(procPtr->firstLocalPtr);
         Tcl_Free((char *)procPtr);
     }
+
     Tcl_DecrRefCount(nsFQN);
 }
 
@@ -446,52 +471,23 @@ static int CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_
     Tcl_Namespace *ns   = Tcl_FindNamespace(ip, nsNm, NULL, 0);
     if (!ns)
         ns = Tcl_CreateNamespace(ip, nsNm, NULL, NULL);
-
-    Tcl_Size  argc = 0;
-    Tcl_Obj **argv = NULL;
-    if (Tcl_ListObjGetElements(ip, argsList, &argc, &argv) != TCL_OK) {
-        W_Error(w, "tbcx: bad args list");
-        return TCL_ERROR;
-    }
-
     Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
-    procPtr->iPtr              = (Interp *)ip;
-    procPtr->refCount          = 1;
-    procPtr->numArgs           = (int)argc;
-    procPtr->numCompiledLocals = (int)argc;
-
-    CompiledLocal *first = NULL, *last = NULL;
-    for (Tcl_Size i = 0; i < argc; i++) {
-        Tcl_Size  nf = 0, nmLen = 0;
-        Tcl_Obj **fv = NULL;
-        if (Tcl_ListObjGetElements(ip, argv[i], &nf, &fv) != TCL_OK || nf < 1 || nf > 2) {
+    procPtr->iPtr     = (Interp *)ip;
+    procPtr->refCount = 1;
+    /* Build compiled locals from the public args list */
+    {
+        CompiledLocal *first = NULL, *last = NULL;
+        int            numA = 0;
+        if (TbcxBuildLocalsFromArgs(ip, argsList, &first, &last, &numA) != TCL_OK) {
             W_Error(w, "tbcx: bad arg spec");
             goto cple_fail;
         }
-        const char    *nm = Tcl_GetStringFromObj(fv[0], &nmLen);
-        CompiledLocal *cl = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-        memset(cl, 0, sizeof(CompiledLocal));
-        cl->nameLength = (int)nmLen;
-        memcpy(cl->name, nm, (size_t)nmLen + 1);
-        cl->frameIndex = (int)i;
-        cl->flags      = VAR_ARGUMENT;
-        if (nf == 2) {
-            cl->defValuePtr = fv[1];
-            Tcl_IncrRefCount(cl->defValuePtr);
-        }
-        if (i == argc - 1 && nmLen == 4 && memcmp(nm, "args", 4) == 0)
-            cl->flags |= VAR_IS_ARGS;
-        if (!first)
-            first = last = cl;
-        else {
-            last->nextPtr = cl;
-            last          = cl;
-        }
+        procPtr->numArgs           = numA;
+        procPtr->numCompiledLocals = numA;
+        procPtr->firstLocalPtr     = first;
+        procPtr->lastLocalPtr      = last;
     }
-    procPtr->firstLocalPtr = first;
-    procPtr->lastLocalPtr  = last;
-
     Tcl_IncrRefCount(bodyObj);
     if (TclProcCompileProc(ip, procPtr, bodyObj, (Namespace *)ns, whereTag, "proc") != TCL_OK) {
         Tcl_DecrRefCount(bodyObj);
@@ -514,24 +510,14 @@ static int CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 
     /* cleanup locals/proc (failure path only) */
-    for (CompiledLocal *cl = first; cl;) {
-        CompiledLocal *nx = cl->nextPtr;
-        if (cl->defValuePtr)
-            Tcl_DecrRefCount(cl->defValuePtr);
-        Tcl_Free((char *)cl);
-        cl = nx;
-    }
+    TbcxFreeCompiledLocals(procPtr->firstLocalPtr);
+
     Tcl_Free((char *)procPtr);
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 
 cple_fail:
-    for (CompiledLocal *cl = first; cl;) {
-        CompiledLocal *nx = cl->nextPtr;
-        if (cl->defValuePtr)
-            Tcl_DecrRefCount(cl->defValuePtr);
-        Tcl_Free((char *)cl);
-        cl = nx;
-    }
+    TbcxFreeCompiledLocals(procPtr->firstLocalPtr);
+
     Tcl_Free((char *)procPtr);
     return TCL_ERROR;
 }
@@ -598,11 +584,15 @@ static void WriteLiteral(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
             W_U64(w, (uint64_t)wv);
         } /* two's complement */
     } else {
-        /* Default: emit as STRING using current UTF-8 rep. */
+        /* Default: emit as STRING using current UTF-8 rep. Optionally strip known proc/method bodies. */
         Tcl_Size    n;
         const char *s = Tcl_GetStringFromObj(obj, &n);
         W_U32(w, TBCX_LIT_STRING);
-        W_LPString(w, s, n);
+        if (ShouldStripBody(ctx, obj)) {
+            W_LPString(w, "", 0);
+        } else {
+            W_LPString(w, s, n);
+        }
     }
 }
 
@@ -1177,9 +1167,11 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
 }
 
 static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
-    TbcxCtx ctx = {ip};
+    TbcxCtx ctx = {0};
+    ctx.interp  = ip;
+    CtxInitStripBodies(&ctx);
 
-    DefVec  defs;
+    DefVec defs;
     DV_Init(&defs);
     ClsVec classes;
     CV_Init(&classes);
@@ -1193,12 +1185,20 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         CaptureStaticsRec(ip, srcStr, srcLen, rootNs, &defs, &classes);
     }
 
+    /* Precompute set of bodies to strip out of top-level literals (we serialize compiled blocks separately). */
+    for (size_t i = 0; i < defs.n; i++) {
+        if (defs.v[i].body) {
+            CtxAddStripBody(&ctx, defs.v[i].body);
+        }
+    }
+
     /* 1. Compile top-level (after capture) */
     if (TclSetByteCodeFromAny(ip, scriptObj, NULL, NULL) != TCL_OK) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
         CV_Free(&classes);
+        CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
     ByteCode *top = NULL;
@@ -1209,6 +1209,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         DV_Free(&defs);
         CV_Free(&classes);
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to get top bytecode", -1));
+        CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
 
@@ -1219,16 +1220,20 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
         CV_Free(&classes);
+        CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
 
     /* 4. Top-level compiled block */
+    ctx.stripActive = 1;
     WriteCompiledBlock(w, &ctx, scriptObj);
+    ctx.stripActive = 0;
     if (w->err) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
         CV_Free(&classes);
+        CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
 
@@ -1257,6 +1262,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
                 Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
                 CV_Free(&classes);
+                CtxFreeStripBodies(&ctx);
                 return TCL_ERROR;
             }
         }
@@ -1304,6 +1310,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
                 Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
                 CV_Free(&classes);
+                CtxFreeStripBodies(&ctx);
                 return TCL_ERROR;
             }
         }
@@ -1311,6 +1318,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
     CV_Free(&classes);
     Tcl_DecrRefCount(srcCopy);
     Tcl_DecrRefCount(rootNs);
+    CtxFreeStripBodies(&ctx);
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 }
 

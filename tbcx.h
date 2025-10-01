@@ -83,5 +83,7 @@ extern const AuxDataType *tbcxAuxForeach;
 extern const AuxDataType *tbcxAuxNewForeach;
 
 int                       CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
+int                       TbcxBuildLocalsFromArgs(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **firstOut, CompiledLocal **lastOut, int *numArgsOut);
+void                      TbcxFreeCompiledLocals(CompiledLocal *first);
 
 #endif /* TBCX_H */

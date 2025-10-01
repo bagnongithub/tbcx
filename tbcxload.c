@@ -569,7 +569,6 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(nameObj);
         return TCL_ERROR;
     }
-
     /* Build Proc + compiled locals from argsObj */
     Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
@@ -577,40 +576,16 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     procPtr->refCount = 1;
     procPtr->bodyPtr  = bodyBC;
     Tcl_IncrRefCount(bodyBC);
-    Tcl_Size  argc = 0;
-    Tcl_Obj **argv = NULL;
-    if (Tcl_ListObjGetElements(ip, argsObj, &argc, &argv) != TCL_OK)
-        return TCL_ERROR;
-    procPtr->numArgs           = (int)argc;
-    procPtr->numCompiledLocals = (int)argc;
-    CompiledLocal *first = NULL, *last = NULL;
-    for (Tcl_Size i = 0; i < argc; i++) {
-        Tcl_Size  nf = 0, nmLen = 0;
-        Tcl_Obj **fv = NULL;
-        if (Tcl_ListObjGetElements(ip, argv[i], &nf, &fv) != TCL_OK || nf < 1 || nf > 2)
+    {
+        CompiledLocal *first = NULL, *last = NULL;
+        int            numA = 0;
+        if (TbcxBuildLocalsFromArgs(ip, argsObj, &first, &last, &numA) != TCL_OK)
             return TCL_ERROR;
-        const char    *nm = Tcl_GetStringFromObj(fv[0], &nmLen);
-        CompiledLocal *cl = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-        memset(cl, 0, sizeof(CompiledLocal));
-        cl->nameLength = (int)nmLen;
-        memcpy(cl->name, nm, (size_t)nmLen + 1);
-        cl->frameIndex = (int)i;
-        cl->flags      = VAR_ARGUMENT;
-        if (nf == 2) {
-            cl->defValuePtr = fv[1];
-            Tcl_IncrRefCount(cl->defValuePtr);
-        }
-        if (i == argc - 1 && nmLen == 4 && memcmp(nm, "args", 4) == 0)
-            cl->flags |= VAR_IS_ARGS;
-        if (!first)
-            first = last = cl;
-        else {
-            last->nextPtr = cl;
-            last          = cl;
-        }
+        procPtr->numArgs           = numA;
+        procPtr->numCompiledLocals = numA;
+        procPtr->firstLocalPtr     = first;
+        procPtr->lastLocalPtr      = last;
     }
-    procPtr->firstLocalPtr = first;
-    procPtr->lastLocalPtr  = last;
     TbcxExtendCompiledLocals(procPtr, (int)nLoc);
 
     /* Build procbody and register */
@@ -861,82 +836,23 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
         /* Build a Proc for the lambda */
         Proc    *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
         memset(procPtr, 0, sizeof(Proc));
-        procPtr->iPtr              = (Interp *)ip;
-        procPtr->refCount          = 1;
-        procPtr->numArgs           = (int)numArgs;
-        procPtr->numCompiledLocals = (int)numArgs;
-
-        CompiledLocal *first = NULL, *last = NULL;
-        for (uint32_t i = 0; i < numArgs; i++) {
-            char    *nameC   = NULL;
-            uint32_t nameLen = 0;
-            if (!R_LPString(r, &nameC, &nameLen)) {
-                Tcl_DecrRefCount(nsObj);
-                R_Error(r, "tbcx: arg decode");
+        procPtr->iPtr     = (Interp *)ip;
+        procPtr->refCount = 1;
+        {
+            CompiledLocal *first = NULL, *last = NULL;
+            int            numA = 0;
+            if (TbcxBuildLocalsFromArgs(ip, argList, &first, &last, &numA) != TCL_OK)
                 return NULL;
-            }
-            uint8_t hasDef = 0;
-            if (!R_U8(r, &hasDef)) {
-                Tcl_Free(nameC);
-                Tcl_DecrRefCount(nsObj);
-                R_Error(r, "tbcx: arg flag");
-                return NULL;
-            }
-
-            Tcl_Obj *argSpec = Tcl_NewListObj(0, NULL);
-            Tcl_ListObjAppendElement(ip, argSpec, Tcl_NewStringObj(nameC, (Tcl_Size)nameLen));
-            Tcl_Free(nameC);
-            Tcl_Obj *defVal = NULL;
-            if (hasDef) {
-                defVal = ReadLiteral(r, ip);
-                if (!defVal) {
-                    Tcl_DecrRefCount(argSpec);
-                    Tcl_DecrRefCount(nsObj);
-                    R_Error(r, "tbcx: arg default");
-                    return NULL;
-                }
-                Tcl_ListObjAppendElement(ip, argSpec, defVal);
-            }
-            Tcl_ListObjAppendElement(ip, argList, argSpec);
-
-            /* Create compiled-local node (correct list/index handling) */
-            Tcl_Obj *nameObj = NULL;
-            if (Tcl_ListObjIndex(ip, argSpec, 0, &nameObj) != TCL_OK) {
-                if (defVal)
-                    Tcl_DecrRefCount(defVal);
-                Tcl_DecrRefCount(argSpec);
-                Tcl_DecrRefCount(nsObj);
-                R_Error(r, "tbcx: arg spec");
-                return NULL;
-            }
-            Tcl_Size       nmLen = 0;
-            const char    *nm    = Tcl_GetStringFromObj(nameObj, &nmLen);
-            CompiledLocal *cl    = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-            memset(cl, 0, sizeof(CompiledLocal));
-            cl->nameLength = (int)nmLen;
-            memcpy(cl->name, nm, (size_t)nmLen + 1);
-            cl->frameIndex = (int)i;
-            cl->flags      = VAR_ARGUMENT;
-            if (defVal) {
-                cl->defValuePtr = defVal;
-                Tcl_IncrRefCount(defVal);
-            }
-            if (i + 1 == numArgs && nmLen == 4 && memcmp(nm, "args", 4) == 0)
-                cl->flags |= VAR_IS_ARGS;
-            if (!first)
-                first = last = cl;
-            else {
-                last->nextPtr = cl;
-                last          = cl;
-            }
+            procPtr->numArgs           = numA;
+            procPtr->numCompiledLocals = numA;
+            procPtr->firstLocalPtr     = first;
+            procPtr->lastLocalPtr      = last;
         }
-        procPtr->firstLocalPtr = first;
-        procPtr->lastLocalPtr  = last;
 
         /* Body compiled block (+numLocals captured from stream) */
-        uint32_t nLocalsBody   = 0;
-        Tcl_Obj *bodyBC        = ReadCompiledBlock(r, ip, nsPtr, &nLocalsBody);
-        procPtr->bodyPtr       = bodyBC;
+        uint32_t nLocalsBody = 0;
+        Tcl_Obj *bodyBC      = ReadCompiledBlock(r, ip, nsPtr, &nLocalsBody);
+        procPtr->bodyPtr     = bodyBC;
         Tcl_IncrRefCount(bodyBC);
         TbcxExtendCompiledLocals(procPtr, (int)nLocalsBody);
 
@@ -1055,8 +971,8 @@ static int ReadAuxArray(TbcxIn *r, Tcl_Interp *ip, AuxData **auxOut, uint32_t *n
             arr[i].type       = tbcxAuxDictUpdate;
             arr[i].clientData = info;
         } else if (tag == TBCX_AUX_NEWFORE || tag == TBCX_AUX_FOREACH) {
-            uint32_t numLists = 0, loopCt = 0, firstVal = 0, dupNumLists = 0;
-            if (!R_U32(r, &numLists) || !R_U32(r, &loopCt) || !R_U32(r, &firstVal) || !R_U32(r, &dupNumLists)) {
+            uint32_t numLists = 0, loopCtU = 0, firstValU = 0, dupNumLists = 0;
+            if (!R_U32(r, &numLists) || !R_U32(r, &loopCtU) || !R_U32(r, &firstValU) || !R_U32(r, &dupNumLists)) {
                 if (arr)
                     Tcl_Free(arr);
                 return 0;
@@ -1070,8 +986,8 @@ static int ReadAuxArray(TbcxIn *r, Tcl_Interp *ip, AuxData **auxOut, uint32_t *n
             size_t       bytes   = sizeof(ForeachInfo) + (numLists ? (numLists - 1u) * sizeof(ForeachVarList *) : 0);
             ForeachInfo *info    = (ForeachInfo *)Tcl_Alloc(bytes);
             info->numLists       = (Tcl_Size)numLists;
-            info->firstValueTemp = (Tcl_LVTIndex)firstVal;
-            info->loopCtTemp     = (Tcl_LVTIndex)loopCt;
+            info->firstValueTemp = (Tcl_LVTIndex)(int32_t)firstValU;
+            info->loopCtTemp     = (Tcl_LVTIndex)(int32_t)loopCtU;
             for (uint32_t iL = 0; iL < numLists; iL++) {
                 uint32_t nv = 0;
                 if (!R_U32(r, &nv))
@@ -1433,48 +1349,17 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     procPtr->refCount = 1;
     procPtr->bodyPtr  = bodyBC;
     Tcl_IncrRefCount(bodyBC);
-
     /* Build compiled locals/args consistent with argsObj */
-    Tcl_Size  argc = 0;
-    Tcl_Obj **argv = NULL;
-    if (Tcl_ListObjGetElements(ip, argsObj, &argc, &argv) != TCL_OK)
-        return TCL_ERROR;
-    procPtr->numArgs           = (int)argc;
-    procPtr->numCompiledLocals = (int)argc;
-
-    CompiledLocal *first = NULL, *last = NULL;
-    for (Tcl_Size i = 0; i < argc; i++) {
-        Tcl_Size  nFields = 0;
-        Tcl_Obj **fields  = NULL;
-        if (Tcl_ListObjGetElements(ip, argv[i], &nFields, &fields) != TCL_OK)
+    {
+        CompiledLocal *first = NULL, *last = NULL;
+        int            numA = 0;
+        if (TbcxBuildLocalsFromArgs(ip, argsObj, &first, &last, &numA) != TCL_OK)
             return TCL_ERROR;
-        if (nFields < 1 || nFields > 2) {
-            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: bad arg spec", -1));
-            return TCL_ERROR;
-        }
-        Tcl_Size       nmLen = 0;
-        const char    *nm    = Tcl_GetStringFromObj(fields[0], &nmLen);
-        CompiledLocal *cl    = (CompiledLocal *)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-        memset(cl, 0, sizeof(CompiledLocal));
-        cl->nameLength = (int)nmLen;
-        memcpy(cl->name, nm, (size_t)nmLen + 1);
-        cl->frameIndex = (int)i;
-        cl->flags      = VAR_ARGUMENT;
-        if (nFields == 2) {
-            cl->defValuePtr = fields[1];
-            Tcl_IncrRefCount(cl->defValuePtr);
-        }
-        if (i == argc - 1 && nmLen == 4 && memcmp(nm, "args", 4) == 0)
-            cl->flags |= VAR_IS_ARGS;
-        if (!first)
-            first = last = cl;
-        else {
-            last->nextPtr = cl;
-            last          = cl;
-        }
+        procPtr->numArgs           = numA;
+        procPtr->numCompiledLocals = numA;
+        procPtr->firstLocalPtr     = first;
+        procPtr->lastLocalPtr      = last;
     }
-    procPtr->firstLocalPtr = first;
-    procPtr->lastLocalPtr  = last;
     TbcxExtendCompiledLocals(procPtr, (int)nLoc);
 
     /* Create procbody Tcl_Obj and register under nameFqn */

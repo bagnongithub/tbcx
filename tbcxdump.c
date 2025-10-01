@@ -850,8 +850,8 @@ static int DumpOneAux(Reader *r, Tcl_Obj *out, Tcl_Obj *err, uint32_t idx) {
             return TCL_ERROR;
         if (R_U32(r, &dupNum, err) != TCL_OK)
             return TCL_ERROR;
-        Tcl_AppendPrintfToObj(out, "  [aux %u] %s numLists=%u (dup=%u) firstValueTemp=%u loopCtTemp=%u\n", idx, (tag == TBCX_AUX_FOREACH ? "foreach" : "newForeach"), numLists, dupNum, firstVal,
-                              loopCt);
+        Tcl_AppendPrintfToObj(out, "  [aux %u] %s numLists=%u (dup=%u) firstValueTemp=%d loopCtTemp=%d\n", idx, (tag == TBCX_AUX_FOREACH ? "foreach" : "newForeach"), numLists, dupNum,
+                              (int32_t)firstVal, (int32_t)loopCt);
         for (uint32_t iL = 0; iL < numLists; iL++) {
             uint32_t nv = 0;
             if (R_U32(r, &nv, err) != TCL_OK)
