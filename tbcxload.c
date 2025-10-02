@@ -607,8 +607,13 @@ static int ReadOneMethodAndRegister(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_Obj       *key   = BuildMethodKey(ip, clsFqn, kind, (mnL ? nameObj : NULL));
     int            isNew = 0;
     Tcl_HashEntry *he    = Tcl_CreateHashEntry(&os->methodsByKey, (const char *)key, &isNew);
+    if (!isNew) {
+        Tcl_Obj *oldPair = (Tcl_Obj *)Tcl_GetHashValue(he);
+        if (oldPair)
+            Tcl_DecrRefCount(oldPair);
+    }
     /* Store PAIR {argsObj, procBodyObj} so we can verify signature at shim time */
-    Tcl_Obj       *pair  = Tcl_NewListObj(0, NULL);
+    Tcl_Obj *pair = Tcl_NewListObj(0, NULL);
     Tcl_ListObjAppendElement(ip, pair, argsObj);
     Tcl_ListObjAppendElement(ip, pair, procBodyObj);
     Tcl_IncrRefCount(pair);
@@ -831,10 +836,43 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip) {
             Tcl_DecrRefCount(nsObj);
             return NULL;
         }
-
         Tcl_Obj *argList = Tcl_NewListObj(0, NULL);
+        /* Read each argument spec {name ?default?} into argList */
+        for (uint32_t i = 0; i < numArgs; i++) {
+            char    *argName    = NULL;
+            uint32_t argNameLen = 0;
+            if (!R_LPString(r, &argName, &argNameLen)) {
+                Tcl_DecrRefCount(nsObj);
+                Tcl_DecrRefCount(argList);
+                return NULL;
+            }
+            Tcl_Obj *argNameObj = Tcl_NewStringObj(argName, (Tcl_Size)argNameLen);
+            Tcl_Free(argName);
+            uint8_t hasDef = 0;
+            if (!R_U8(r, &hasDef)) {
+                Tcl_DecrRefCount(nsObj);
+                Tcl_DecrRefCount(argNameObj);
+                Tcl_DecrRefCount(argList);
+                return NULL;
+            }
+            if (hasDef) {
+                Tcl_Obj *defVal = ReadLiteral(r, ip);
+                if (!defVal) {
+                    Tcl_DecrRefCount(nsObj);
+                    Tcl_DecrRefCount(argNameObj);
+                    Tcl_DecrRefCount(argList);
+                    return NULL;
+                }
+                Tcl_Obj *argPair = Tcl_NewListObj(0, NULL);
+                Tcl_ListObjAppendElement(ip, argPair, argNameObj);
+                Tcl_ListObjAppendElement(ip, argPair, defVal);
+                Tcl_ListObjAppendElement(ip, argList, argPair);
+            } else {
+                Tcl_ListObjAppendElement(ip, argList, argNameObj);
+            }
+        }
         /* Build a Proc for the lambda */
-        Proc    *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
+        Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
         memset(procPtr, 0, sizeof(Proc));
         procPtr->iPtr     = (Interp *)ip;
         procPtr->refCount = 1;
@@ -912,22 +950,23 @@ static int ReadAuxArray(TbcxIn *r, Tcl_Interp *ip, AuxData **auxOut, uint32_t *n
             for (uint32_t k = 0; k < cnt; k++) {
                 char    *s  = NULL;
                 uint32_t sl = 0;
-                if (!R_LPString(r, &s, &sl))
+                if (!R_LPString(r, &s, &sl)) {
+                    Tcl_DeleteHashTable(&info->hashTable);
+                    Tcl_Free(info);
                     return 0;
+                }
                 uint32_t off = 0;
                 if (!R_U32(r, &off)) {
                     Tcl_Free(s);
+                    Tcl_DeleteHashTable(&info->hashTable);
+                    Tcl_Free(info);
                     return 0;
                 }
-                /* IMPORTANT: Tcl does not copy string keys for TCL_STRING_KEYS tables.
-                 * We must keep a stable, heap-allocated copy alive as long as the table lives. */
-                char *stable = (char *)Tcl_Alloc(sl + 1u);
-                memcpy(stable, s, sl);
-                stable[sl] = '\0';
-                Tcl_Free(s); /* free transient buffer from R_LPString */
+                /* For TCL_STRING_KEYS, Tcl duplicates the key we pass in. */
                 int            newEntry = 0;
-                Tcl_HashEntry *he       = Tcl_CreateHashEntry(&info->hashTable, (const char *)stable, &newEntry);
+                Tcl_HashEntry *he       = Tcl_CreateHashEntry(&info->hashTable, s, &newEntry);
                 Tcl_SetHashValue(he, INT2PTR((int)off));
+                Tcl_Free(s); /* safe: table holds its own duplicate */
             }
             arr[i].type       = tbcxAuxJTStr;
             arr[i].clientData = info;
@@ -939,15 +978,30 @@ static int ReadAuxArray(TbcxIn *r, Tcl_Interp *ip, AuxData **auxOut, uint32_t *n
                 return 0;
             }
             JumptableNumInfo *info = (JumptableNumInfo *)Tcl_Alloc(sizeof(*info));
+#if UINTPTR_MAX < 0xFFFFFFFFFFFFFFFFull
+            Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
+#else
             Tcl_InitHashTable(&info->hashTable, TCL_ONE_WORD_KEYS);
+#endif
             for (uint32_t k = 0; k < cnt; k++) {
                 uint64_t key = 0;
                 uint32_t off = 0;
+
                 if (!R_U64(r, &key) || !R_U32(r, &off)) {
+                    /* cleanup on short read */
+                    Tcl_DeleteHashTable(&info->hashTable);
+                    Tcl_Free(info);
                     return 0;
                 }
                 int            newE = 0;
-                Tcl_HashEntry *he   = Tcl_CreateHashEntry(&info->hashTable, (const char *)(intptr_t)key, &newE);
+                Tcl_HashEntry *he;
+#if UINTPTR_MAX < 0xFFFFFFFFFFFFFFFFull
+                char keyStr[32];
+                sprintf(keyStr, "%" PRIu64, key);
+                he = Tcl_CreateHashEntry(&info->hashTable, keyStr, &newE);
+#else
+                he = Tcl_CreateHashEntry(&info->hashTable, (const char *)(intptr_t)key, &newE);
+#endif
                 Tcl_SetHashValue(he, INT2PTR((int)off));
             }
             arr[i].type       = tbcxAuxJTNum;
@@ -1384,8 +1438,12 @@ static int ReadOneProcAndRegister(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     Tcl_ListObjAppendElement(ip, pair, procBodyObj);
     Tcl_IncrRefCount(pair);
     int            isNew = 0;
-
     Tcl_HashEntry *he    = Tcl_CreateHashEntry(&shim->procsByFqn, (const char *)fqnKey, &isNew);
+    if (!isNew) {
+        Tcl_Obj *oldPair = (Tcl_Obj *)Tcl_GetHashValue(he);
+        if (oldPair)
+            Tcl_DecrRefCount(oldPair);
+    }
     Tcl_SetHashValue(he, pair);
     /* Clean temporaries not stored in the registry */
     Tcl_DecrRefCount(nsObj);

@@ -46,14 +46,11 @@ typedef struct {
     size_t  n, cap;
 } DefVec;
 
+/* Class set (unique FQNs). We store stable UTF-8 keys; value is unused. */
 typedef struct {
-    Tcl_Obj *name; /* class FQN */
-} ClsRec;
-
-typedef struct {
-    ClsRec *v;
-    size_t  n, cap;
-} ClsVec;
+    Tcl_HashTable ht; /* TCL_STRING_KEYS; key is stable char* we own */
+    int           init;
+} ClsSet;
 
 #define DEF_F_FROM_BUILDER 0x01
 #define DEF_KIND_PROC 0
@@ -67,18 +64,18 @@ typedef struct {
  * ========================================================================== */
 
 static void                    AppendBuilderStubLinesForClass(Tcl_DString *out, DefVec *defs, Tcl_Obj *clsFqn);
-static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsVec *classes, int flags);
-static void                    CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsVec *classes, int inBuilder);
+static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags);
+static void                    CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsSet *classes, int inBuilder);
 int                            CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
 static inline const char      *CmdCore(const char *s);
 static int                     CompileProcLikeAndEmit(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_Obj *argsList, Tcl_Obj *bodyObj, const char *whereTag);
 static uint32_t                ComputeNumLocalsFromAux(ByteCode *bc);
+static void                    CS_Add(ClsSet *cs, Tcl_Obj *clsFqn);
+static void                    CS_Free(ClsSet *cs);
+static void                    CS_Init(ClsSet *cs);
 static void                    CtxAddStripBody(TbcxCtx *ctx, Tcl_Obj *body);
 static void                    CtxFreeStripBodies(TbcxCtx *ctx);
 static void                    CtxInitStripBodies(TbcxCtx *ctx);
-static void                    CV_Free(ClsVec *cv);
-static void                    CV_Init(ClsVec *cv);
-static void                    CV_PushUnique(ClsVec *cv, Tcl_Obj *clsFqn);
 static void                    DV_Free(DefVec *dv);
 static void                    DV_Init(DefVec *dv);
 static void                    DV_Push(DefVec *dv, DefRec r);
@@ -930,32 +927,30 @@ static void DV_Free(DefVec *dv) {
         Tcl_Free(dv->v);
 }
 
-static void CV_Init(ClsVec *cv) {
-    cv->v = NULL;
-    cv->n = cv->cap = 0;
+static void CS_Init(ClsSet *cs) {
+    cs->init = 1;
+    Tcl_InitHashTable(&cs->ht, TCL_STRING_KEYS);
 }
-static void CV_PushUnique(ClsVec *cv, Tcl_Obj *clsFqn) {
-    Tcl_Size    lnA = 0;
-    const char *sa  = Tcl_GetStringFromObj(clsFqn, &lnA);
-    for (size_t i = 0; i < cv->n; i++) {
-        Tcl_Size    lnB = 0;
-        const char *sb  = Tcl_GetStringFromObj(cv->v[i].name, &lnB);
-        if (lnA == lnB && memcmp(sa, sb, (size_t)lnA) == 0)
-            return;
+
+static void CS_Add(ClsSet *cs, Tcl_Obj *clsFqn) {
+    if (!cs || !cs->init || !clsFqn)
+        return;
+    Tcl_Size       ln    = 0;
+    const char    *s     = Tcl_GetStringFromObj(clsFqn, &ln);
+    int            isNew = 0;
+    /* For TCL_STRING_KEYS, Tcl duplicates the key internally. */
+    Tcl_HashEntry *he    = Tcl_CreateHashEntry(&cs->ht, s, &isNew);
+    if (isNew) {
+        Tcl_SetHashValue(he, NULL);
     }
-    if (cv->n == cv->cap) {
-        cv->cap = cv->cap ? cv->cap * 2 : 8;
-        cv->v   = (ClsRec *)Tcl_Realloc(cv->v, cv->cap * sizeof(ClsRec));
-    }
-    cv->v[cv->n].name = clsFqn;
-    Tcl_IncrRefCount(clsFqn);
-    cv->n++;
 }
-static void CV_Free(ClsVec *cv) {
-    for (size_t i = 0; i < cv->n; i++)
-        Tcl_DecrRefCount(cv->v[i].name);
-    if (cv->v)
-        Tcl_Free(cv->v);
+
+static void CS_Free(ClsSet *cs) {
+    if (!cs || !cs->init)
+        return;
+    /* Tcl frees string keys it duplicated for TCL_STRING_KEYS. */
+    Tcl_DeleteHashTable(&cs->ht);
+    cs->init = 0;
 }
 
 static Tcl_Obj *WordLiteralObj(Tcl_Interp *ip, const Tcl_Token *wordTok) {
@@ -1015,10 +1010,7 @@ static Tcl_Obj *FqnUnder(Tcl_Obj *curNs, Tcl_Obj *name) {
     return fqn;
 }
 
-/* Parse an “oo::class create X { … }” builder to capture
- *   method|classmethod|constructor|destructor
- * bodies with saver-internal kinds (DEF_KIND_*). */
-static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsVec *classes, int flags) {
+static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags) {
     Tcl_Parse   p;
     const char *cur    = script;
     Tcl_Size    remain = (len >= 0 ? len : (Tcl_Size)strlen(script));
@@ -1057,7 +1049,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                         Tcl_IncrRefCount(r.ns);
                         r.flags = flags;
                         DV_Push(defs, r);
-                        CV_PushUnique(classes, clsFqn);
+                        CS_Add(classes, clsFqn);
                     } else {
                         if (mname)
                             Tcl_DecrRefCount(mname);
@@ -1085,7 +1077,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                         Tcl_IncrRefCount(r.ns);
                         r.flags = flags;
                         DV_Push(defs, r);
-                        CV_PushUnique(classes, clsFqn);
+                        CS_Add(classes, clsFqn);
                     } else {
                         if (args)
                             Tcl_DecrRefCount(args);
@@ -1111,7 +1103,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                         Tcl_IncrRefCount(r.ns);
                         r.flags = flags;
                         DV_Push(defs, r);
-                        CV_PushUnique(classes, clsFqn);
+                        CS_Add(classes, clsFqn);
                     } else {
                         if (args)
                             Tcl_DecrRefCount(args);
@@ -1212,7 +1204,6 @@ static Tcl_Obj *RewriteScript_RemoveClassBuildersAndAppendDefines(Tcl_Interp *ip
                             Tcl_Obj *bodyObj = Tcl_NewStringObj(w3->start, w3->size);
                             Tcl_IncrRefCount(bodyObj);
                             Tcl_Obj    *rewritten = RewriteScript_RemoveClassBuildersAndAppendDefines(ip, Tcl_GetString(bodyObj), Tcl_GetCharLength(bodyObj), defs, nsFqn);
-
                             /* Re-emit: namespace eval <ns> {<rewritten>} */
                             Tcl_DString cmdLn;
                             Tcl_DStringInit(&cmdLn);
@@ -1282,7 +1273,7 @@ static Tcl_Obj *RewriteScript_RemoveClassBuildersAndAppendDefines(Tcl_Interp *ip
     return rew;
 }
 
-static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsVec *classes, int inBuilder) {
+static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsSet *classes, int inBuilder) {
     Tcl_Parse   p;
     const char *cur    = script;
     Tcl_Size    remain = len >= 0 ? len : (Tcl_Size)strlen(script);
@@ -1386,7 +1377,7 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                                 Tcl_IncrRefCount(r.ns);
                                 r.flags = inBuilder ? DEF_F_FROM_BUILDER : 0;
                                 DV_Push(defs, r);
-                                CV_PushUnique(classes, clsFqn);
+                                CS_Add(classes, clsFqn);
                             } else {
                                 if (mname)
                                     Tcl_DecrRefCount(mname);
@@ -1415,7 +1406,7 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                                 Tcl_IncrRefCount(r.ns);
                                 r.flags = inBuilder ? DEF_F_FROM_BUILDER : 0;
                                 DV_Push(defs, r);
-                                CV_PushUnique(classes, clsFqn);
+                                CS_Add(classes, clsFqn);
                             } else {
                                 if (args)
                                     Tcl_DecrRefCount(args);
@@ -1441,7 +1432,7 @@ static void CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                         Tcl_Obj         *nm = WordLiteralObj(ip, w2);
                         if (nm) {
                             Tcl_Obj *clsFqn = FqnUnder(curNs, nm);
-                            CV_PushUnique(classes, clsFqn);
+                            CS_Add(classes, clsFqn);
                             /* Recurse into builder (word #4) to capture methods */
                             if (p.numWords >= 4) {
                                 const Tcl_Token *w3  = NextWord(w2);
@@ -1476,8 +1467,8 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
 
     DefVec defs;
     DV_Init(&defs);
-    ClsVec classes;
-    CV_Init(&classes);
+    ClsSet classes;
+    CS_Init(&classes);
     Tcl_Obj *rootNs = Tcl_NewStringObj("::", -1);
     Tcl_IncrRefCount(rootNs);
     Tcl_Size    srcLen  = 0;
@@ -1510,7 +1501,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
-        CV_Free(&classes);
+        CS_Free(&classes);
         CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
@@ -1520,7 +1511,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
-        CV_Free(&classes);
+        CS_Free(&classes);
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to get top bytecode", -1));
         CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
@@ -1532,7 +1523,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
-        CV_Free(&classes);
+        CS_Free(&classes);
         CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
@@ -1545,7 +1536,7 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
         Tcl_DecrRefCount(srcCopy);
         Tcl_DecrRefCount(rootNs);
         DV_Free(&defs);
-        CV_Free(&classes);
+        CS_Free(&classes);
         CtxFreeStripBodies(&ctx);
         return TCL_ERROR;
     }
@@ -1575,19 +1566,29 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
                 Tcl_DecrRefCount(srcCopy);
                 Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
-                CV_Free(&classes);
+                CS_Free(&classes);
                 CtxFreeStripBodies(&ctx);
                 return TCL_ERROR;
             }
         }
 
-    /* 6. Classes section (FQN + nSupers=0 for now) */
-    W_U32(w, (uint32_t)classes.n);
-    for (size_t c = 0; c < classes.n; c++) {
-        Tcl_Size    ln = 0;
-        const char *s  = Tcl_GetStringFromObj(classes.v[c].name, &ln);
-        W_LPString(w, s, ln);
-        W_U32(w, 0); /* nSupers */
+    /* 6. Classes section (FQN + nSupers=0 for now) — use unique set */
+    {
+        Tcl_HashEntry *h;
+        Tcl_HashSearch srch;
+        /* Count */
+        uint32_t       numClasses = 0;
+        for (h = Tcl_FirstHashEntry(&classes.ht, &srch); h; h = Tcl_NextHashEntry(&srch)) {
+            numClasses++;
+        }
+        W_U32(w, numClasses);
+        /* Stream each unique FQN once */
+        for (h = Tcl_FirstHashEntry(&classes.ht, &srch); h; h = Tcl_NextHashEntry(&srch)) {
+            const char *key = (const char *)Tcl_GetHashKey(&classes.ht, h);
+            Tcl_Size    ln  = (Tcl_Size)strlen(key);
+            W_LPString(w, key, ln);
+            W_U32(w, 0); /* nSupers */
+        }
     }
 
     /* 7. Methods section: emit captured OO methods/ctors/dtors */
@@ -1624,13 +1625,13 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
                 Tcl_DecrRefCount(srcCopy);
                 Tcl_DecrRefCount(rootNs);
                 DV_Free(&defs);
-                CV_Free(&classes);
+                CS_Free(&classes);
                 CtxFreeStripBodies(&ctx);
                 return TCL_ERROR;
             }
         }
     DV_Free(&defs);
-    CV_Free(&classes);
+    CS_Free(&classes);
     Tcl_DecrRefCount(srcCopy);
     Tcl_DecrRefCount(rootNs);
     CtxFreeStripBodies(&ctx);
