@@ -82,8 +82,30 @@ extern const AuxDataType *tbcxAuxDictUpdate;
 extern const AuxDataType *tbcxAuxForeach;
 extern const AuxDataType *tbcxAuxNewForeach;
 
-int                       CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
-int                       TbcxBuildLocalsFromArgs(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **firstOut, CompiledLocal **lastOut, int *numArgsOut);
-void                      TbcxFreeCompiledLocals(CompiledLocal *first);
+/* ==========================================================================
+ * Type definitions
+ * ========================================================================== */
 
-#endif /* TBCX_H */
+typedef struct TbcxIn {
+    Tcl_Interp *interp;
+    Tcl_Channel chan;
+    int         err; /* TCL_OK / TCL_ERROR */
+} TbcxIn;
+
+/* ==========================================================================
+ * Forward Declarations
+ * ========================================================================== */
+
+int            BuildLocals(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **firstOut, CompiledLocal **lastOut, int *numArgsOut);
+int            CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
+Tcl_Namespace *EnsureNamespace(Tcl_Interp *ip, const char *fqn);
+void           FreeLocals(CompiledLocal *first);
+int            R_Bytes(TbcxIn *r, void *p, size_t n);
+int            R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
+int            R_U32(TbcxIn *r, uint32_t *vp);
+int            R_U64(TbcxIn *r, uint64_t *vp);
+int            R_U8(TbcxIn *r, uint8_t *v);
+Tcl_Obj       *ReadCompiledBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut);
+int            ReadHeader(TbcxIn *r, TbcxHeader *H);
+
+#endif

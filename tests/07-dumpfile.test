@@ -8,7 +8,7 @@ test dump.1 {dumpfile prints header & sections} -body {
     set out [makeFile "" dump.1-out.tbcx]
     tbcx::savefile $in $out
     set d [tbcx::dumpfile $out]
-    expr {[string match "tbcx:*" $d] && [string match "*procs=1*" $d] && [string match "*top:*" $d]}
+    expr {[string match "*Procs: 1*" $d] && [string match "*top:*" $d]}
 } -result 1
 
 cleanupTests
