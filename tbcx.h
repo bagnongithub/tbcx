@@ -12,9 +12,11 @@
 #include <string.h>
 
 #include "tcl.h"
-#include "tclCompile.h"
 #include "tclInt.h"
 #include "tclIntDecls.h"
+#include "tclCompile.h"
+#include "tclOO.h"
+#include "tclOOInt.h"
 #include "tclTomMath.h"
 
 #define TBCX_MAGIC 0x58434254u

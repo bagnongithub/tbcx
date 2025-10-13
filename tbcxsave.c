@@ -1312,6 +1312,127 @@ static int IsPureOodefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Siz
     return 1;
 }
 
+/* Build a builder body where every method/classmethod/constructor/destructor
+ * subcommand has its body replaced by the empty string, while copying all
+ * other subcommands verbatim. This ensures that load-time evaluation of the
+ * builder will not compile real method bodies, but will still execute
+ * superclass/mixin/export/variable/etc. side-effects. */
+static Tcl_Obj *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj) {
+    Tcl_Size    blen = 0;
+    const char *bstr = Tcl_GetStringFromObj(bodyObj, &blen);
+    Tcl_DString out;
+    Tcl_DStringInit(&out);
+    Tcl_Parse   p;
+    const char *cur    = bstr;
+    Tcl_Size    remain = blen;
+
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 1) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = WordLiteralObj(ip, w0);
+            if (cmd) {
+                const char *kw = CmdCore(Tcl_GetString(cmd));
+                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+                    /* Last three words are name/args/body */
+                    const Tcl_Token *t = w0;
+                    for (int w = 0; w < p.numWords - 3; w++)
+                        t = NextWord(t);
+                    const Tcl_Token *wN = t, *wA = NextWord(wN);
+                    Tcl_Obj         *mname = WordLiteralObj(ip, wN);
+                    Tcl_Obj         *args  = WordLiteralObj(ip, wA);
+                    if (mname && args) {
+                        Tcl_DString ln;
+                        Tcl_DStringInit(&ln);
+                        Tcl_DStringAppendElement(&ln, (strcmp(kw, "classmethod") == 0) ? "classmethod" : "method");
+                        Tcl_DStringAppendElement(&ln, Tcl_GetString(mname));
+                        Tcl_DStringAppendElement(&ln, Tcl_GetString(args));
+                        Tcl_DStringAppendElement(&ln, ""); /* stub body */
+                        Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                        Tcl_DStringAppend(&out, "\n", 1);
+                        Tcl_DStringFree(&ln);
+                    }
+                    if (mname)
+                        Tcl_DecrRefCount(mname);
+                    if (args)
+                        Tcl_DecrRefCount(args);
+                    Tcl_DecrRefCount(cmd);
+                    goto next_cmd;
+                } else if ((strcmp(kw, "constructor") == 0) && p.numWords >= 2) {
+                    /* Constructor: last two words are args/body (args may be omitted in shorthand) */
+                    const Tcl_Token *t = w0;
+                    for (int w = 0; w < p.numWords - 1; w++)
+                        t = NextWord(t);
+                    const Tcl_Token *wArgs = NULL;
+                    if (p.numWords >= 3) {
+                        const Tcl_Token *pre = w0;
+                        for (int w = 0; w < p.numWords - 2; w++)
+                            pre = NextWord(pre);
+                        wArgs = pre;
+                    }
+                    Tcl_Obj *args = wArgs ? WordLiteralObj(ip, wArgs) : Tcl_NewStringObj("", 0);
+                    if (args) {
+                        Tcl_DString ln;
+                        Tcl_DStringInit(&ln);
+                        Tcl_DStringAppendElement(&ln, "constructor");
+                        Tcl_DStringAppendElement(&ln, Tcl_GetString(args));
+                        Tcl_DStringAppendElement(&ln, ""); /* stub body */
+                        Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                        Tcl_DStringAppend(&out, "\n", 1);
+                        Tcl_DStringFree(&ln);
+                    }
+                    if (args)
+                        Tcl_DecrRefCount(args);
+                    Tcl_DecrRefCount(cmd);
+                    goto next_cmd;
+                } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
+                    /* Destructor: allow body-only or args/body; always canonicalize to two lists */
+                    const Tcl_Token *t = w0;
+                    for (int w = 0; w < p.numWords - 1; w++)
+                        t = NextWord(t);
+                    const Tcl_Token *wArgs = NULL;
+                    if (p.numWords >= 3) {
+                        const Tcl_Token *pre = w0;
+                        for (int w = 0; w < p.numWords - 2; w++)
+                            pre = NextWord(pre);
+                        wArgs = pre;
+                    }
+                    Tcl_Obj *args = wArgs ? WordLiteralObj(ip, wArgs) : Tcl_NewStringObj("", 0);
+                    if (args) {
+                        Tcl_DString ln;
+                        Tcl_DStringInit(&ln);
+                        Tcl_DStringAppendElement(&ln, "destructor");
+                        Tcl_DStringAppendElement(&ln, Tcl_GetString(args));
+                        Tcl_DStringAppendElement(&ln, ""); /* stub body */
+                        Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                        Tcl_DStringAppend(&out, "\n", 1);
+                        Tcl_DStringFree(&ln);
+                    }
+                    if (args)
+                        Tcl_DecrRefCount(args);
+                    Tcl_DecrRefCount(cmd);
+                    goto next_cmd;
+                }
+                Tcl_DecrRefCount(cmd);
+            }
+            /* Non-method subcommand: copy verbatim */
+            Tcl_DStringAppend(&out, p.commandStart, p.commandSize);
+        }
+    next_cmd:
+        cur    = p.commandStart + p.commandSize;
+        remain = (bstr + blen) - cur;
+        Tcl_FreeParse(&p);
+    }
+    Tcl_Obj *res = Tcl_NewStringObj(Tcl_DStringValue(&out), Tcl_DStringLength(&out));
+    Tcl_DStringFree(&out);
+    return res;
+}
+
 static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, DefVec *defs, Tcl_Obj *curNs) {
     Tcl_DString out;
     Tcl_DStringInit(&out);
@@ -1327,13 +1448,106 @@ static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, 
         const char *cmdStart = p.commandStart;
         const char *cmdEnd   = p.commandStart + p.commandSize;
         int         handled  = 0;
-        if (p.numWords >= 4) {
+        if (p.numWords >= 3) {
             const Tcl_Token *w0 = p.tokenPtr;
             if (w0->type == TCL_TOKEN_COMMAND)
                 w0++;
             Tcl_Obj *cmd = WordLiteralObj(ip, w0);
             if (cmd) {
                 const char *c0 = CmdCore(Tcl_GetString(cmd));
+                /* Direct oo::define forms: stub out bodies to avoid any compile on load */
+                if (strcmp(c0, "oo::define") == 0 && p.numWords >= 5) {
+                    const Tcl_Token *wCls = NextWord(w0);
+                    const Tcl_Token *wK   = NextWord(wCls);
+                    Tcl_Obj         *kwd  = WordLiteralObj(ip, wK);
+                    Tcl_Obj         *clsO = WordLiteralObj(ip, wCls);
+                    if (kwd && clsO) {
+                        const char *kw = CmdCore(Tcl_GetString(kwd));
+                        if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 6) {
+                            const Tcl_Token *t = w0;
+                            for (int w = 0; w < p.numWords - 3; w++)
+                                t = NextWord(t);
+                            const Tcl_Token *wN = t, *wA = NextWord(wN);
+                            Tcl_Obj         *mname = WordLiteralObj(ip, wN), *args = WordLiteralObj(ip, wA);
+                            if (mname && args) {
+                                Tcl_DString line;
+                                Tcl_DStringInit(&line);
+                                Tcl_DStringAppendElement(&line, "oo::define");
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(clsO));
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(kwd));
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(mname));
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(args));
+                                Tcl_DStringAppendElement(&line, "");
+                                Tcl_DStringAppend(&out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
+                                Tcl_DStringAppend(&out, "\n", 1);
+                                Tcl_DStringFree(&line);
+                                handled = 1;
+                            }
+                            if (mname)
+                                Tcl_DecrRefCount(mname);
+                            if (args)
+                                Tcl_DecrRefCount(args);
+                        } else if (strcmp(kw, "constructor") == 0 && p.numWords >= 4) {
+                            const Tcl_Token *t = w0;
+                            for (int w = 0; w < p.numWords - 1; w++)
+                                t = NextWord(t);
+                            const Tcl_Token *wArgsTok = NULL;
+                            if (p.numWords >= 5) {
+                                const Tcl_Token *pre = w0;
+                                for (int w = 0; w < p.numWords - 2; w++)
+                                    pre = NextWord(pre);
+                                wArgsTok = pre;
+                            }
+                            Tcl_Obj *args = wArgsTok ? WordLiteralObj(ip, wArgsTok) : Tcl_NewStringObj("", 0);
+                            if (args) {
+                                Tcl_DString line;
+                                Tcl_DStringInit(&line);
+                                Tcl_DStringAppendElement(&line, "oo::define");
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(clsO));
+                                Tcl_DStringAppendElement(&line, "constructor");
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(args));
+                                Tcl_DStringAppendElement(&line, "");
+                                Tcl_DStringAppend(&out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
+                                Tcl_DStringAppend(&out, "\n", 1);
+                                Tcl_DStringFree(&line);
+                                handled = 1;
+                            }
+                            if (args)
+                                Tcl_DecrRefCount(args);
+                        } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 3) {
+                            const Tcl_Token *t = w0;
+                            for (int w = 0; w < p.numWords - 1; w++)
+                                t = NextWord(t);
+                            const Tcl_Token *wArgsTok = NULL;
+                            if (p.numWords >= 4) {
+                                const Tcl_Token *pre = w0;
+                                for (int w = 0; w < p.numWords - 2; w++)
+                                    pre = NextWord(pre);
+                                wArgsTok = pre;
+                            }
+                            Tcl_Obj *args = wArgsTok ? WordLiteralObj(ip, wArgsTok) : Tcl_NewStringObj("", 0);
+                            if (args) {
+                                Tcl_DString line;
+                                Tcl_DStringInit(&line);
+                                Tcl_DStringAppendElement(&line, "oo::define");
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(clsO));
+                                Tcl_DStringAppendElement(&line, "destructor");
+                                Tcl_DStringAppendElement(&line, Tcl_GetString(args));
+                                Tcl_DStringAppendElement(&line, "");
+                                Tcl_DStringAppend(&out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
+                                Tcl_DStringAppend(&out, "\n", 1);
+                                Tcl_DStringFree(&line);
+                                handled = 1;
+                            }
+                            if (args)
+                                Tcl_DecrRefCount(args);
+                        }
+                    }
+                    if (kwd)
+                        Tcl_DecrRefCount(kwd);
+                    if (clsO)
+                        Tcl_DecrRefCount(clsO);
+                }
                 /* Handle: namespace eval <ns> <body> — rewrite the body recursively */
                 if (strcmp(c0, "namespace") == 0) {
                     const Tcl_Token *w1  = NextWord(w0);
@@ -1367,9 +1581,10 @@ static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                     if (sub)
                         Tcl_DecrRefCount(sub);
                 }
-                /* Handle: oo::define <class> <builder>
-                 * Strip the builder body and immediately emit stubs for any
-                 * methods we captured from this builder (like the oo::class path).
+                /* Handle: oo::define <class> {builder}
+                 * If the builder is pure method/ctor/dtor: drop body and emit stubs.
+                 * Otherwise, reconstruct a builder that preserves non-method
+                 * subcommands and replaces every method/ctor/dtor body with "".
                  */
                 if (!handled && strcmp(c0, "oo::define") == 0 && p.numWords == 3) {
                     const Tcl_Token *w1 = NextWord(w0);             /* class */
@@ -1391,21 +1606,17 @@ static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                                 StubLinesForClass(&out, defs, clsFqn);
                                 handled = 1;
                             } else {
-                                /*
-                                 * Non-pure builder: preserve semantics. Re-emit the
-                                 * command canonically (normalize trivia) but keep the
-                                 * original body intact. We do *not* strip or replace
-                                 * this literal, because it may carry critical
-                                 * side-effects (superclass, mixin, variable, …).
-                                 */
+                                /* Non-pure: rebuild builder with stubbed method bodies */
+                                Tcl_Obj    *stubbed = StubbedBuilderBody(ip, bodyObj);
                                 Tcl_DString cmdLn;
                                 Tcl_DStringInit(&cmdLn);
                                 Tcl_DStringAppendElement(&cmdLn, "oo::define");
                                 Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(clsObj));
-                                Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(bodyObj));
+                                Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(stubbed));
                                 Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                                 Tcl_DStringAppend(&out, "\n", 1);
                                 Tcl_DStringFree(&cmdLn);
+                                Tcl_DecrRefCount(stubbed);
                                 handled = 1;
                             }
                             Tcl_DecrRefCount(clsFqn);
@@ -1418,8 +1629,9 @@ static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                 }
 
                 /* Handle: oo::class create <name> ?{builder}?
-                 * Replace with an empty builder and append the stubs gathered
-                 * during capture so we avoid executing the builder at load-time. */
+                 * If builder is present and pure, drop it and emit stubs.
+                 * If builder is present and non-pure, rebuild a stubbed builder
+                 * that preserves non-method subcommands. Otherwise, use {}. */
                 if (!handled && strcmp(c0, "oo::class") == 0 && p.numWords >= 3) {
                     const Tcl_Token *w1  = NextWord(w0);
                     Tcl_Obj         *sub = WordLiteralObj(ip, w1);
@@ -1427,45 +1639,48 @@ static Tcl_Obj *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, 
                         const Tcl_Token *w2 = NextWord(w1); /* class name */
                         Tcl_Obj         *nm = WordLiteralObj(ip, w2);
                         if (nm) {
-                            Tcl_Obj         *clsFqn  = FqnUnder(curNs, nm);
-                            const Tcl_Token *w3      = (p.numWords >= 4) ? NextWord(w2) : NULL;
-                            Tcl_Obj         *builder = w3 ? WordLiteralObj(ip, w3) : NULL;
-                            int              pure    = 0;
-                            if (builder) {
-                                Tcl_Size    blen = 0;
-                                const char *bstr = Tcl_GetStringFromObj(builder, &blen);
-                                pure             = IsPureOodefineBuilderBody(ip, bstr, blen);
-                            }
-                            if (!builder || pure) {
-                                /* Strip builder and use stubs (loader shim will patch bodies). */
-                                Tcl_DString cmdLn;
-                                Tcl_DStringInit(&cmdLn);
-                                Tcl_DStringAppendElement(&cmdLn, "oo::class");
-                                Tcl_DStringAppendElement(&cmdLn, "create");
-                                Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(nm));
-                                Tcl_DStringAppendElement(&cmdLn, ""); /* empty builder */
-                                Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
-                                Tcl_DStringAppend(&out, "\n", 1);
-                                Tcl_DStringFree(&cmdLn);
-                                StubLinesForClass(&out, defs, clsFqn);
-                                handled = 1;
+                            Tcl_Obj    *clsFqn = FqnUnder(curNs, nm);
+                            Tcl_DString cmdLn;
+                            Tcl_DStringInit(&cmdLn);
+                            Tcl_DStringAppendElement(&cmdLn, "oo::class");
+                            Tcl_DStringAppendElement(&cmdLn, "create");
+                            Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(nm));
+                            if (p.numWords >= 4) {
+                                const Tcl_Token *w3  = NextWord(w2); /* builder */
+                                Tcl_Obj         *bod = WordLiteralObj(ip, w3);
+                                if (bod) {
+                                    Tcl_Size    bl = 0;
+                                    const char *bs = Tcl_GetStringFromObj(bod, &bl);
+                                    if (IsPureOodefineBuilderBody(ip, bs, bl)) {
+                                        /* drop builder, then emit stubs */
+                                        Tcl_DStringAppendElement(&cmdLn, ""); /* empty builder */
+                                        Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                        Tcl_DStringAppend(&out, "\n", 1);
+                                        StubLinesForClass(&out, defs, clsFqn);
+                                    } else {
+                                        Tcl_Obj *stubbed = StubbedBuilderBody(ip, bod);
+                                        Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(stubbed));
+                                        Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                        Tcl_DStringAppend(&out, "\n", 1);
+                                        Tcl_DecrRefCount(stubbed);
+                                    }
+                                    Tcl_DStringFree(&cmdLn);
+                                    Tcl_DecrRefCount(bod);
+                                } else {
+                                    Tcl_DStringAppendElement(&cmdLn, "");
+                                    Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                    Tcl_DStringAppend(&out, "\n", 1);
+                                    Tcl_DStringFree(&cmdLn);
+                                }
                             } else {
-                                /* Non‑pure: keep builder body intact. */
-                                Tcl_DString cmdLn;
-                                Tcl_DStringInit(&cmdLn);
-                                Tcl_DStringAppendElement(&cmdLn, "oo::class");
-                                Tcl_DStringAppendElement(&cmdLn, "create");
-                                Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(nm));
-                                Tcl_DStringAppendElement(&cmdLn, Tcl_GetString(builder));
+                                Tcl_DStringAppendElement(&cmdLn, "");
                                 Tcl_DStringAppend(&out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                                 Tcl_DStringAppend(&out, "\n", 1);
                                 Tcl_DStringFree(&cmdLn);
-                                handled = 1;
                             }
-                            if (builder)
-                                Tcl_DecrRefCount(builder);
                             Tcl_DecrRefCount(clsFqn);
                             Tcl_DecrRefCount(nm);
+                            handled = 1;
                         }
                     }
                     if (sub)

@@ -252,6 +252,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
     OOShim  *os  = (OOShim *)cd;
     int      rc  = TCL_OK;
     Tcl_Obj *cls = NULL, *sub = NULL;
+    Tcl_Obj *nameO = NULL; /* method/classmethod name when applicable */
 
     /* Prepare argv for calling the renamed original command. */
     Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
@@ -318,6 +319,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             bodyIdx     = (int)(objc - 1);
             runtimeArgs = objv[argsIdx];
             key         = BuildMethodKey(ip, clsFqn, kind, objv[nameIdx]);
+            nameO       = objv[nameIdx];
         }
     } else if (strcmp(subc, "constructor") == 0) {
         if (objc >= 5) {
@@ -493,6 +495,61 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             }
         }
     }
+    /*
+     * HARDENING: Even if the inline substitution above didn’t trigger,
+     * ensure the precompiled body is installed. If we have a saved
+     * {args,procbody} pair for this exact define form, re-apply it now
+     * using the renamed original (::tbcx::__oo_define_orig__). This
+     * guarantees the constructor/method ends up with the compiled body
+     * instead of the empty stub emitted by the saver.
+     */
+    if (rc == TCL_OK && key != NULL) {
+        Tcl_HashEntry *he2 = Tcl_FindHashEntry(&os->methodsByKey, Tcl_GetString(key));
+        if (he2) {
+            Tcl_Obj *pair2      = (Tcl_Obj *)Tcl_GetHashValue(he2);
+            Tcl_Obj *savedArgs2 = NULL, *preBody2 = NULL;
+            if (pair2 && Tcl_ListObjIndex(ip, pair2, 0, &savedArgs2) == TCL_OK && Tcl_ListObjIndex(ip, pair2, 1, &preBody2) == TCL_OK && savedArgs2 && preBody2) {
+                Tcl_IncrRefCount(preBody2);
+                /* Normalize class arg to FQN for deterministic resolution */
+                Tcl_Obj *clsForCall = clsFqn;
+                if (clsForCall != cls)
+                    Tcl_IncrRefCount(clsForCall);
+
+                if (kind == TBCX_METH_DTOR) {
+                    Tcl_Obj *argv0b = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
+                    Tcl_IncrRefCount(argv0b);
+                    Tcl_Obj *argvD[4] = {argv0b, clsForCall, sub, preBody2};
+                    int      rc2      = Tcl_EvalObjv(ip, 4, argvD, 0);
+                    if (rc2 != TCL_OK)
+                        rc = rc2;
+                    Tcl_DecrRefCount(argv0b);
+                } else if (kind == TBCX_METH_CTOR) {
+                    Tcl_Obj *argv0b = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
+                    Tcl_IncrRefCount(argv0b);
+                    Tcl_Obj *argvC[5] = {argv0b, clsForCall, sub, savedArgs2, preBody2};
+                    int      rc2      = Tcl_EvalObjv(ip, 5, argvC, 0);
+                    if (rc2 != TCL_OK)
+                        rc = rc2;
+                    Tcl_DecrRefCount(argv0b);
+                } else if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
+                    if (!nameO) {
+                        /* Best-effort: method name should have been set above; if not, skip safe patch */
+                    } else {
+                        Tcl_Obj *argv0b = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
+                        Tcl_IncrRefCount(argv0b);
+                        Tcl_Obj *argvM[6] = {argv0b, clsForCall, sub, nameO, savedArgs2, preBody2};
+                        int      rc2      = Tcl_EvalObjv(ip, 6, argvM, 0);
+                        if (rc2 != TCL_OK)
+                            rc = rc2;
+                        Tcl_DecrRefCount(argv0b);
+                    }
+                }
+                if (clsForCall != cls)
+                    Tcl_DecrRefCount(clsForCall);
+                Tcl_DecrRefCount(preBody2);
+            }
+        }
+    }
 
     /* Cleanup */
     if (key)
@@ -605,7 +662,7 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr, const
     p                    = (unsigned char *)TCL_ALIGN((uintptr_t)p);
     codePtr->objArrayPtr = (Tcl_Obj **)p;
     if (env->numLitObjects) {
-        for (Tcl_Size i = 0; i < env->numLitObjects; i++) {
+        for (int i = 0; i < env->numLitObjects; i++) {
             Tcl_Obj *lit            = env->objArrayPtr[i];
             codePtr->objArrayPtr[i] = lit;
             if (lit)
@@ -698,15 +755,7 @@ static Tcl_Obj *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned cha
     bcObj = Tcl_NewObj();
     /* Store a bytecode internal rep by asking the core to initialize from env */
     (void)TbcxByteCode(bcObj, tbcxTyBytecode, &env);
-    /* Undo our temporary literal refcounts and free the transient array. */
-    if (env.objArrayPtr) {
-        for (uint32_t i = 0; i < numLits; i++) {
-            if (env.objArrayPtr[i]) {
-                Tcl_DecrRefCount(env.objArrayPtr[i]);
-            }
-        }
-        Tcl_Free(env.objArrayPtr);
-    }
+
     if (env.auxDataArrayPtr)
         Tcl_Free(env.auxDataArrayPtr);
     if (env.exceptArrayPtr)
@@ -1699,8 +1748,7 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim) {
     Tcl_SetHashValue(he, pair);
     /* Clean temporaries not stored in the registry */
     Tcl_DecrRefCount(nsObj);
-    /* Hash table duplicates string keys; drop our Tcl_Obj now. */
-    Tcl_DecrRefCount(fqnKey);
+    /* fqnKey is held by the hash table; do not drop it here */
     return TCL_OK;
 }
 
