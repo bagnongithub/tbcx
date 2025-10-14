@@ -69,6 +69,8 @@ static void                    CaptureClassBody(Tcl_Interp *ip, const char *scri
 static void                    CaptureStaticsRec(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsSet *classes, int inBuilder);
 int                            CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
 static inline const char      *CmdCore(const char *s);
+static int                     CmpJTEntryUtf8_qsort(const void *pa, const void *pb);
+static int                     CmpTclObjUtf8_qsort(const void *pa, const void *pb);
 static int                     CompileProcLike(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_Obj *argsList, Tcl_Obj *bodyObj, const char *whereTag);
 static uint32_t                ComputeNumLocals(ByteCode *bc);
 static void                    CS_Add(ClsSet *cs, Tcl_Obj *clsFqn);
@@ -94,6 +96,7 @@ static Tcl_Obj                *NsFqn(Tcl_Interp *ip, Tcl_Namespace *nsPtr);
 static Tcl_Obj                *ResolveToBytecodeObj(TbcxCtx *ctx, Tcl_Obj *cand);
 static Tcl_Obj                *RewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, DefVec *defs, Tcl_Obj *curNs);
 static int                     ShouldStripBody(TbcxCtx *ctx, Tcl_Obj *obj);
+static Tcl_Obj                *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj);
 static void                    StubLinesForClass(Tcl_DString *out, DefVec *defs, Tcl_Obj *clsFqn);
 int                            Tbcx_SaveChanObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 int                            Tbcx_SaveFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
