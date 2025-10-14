@@ -7,12 +7,7 @@
 /* ==========================================================================
  * File-local globals
  * ========================================================================== */
-/*
- * Monotonic counter for generating unique names of hidden OO wrapper members
- * created during load (e.g., "__tbcx_ctor_<id>", "__tbcx_dtor_<id>").
- * The counter lives at file scope so multiple wrapper syntheses in the same
- * process/interpreter do not collide.
- */
+
 static int tbcxHiddenId = 0;
 
 /* ==========================================================================
@@ -170,7 +165,6 @@ static Tcl_Obj *BuildMethodKey(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tc
     return k;
 }
 
-/* Define a hidden normal method that *does* adopt a procbody directly. */
 static int DefineHiddenProcMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *hiddenName, Tcl_Obj *argsObj, Tcl_Obj *procBody) {
     Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
     Tcl_Obj *sub   = Tcl_NewStringObj("method", -1);
@@ -185,7 +179,6 @@ static int DefineHiddenProcMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *hidd
     return rc;
 }
 
-/* Build:  my <hidden> $a $b ...  with {*}$args for variadic last arg */
 static Tcl_Obj *CtorWrapperBody(Tcl_Interp *ip, Tcl_Obj *hiddenName, Tcl_Obj *argsObj) {
     (void)ip;
     Tcl_Obj *body = Tcl_NewStringObj("my ", -1);
@@ -210,22 +203,14 @@ static Tcl_Obj *CtorWrapperBody(Tcl_Interp *ip, Tcl_Obj *hiddenName, Tcl_Obj *ar
             }
         }
     }
-    return body; /* refcount already +1; caller should decref after use */
+    return body;
 }
 
-/* Destructors normally have empty arglists; still be generic. */
 static Tcl_Obj *DtorWrapperBody(Tcl_Interp *ip, Tcl_Obj *hiddenName, Tcl_Obj *argsObj) {
     (void)argsObj;
     return CtorWrapperBody(ip, hiddenName, Tcl_NewStringObj("", 0));
 }
 
-/* Re-apply precompiled bodies for all methods of class 'clsFqn' after a builder-form
- * 'oo::define cls { ... }' has executed. We always call the original renamed
- * define (::tbcx::__oo_define_orig__) with the class FQN so namespace‑relative
- * builder blocks are resolved consistently.
- *
- * Keys in os->methodsByKey are "class\x1Fkind\x1Fname".
- */
 static int ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     Tcl_HashSearch s;
     Tcl_HashEntry *e;
@@ -340,10 +325,6 @@ static int ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     return rc;
 }
 
-/* Forwarding shim for oo::define that substitutes precompiled bodies when available.
- * IMPORTANT FIX: always invoke the renamed original (::tbcx::__oo_define_orig__)
- * to avoid recursion; never re-invoke "oo::define" directly.
- */
 static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
     OOShim  *os  = (OOShim *)cd;
     int      rc  = TCL_OK;
@@ -549,11 +530,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             Tcl_Free(argv2);
             return rc;
         }
-        /* If the args didn't match exactly, allow a tolerant fallback:
-         * when the runtime body is the empty string (saver stub), and a precompiled
-         * body exists, substitute it regardless of arg canonicalization.
-         * This supports saver-emitted stubs like: oo::define C constructor {args} "".
-         */
+
         if (preBody && bodyIdx >= 0) {
             Tcl_Size bodyLen = 0;
             (void)Tcl_GetStringFromObj(objv[bodyIdx], &bodyLen);
@@ -911,12 +888,6 @@ static Tcl_Obj *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned cha
     return bcObj;
 }
 
-/* Ensure the CompiledLocal linked-list length matches 'neededCount' by
- * appending placeholder locals (empty names, no defaults) for non-argument
- * locals referenced by the compiled bytecode. This keeps the invariant that
- * the list contains exactly 'numCompiledLocals' nodes, which Tcl assumes
- * when freeing a Proc on redefinition.
- */
 static void CompiledLocals(Proc *procPtr, int neededCount) {
     if (!procPtr)
         return;
@@ -944,7 +915,6 @@ static void CompiledLocals(Proc *procPtr, int neededCount) {
     procPtr->numCompiledLocals = neededCount;
 }
 
-/* Install one precompiled method/ctor/dtor into OO registry */
 static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     /* classFqn */
     char    *clsf = NULL;
