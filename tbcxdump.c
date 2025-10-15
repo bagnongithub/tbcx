@@ -496,34 +496,6 @@ int Tbcx_DumpFileObjCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *co
         Tcl_Obj *argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
         Tcl_Free(args);
 
-        uint32_t bodyTextLen = 0;
-        if (!R_U32(&r, &bodyTextLen)) {
-            Tcl_DecrRefCount(argsObj);
-            Tcl_DecrRefCount(nameObj);
-            Tcl_DecrRefCount(clsFqn);
-            Tcl_DecrRefCount(topBC);
-            Tcl_DecrRefCount(out);
-            Tcl_Close(interp, in);
-            return TCL_ERROR;
-        }
-        if (bodyTextLen) {
-            unsigned char scratch[4096];
-            uint32_t      remain = bodyTextLen;
-            while (remain) {
-                Tcl_Size chunk = (remain < sizeof(scratch)) ? (Tcl_Size)remain : (Tcl_Size)sizeof(scratch);
-                if (!R_Bytes(&r, scratch, (size_t)chunk)) {
-                    Tcl_DecrRefCount(argsObj);
-                    Tcl_DecrRefCount(nameObj);
-                    Tcl_DecrRefCount(clsFqn);
-                    Tcl_DecrRefCount(topBC);
-                    Tcl_DecrRefCount(out);
-                    Tcl_Close(interp, in);
-                    return TCL_ERROR;
-                }
-                remain -= (uint32_t)chunk;
-            }
-        }
-
         Tcl_AppendToObj(out, "  - ", -1);
         Tcl_AppendObjToObj(out, clsFqn);
         const char *kname = (kind == TBCX_METH_INST)    ? "::method "

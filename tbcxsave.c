@@ -947,7 +947,6 @@ static void WriteHeaderTop(TbcxOut *w, ByteCode *top) {
     H.format       = TBCX_FORMAT;
     H.tcl_version  = PackTclVersion();
     H.codeLenTop   = (uint64_t)top->numCodeBytes;
-    H.numCmdsTop   = 0;
     H.numExceptTop = (uint32_t)top->numExceptRanges;
     H.numLitsTop   = (uint32_t)top->numLitObjects;
     H.numAuxTop    = (uint32_t)top->numAuxDataItems;
@@ -957,7 +956,6 @@ static void WriteHeaderTop(TbcxOut *w, ByteCode *top) {
     W_U32(w, H.format);
     W_U32(w, H.tcl_version);
     W_U64(w, H.codeLenTop);
-    W_U32(w, H.numCmdsTop);
     W_U32(w, H.numExceptTop);
     W_U32(w, H.numLitsTop);
     W_U32(w, H.numAuxTop);
@@ -2130,8 +2128,6 @@ static int EmitTbcxStream(Tcl_Interp *ip, Tcl_Obj *scriptObj, TbcxOut *w) {
             /* args */
             s = Tcl_GetStringFromObj(defs.v[i].args, &ln);
             W_LPString(w, s, ln);
-            /* bodyTextLen (=0 as we serialize compiled block next) */
-            W_U32(w, 0);
 
             /* Compile & emit block (proc semantics) */
             if (CompileProcLike(w, &ctx, defs.v[i].cls, defs.v[i].args, defs.v[i].body, "body of method") != TCL_OK) {

@@ -17,7 +17,7 @@ static int tbcxHiddenId = 0;
 typedef struct { /* minimal prefix used by TclInitByteCodeObj in our path */
     Tcl_Interp     *interp;
     Namespace      *nsPtr;
-    unsigned char  *codeStart, *codeNext, *codeEnd;
+    unsigned char  *codeStart, *codeNext;
     Tcl_Obj       **objArrayPtr;
     int             numLitObjects;
     AuxData        *auxDataArrayPtr;
@@ -845,8 +845,6 @@ static Tcl_Obj *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned cha
     if (codeLen)
         memcpy(env.codeStart, code, codeLen);
     env.codeNext      = env.codeStart + codeLen;
-    env.codeEnd       = env.codeNext;
-
     env.objArrayPtr   = NULL;
     env.numLitObjects = (int)numLits;
     if (numLits) {
@@ -943,30 +941,6 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     }
     Tcl_Obj *argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
     Tcl_Free(args);
-    /* bodyTextLen (ignored) */
-    uint32_t bodyTextLen = 0;
-    if (!R_U32(r, &bodyTextLen)) {
-        Tcl_DecrRefCount(argsObj);
-        Tcl_DecrRefCount(nameObj);
-        return TCL_ERROR;
-    }
-
-    /* tolerate saver variants that embed textual bodies.
-     * Keep the stream aligned by skipping bodyTextLen bytes if present.
-     */
-    if (bodyTextLen) {
-        unsigned char scratch[4096];
-        uint32_t      remain = bodyTextLen;
-        while (remain) {
-            Tcl_Size chunk = (remain < sizeof(scratch)) ? (Tcl_Size)remain : (Tcl_Size)sizeof(scratch);
-            if (!R_Bytes(r, scratch, chunk)) {
-                Tcl_DecrRefCount(argsObj);
-                Tcl_DecrRefCount(nameObj);
-                return TCL_ERROR;
-            }
-            remain -= (uint32_t)chunk;
-        }
-    }
 
     /* compiled block (namespace default: class namespace) + receive numLocals */
     Namespace *clsNs  = (Namespace *)EnsureNamespace(ip, Tcl_GetString(clsFqn));
@@ -1729,8 +1703,6 @@ int ReadHeader(TbcxIn *r, TbcxHeader *H) {
     if (!R_U32(r, &H->tcl_version))
         return 0;
     if (!R_U64(r, &H->codeLenTop))
-        return 0;
-    if (!R_U32(r, &H->numCmdsTop))
         return 0;
     if (!R_U32(r, &H->numExceptTop))
         return 0;

@@ -47,13 +47,15 @@
 
 #pragma pack(push, 1)
 typedef struct TbcxHeader {
-    uint32_t magic;       /* "TBCX" */
-    uint32_t format;      /* "9u" */
-    uint32_t tcl_version; /* mmjjppTT */
-    uint64_t codeLenTop;
-    uint32_t numCmdsTop, numExceptTop;
-    uint32_t numLitsTop, numAuxTop;
-    uint32_t numLocalsTop, maxStackTop;
+  uint32_t magic;       /* "TBCX" */
+  uint32_t format;      /* "9u" */
+  uint32_t tcl_version; /* mmjjppTT */
+  uint64_t codeLenTop;
+  uint32_t numExceptTop;
+  uint32_t numLitsTop;
+  uint32_t numAuxTop;
+  uint32_t numLocalsTop;
+  uint32_t maxStackTop;
 } TbcxHeader;
 #pragma pack(pop)
 
