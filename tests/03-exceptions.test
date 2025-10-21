@@ -12,8 +12,8 @@ test exc.1 {exception ranges: try/catch} -body {
         }
     } exc.1-in.tcl]
     set out [makeFile "" exc.1-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result FOO
 
 cleanupTests

@@ -11,8 +11,8 @@ test oo.1 {oo: instance method} -body {
         return [$o m]
     } oo.1-in.tcl]
     set out [makeFile "" oo.1-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result ok
 
 test oo.2 {oo: constructor passes args} -body {
@@ -23,8 +23,8 @@ test oo.2 {oo: constructor passes args} -body {
         return $::ctor
     } oo.2-in.tcl]
     set out [makeFile "" oo.2-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result hello
 
 cleanupTests

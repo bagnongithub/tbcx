@@ -5,14 +5,14 @@ namespace import ::tcltest::*
 
 test args.1 {save: wrong #args} -body {
     list [catch {tbcx::save} e] $e
-} -result {1 {wrong # args: should be "tbcx::save script outPath"}}
+} -result {1 {wrong # args: should be "tbcx::save in out"}}
 
 test args.2 {loadfile: wrong #args} -body {
-    list [catch {tbcx::loadfile} e] $e
-} -result {1 {wrong # args: should be "tbcx::loadfile in.tbcx"}}
+    list [catch {tbcx::load} e] $e
+} -result {1 {wrong # args: should be "tbcx::load in"}}
 
 test args.3 {dumpfile: wrong #args} -body {
-    list [catch {tbcx::dumpfile} e] $e
-} -result {1 {wrong # args: should be "tbcx::dumpfile filename"}}
+    list [catch {tbcx::dump} e] $e
+} -result {1 {wrong # args: should be "tbcx::dump filename"}}
 
 cleanupTests

@@ -7,12 +7,12 @@ test rt.1 {roundtrip: compile->save->load->eval->dump} -body {
     set in  [makeFile {proc p {} {return ok}; return [p]} rt.1-in.tcl]
     set out [makeFile "" rt.1-out.tbcx]
     # 1) save
-    tbcx::savefile $in $out
+    tbcx::save $in $out
     # 2) load+eval
-    set r [tbcx::loadfile $out]
+    set r [tbcx::load $out]
     # 3) dump
-    set d [tbcx::dumpfile $out]
-    expr {$r eq "ok" && [string match "tbcx:*" $d]}
-} -result ok
+    set d [tbcx::dump $out]
+    expr {$r eq "ok" && [string match "*proc p*" $d]}
+} -result 1
 
 cleanupTests

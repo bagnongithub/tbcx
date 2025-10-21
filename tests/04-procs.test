@@ -9,9 +9,9 @@ test proc.1 {procs: compiled body substituted} -body {
         return [add 3 4]
     } proc.1-in.tcl]
     set out [makeFile "" proc.1-out.tbcx]
-    tbcx::savefile $in $out
+    tbcx::save $in $out
     # During load, the proc shim should substitute the precompiled body
-    tbcx::loadfile $out
+    tbcx::load $out
 } -result 7
 
 cleanupTests

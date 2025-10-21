@@ -8,10 +8,12 @@ testConstraint haveThread [expr {![catch {package require Thread}]}]
 test thread.2 {thread + sub-interpreter} -constraints haveThread -body {
     set in  [makeFile {return "combo-ok"} thread.2-in.tcl]
     set out [makeFile "" thread.2-out.tbcx]
-    tbcx::savefile $in $out
-    set script [list interp create J ; interp eval J [list package require tbcx ; tbcx::loadfile $out] ; interp delete J]
+    tbcx::save $in $out
     set tid [thread::create]
-    set res [thread::send $tid $script]
+    thread::send $tid {interp create J}
+    thread::send $tid {interp eval J {package require tbcx}}
+    set res [thread::send $tid [list interp eval J [list tbcx::load $out]]]
+    thread::send $tid {interp delete J}
     thread::release $tid
     set res
 } -result combo-ok

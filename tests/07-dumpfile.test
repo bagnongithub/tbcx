@@ -6,8 +6,8 @@ namespace import ::tcltest::*
 test dump.1 {dumpfile prints header & sections} -body {
     set in  [makeFile {proc p {} {return 1}; return [p]} dump.1-in.tcl]
     set out [makeFile "" dump.1-out.tbcx]
-    tbcx::savefile $in $out
-    set d [tbcx::dumpfile $out]
+    tbcx::save $in $out
+    set d [tbcx::dump $out]
     expr {[string match "*Procs: 1*" $d] && [string match "*top:*" $d]}
 } -result 1
 

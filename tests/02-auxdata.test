@@ -14,8 +14,8 @@ test aux.1 {AUX: jumpTable (string)} -body {
         }
     } aux.1-in.tcl]
     set out [makeFile "" aux.1-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result 2
 
 # JumptableNum (integer keys)
@@ -29,8 +29,8 @@ test aux.2 {AUX: jumpTableNum (integer)} -body {
         }
     } aux.2-in.tcl]
     set out [makeFile "" aux.2-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result 25
 
 # DictUpdateInfo
@@ -43,8 +43,8 @@ test aux.3 {AUX: dict update} -body {
         return $res
     } aux.3-in.tcl]
     set out [makeFile "" aux.3-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
 } -result 1|2
 
 # ForeachInfo / NewForeachInfo
@@ -57,8 +57,78 @@ test aux.4 {AUX: foreach} -body {
         return $s
     } aux.4-in.tcl]
     set out [makeFile "" aux.4-out.tbcx]
-    tbcx::savefile $in $out
-    tbcx::loadfile $out
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 6
+
+# Jumptable (string keys), now within a proc
+test aux.5 {AUX: jumpTable (string)} -body {
+    set in  [makeFile {
+        proc myproc {} {
+            set x b
+            switch -exact -- $x {
+                a {return 1}
+                b {return 2}
+                default {return 0}
+            }
+        }
+        return [myproc]
+    } aux.1-in.tcl]
+    set out [makeFile "" aux.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 2
+
+# JumptableNum (integer keys), now within a proc
+test aux.6 {AUX: jumpTableNum (integer)} -body {
+    set in  [makeFile {
+        proc myproc {} {
+            set x 5
+            switch -exact -- $x {
+                1 {return 10}
+                5 {return 25}
+                default {return 0}
+            }
+        }
+        return [myproc]
+    } aux.2-in.tcl]
+    set out [makeFile "" aux.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 25
+
+# DictUpdateInfo, now within a proc
+test aux.7 {AUX: dict update} -body {
+    set in  [makeFile {
+        proc myproc {} {
+            set d [dict create a 1 b 2]
+            dict update d a A b B {
+                set res "$A|$B"
+            }
+            return $res
+        }
+        return [myproc]
+    } aux.3-in.tcl]
+    set out [makeFile "" aux.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1|2
+
+# ForeachInfo / NewForeachInfo, now within a proc
+test aux.8 {AUX: foreach} -body {
+    set in  [makeFile {
+        proc myproc {} {
+            set s 0
+            foreach x {1 2 3} {
+                incr s $x
+            }
+            return $s
+        }
+        return [myproc]
+    } aux.4-in.tcl]
+    set out [makeFile "" aux.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
 } -result 6
 
 cleanupTests

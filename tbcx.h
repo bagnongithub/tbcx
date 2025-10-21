@@ -47,15 +47,15 @@
 
 #pragma pack(push, 1)
 typedef struct TbcxHeader {
-  uint32_t magic;       /* "TBCX" */
-  uint32_t format;      /* "9u" */
-  uint32_t tcl_version; /* mmjjppTT */
-  uint64_t codeLenTop;
-  uint32_t numExceptTop;
-  uint32_t numLitsTop;
-  uint32_t numAuxTop;
-  uint32_t numLocalsTop;
-  uint32_t maxStackTop;
+    uint32_t magic;       /* "TBCX" */
+    uint32_t format;      /* "9u" */
+    uint32_t tcl_version; /* mmjjppTT */
+    uint64_t codeLenTop;
+    uint32_t numExceptTop;
+    uint32_t numLitsTop;
+    uint32_t numAuxTop;
+    uint32_t numLocalsTop;
+    uint32_t maxStackTop;
 } TbcxHeader;
 #pragma pack(pop)
 
@@ -93,8 +93,14 @@ extern const AuxDataType *tbcxAuxNewForeach;
 typedef struct TbcxIn {
     Tcl_Interp *interp;
     Tcl_Channel chan;
-    int         err; /* TCL_OK / TCL_ERROR */
+    int         err;
 } TbcxIn;
+
+typedef struct {
+    Tcl_Interp *interp;
+    Tcl_Channel chan;
+    int         err;
+} TbcxOut;
 
 /* ==========================================================================
  * Forward Declarations
@@ -104,12 +110,14 @@ int            BuildLocals(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **fi
 int            CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
 Tcl_Namespace *EnsureNamespace(Tcl_Interp *ip, const char *fqn);
 void           FreeLocals(CompiledLocal *first);
+int            ProbeOpenChannel(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_Channel *chPtr);
+int            ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj);
 int            R_Bytes(TbcxIn *r, void *p, size_t n);
 int            R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
 int            R_U32(TbcxIn *r, uint32_t *vp);
 int            R_U64(TbcxIn *r, uint64_t *vp);
 int            R_U8(TbcxIn *r, uint8_t *v);
-Tcl_Obj       *ReadCompiledBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut);
+Tcl_Obj       *ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled);
 int            ReadHeader(TbcxIn *r, TbcxHeader *H);
 
 #endif

@@ -6,10 +6,10 @@ namespace import ::tcltest::*
 test io.1 {savechan + loadchan} -body {
     set out [makeFile "" io.1-out.tbcx]
     set ch [open $out w]
-    tbcx::savechan {return "via-chan"} $ch
+    tbcx::save {return "via-chan"} $ch
     close $ch
     set ch2 [open $out r]
-    set r [tbcx::loadchan $ch2]
+    set r [tbcx::load $ch2]
     close $ch2
     set r
 } -result via-chan
