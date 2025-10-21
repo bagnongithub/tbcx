@@ -743,6 +743,14 @@ static void WriteLiteral(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
         W_U32(w, TBCX_LIT_LIST);
         Lit_List(w, ctx, obj);
     } else if (ty == tbcxTyBytecode) {
+        /*
+         * Top-level literal policy:
+         * When ctx->stripActive is true (writing the rewritten *top* script),
+         * nested bytecode literals are intentionally serialized as STRINGs.
+         * This mirrors 'source' semantics: top-level literal bytecode is not
+         * preserved as bytecode across save/load, while true procedure/method
+         * bodies are serialized (and reinstalled) via the Procs/Methods sections.
+         */
         if (ctx && ctx->stripActive) {
             Tcl_Size    n = 0;
             const char *s = Tcl_GetStringFromObj(obj, &n);
