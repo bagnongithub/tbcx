@@ -1,237 +1,283 @@
-\" -*- nroff -*-
-'\"
-'\" tbcx(n) -- Save, load, dump, and execute Tcl bytecode files (Tcl 9.1+ extension)
-'\"
-.TH tbcx n "September 2025" "tbcx 1.0" "Tcl Extensions"
+.TH tbcx 3 "Oct 22, 2025" "tbcx 1.0" "Tcl Bytecode eXchange"
 .SH NAME
-tbcx \- save, load, and inspect precompiled Tcl bytecode streams (.tbcx) for Tcl 9.1+
+tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas)
 .SH SYNOPSIS
 .nf
-package require tbcx 1.0
+\fBtbcx::save\fR \fIin out\fR
+\fBtbcx::load\fR \fIin\fR
+\fBtbcx::dump\fR \fIfilename\fR
 .fi
-.PP
-.nf
-tbcx::save      \fIscript outPath\fR
-tbcx::savechan  \fIscript channelName\fR
-tbcx::savefile  \fIin.tcl outPath\fR
-tbcx::loadchan  \fIchannelName\fR
-tbcx::loadfile  \fIin.tbcx\fR
-tbcx::dumpfile  \fIfilename\fR
-.fi
-.SH DESCRIPTION
-The \fBtbcx\fR package serializes and restores Tcl 9.1 bytecode in a
-portable stream format (\fB.tbcx\fR).  It lets you precompile Tcl code and
-ship the resulting bytecode, avoiding compilation at runtime.
-.PP
-The format is intentionally simple and little\-endian so streams produced
-on any host can be consumed on any other.  The loader recreates top\-level
-bytecode, procedure bodies, and TclOO methods, and evaluates the top\-level
-block to install definitions into the caller's interpreter.
-.SH COMMANDS
-.SS tbcx::save \fIscript outPath\fR
-Compile \fIscript\fR and write a .tbcx stream to \fIoutPath\fR. On success the
-result is the normalized output path.
-.PP
-Errors come from compilation or I/O; the command fails with a diagnostic.
-.PP
-.SS tbcx::savechan \fIscript channelName\fR
-Compile \fIscript\fR and write the .tbcx stream to an already opened Tcl
-channel named \fIchannelName\fR. The channel is switched to binary mode.
-.PP
-.SS tbcx::savefile \fIin.tcl outPath\fR
-Read \fIin.tcl\fR as a binary file, compile its content, and write a .tbcx
-stream to \fIoutPath\fR. On success the result is the normalized output path.
-.PP
-.SS tbcx::loadchan \fIchannelName\fR
-Read a .tbcx stream from the open binary \fIchannelName\fR and load it into
-the current interpreter. The top\-level code is evaluated with
-\fBTCL_EVAL_GLOBAL\fR after precompiled procedures and methods are registered.
-.PP
-.SS tbcx::loadfile \fIin.tbcx\fR
-Open \fIin.tbcx\fR and behave like \fBtbcx::loadchan\fR.
-.PP
-.SS tbcx::dumpfile \fIfilename\fR
-Open and decode \fIfilename\fR and print a human\-readable dump of the stream,
-including header fields, literal pool, AuxData, disassembled bytecode, and
-exception ranges.
-.SH STREAM FORMAT (OVERVIEW)
-A .tbcx file contains:
-.IP \(bu 2
-A fixed header.
-.IP \(bu 2
-One compiled block for the top level.
-.IP \(bu 2
-A procs section.
-.IP \(bu 2
-A classes section.
-.IP \(bu 2
-A methods section.
-.PP
-A compiled block is encoded as:
-.RS
-.IP "1." 3
-Code bytes length (\fBu32LE\fR) then raw code bytes.
-.IP "2." 3
-Literal pool count (\fBu32LE\fR) then that many literals.
-.IP "3." 3
-AuxData array count (\fBu32LE\fR) then that many AuxData items.
-.IP "4." 3
-Exception range count (\fBu32LE\fR) then that many ranges.
-.IP "5." 3
-Epilogue: \fBmaxStack\fR (\fBu32LE\fR), \fBreserved\fR (\fBu32LE\fR, zero),
-\fBnumLocals\fR (\fBu32LE\fR).
-.RE
-.SS Header
-All multi\-byte numbers are little\-endian. The header layout is:
-.PP
-.nf
-u32 magic       = 0x58434254  ("TBCX")
-u32 format      = 9
-u32 tcl_version = PackTclVersion()  ; mmjjppTT
-u64 codeLenTop
-u32 numCmdsTop      ; 0 in this implementation
-u32 numExceptTop
-u32 numLitsTop
-u32 numAuxTop
-u32 numLocalsTop
-u32 maxStackTop
-.fi
-.PP
-The saver writes these from the compiled top\-level block.
-.SS Limits
-To guard against malformed inputs:
-.PP
-.nf
-codeLen   <= 1 GiB
-literals  <= 64 M
-auxData   <= 64 M
-exceptions<= 64 M
-LPString  <= 16 MiB
-.fi
-.SS Literals
-Each literal is a \fBu32LE\fR tag followed by a tag\-specific payload:
-.PP
-.nf
-0  BIGNUM     : u8 sign(0,1,2) + u32 n + n bytes (magnitude, little\-endian)
-1  BOOLEAN    : u8 (0/1)
-2  BYTEARR    : u32 n + n bytes
-3  DICT       : u32 count + count × {keyLit, valLit}
-4  DOUBLE     : u64 raw IEEE\-754 bits (host written & byteswapped as LE)
-5  LIST       : u32 n + n × literal
-6  STRING     : LPString (u32 len + bytes, no NUL)
-7  WIDEINT    : u64 two's complement
-8  WIDEUINT   : u64 (promoted to bignum if out of Tcl wide range)
-9  LAMBDA_BC  : LPString nsFQN, u32 argc,
-                argc × {LPString name, u8 hasDefault, [default literal]},
-                then a compiled block for the body
-10 BYTECODE   : LPString nsFQN, then a compiled block
-.fi
-.SS AuxData
-The AuxData array mirrors Tcl's internal aux records for certain opcodes.
-Supported tags:
-.PP
-.nf
-0  JT_STR     : u32 cnt + cnt × {LPString key, u32 targetOffset}
-1  JT_NUM     : u32 cnt + cnt × {u64 key, u32 targetOffset}
-2  DICTUPD    : u32 L + L × u32 varIndex
-3  NEWFORE    : foreach(new) record (see below)
-4  FOREACH    : foreach(old) record (see below)
-.fi
-.PP
-Foreach records encode:
-.RS
-.IP \(bu 2
-\fInumLists\fR, \fIloopCtTemp\fR, \fIfirstValueTemp\fR, and a duplicate
-\fInumLists\fR (sanity check).
-.IP \(bu 2
-For each list: \fInumVars\fR then that many local variable indices.
-.IP \(bu 2
-The loader maps both tags to the appropriate runtime aux type
-(\fBForeachInfo\fR or \fBNewForeachInfo\fR), preferring the name that matches
-the tag and falling back when necessary.
-.RE
-.SS Exception ranges
-Each range is encoded as seven \fBu32LE\fR values: \fBtype\fR (low 8 bits
-used), \fBnestingLevel\fR, \fBcodeOffset\fR, \fBnumCodeBytes\fR,
-\fBcontinueOffset\fR, \fBbreakOffset\fR, \fBcatchOffset\fR.
-.SS Procs section
-Count (\fBu32LE\fR) then that many entries, each:
-.RS
-.IP \(bu 2
-LPString \fIprocName\fR (as provided) and LPString \fIns\fR (namespace FQN).
-.IP \(bu 2
-LPString \fIargs\fR (canonical list).
-.IP \(bu 2
-A compiled block for the body (compiled with \fBproc\fR semantics under
-\fIns\fR). The epilogue's \fBnumLocals\fR is the max of the local cache size
-(if present) and what can be inferred from AuxData usage.
-.RE
-.PP
-On load, \fBproc\fR is temporarily replaced by a shim that substitutes the
-precompiled \fBprocbody\fR when the call defines a procedure whose FQN and
-argument list exactly match the registry entry; otherwise it forwards to the
-original \fBproc\fR. The shim is removed after the top\-level evaluation.
-.SS Classes section
-Count (\fBu32LE\fR) then that many entries, each LPString class FQN and
-\fBu32\fR number of superclasses (currently 0). The saver records classes it
-observes in the source; the loader ensures the namespaces exist.
-.SS Methods section
-Count (\fBu32LE\fR) then that many entries, each:
-.RS
-.IP \(bu 2
-LPString \fIclassFqn\fR.
-.IP \(bu 2
-u8 \fIkind\fR: 0=inst, 1=class, 2=ctor, 3=dtor.
-.IP \(bu 2
-LPString \fIname\fR (empty for ctor/dtor).
-.IP \(bu 2
-LPString \fIargs\fR (canonical list), u32 \fIbodyTextLen\fR (reserved, 0),
-then a compiled block for the body.
-.RE
-.PP
-On load, \fBoo::define\fR is temporarily replaced by a shim that substitutes
-the precompiled body when the method/ctor/dtor being defined in script has the
-same argument list as the registry entry; otherwise it forwards to the original.
-.SH ENDIANNESS
-Streams are always little\-endian. The saver byteswaps on big\-endian hosts,
-and the loader byteswaps while reading on big\-endian hosts. Double literals
-are moved as raw 64\-bit bit patterns.
-.SH EXAMPLES
-.PP
-Precompile a package and load it later:
-.PP
-.nf
-set out [tbcx::save {
-    namespace eval ::demo {
-        proc add {a b} { expr {$a + $b} }
-    }
-} demo.tbcx]
-# Later, possibly in another process or machine:
-tbcx::loadfile $out
-puts [demo::add 2 3]   ;# -> 5
-.fi
-.PP
-Dump a file for inspection:
-.PP
-.nf
-puts [tbcx::dumpfile demo.tbcx]
-.fi
-.SH DIAGNOSTICS
-Typical errors include: "short read/write", "string too large", "too many
-literals/aux/exception ranges", "unsupported AuxData kind", "unknown literal
-tag", "bad header", and failures from the Tcl compiler.
-.SH COMPATIBILITY NOTES
-.IP \(bu 2
-The instruction decoder used by \fBtbcx::dumpfile\fR matches Tcl 9.1. Legacy
-one\-byte forms are marked as deprecated in the dump.
-.IP \(bu 2
-The loader installs temporary shims for \fBproc\fR and \fBoo::define\fR and
-removes them after the top\-level block evaluates.
-.SH SEE ALSO
-Tcl(n), bytecode(n), TclOO(n), source(n), proc(n), namespace(n), oo::class(n), oo::define(n)
-.SH KEYWORDS
-bytecode, compile, load, save, dump, channel, packaging
-.SH COPYRIGHT
-MIT License
 
-Copyright (c) 2025 Miguel Banon
+.SH DESCRIPTION
+The \fBtbcx\fR extension provides three subcommands that enable an efficient
+\fIsave \[->] load \[->] eval\fR pipeline for Tcl 9.1 scripts. The goal is to pay the cost of
+parsing/compiling at save time so that loading is as fast as reading a compact binary, while
+remaining functionally equivalent to \fBsource\fR of the original script.
+.PP
+Artifacts store the compiled top\-level, precompiled \fBproc\fR bodies, TclOO method/ctor/dtor
+bodies, and \fBlambda\fR literals for use with \fBapply\fR. Loading installs these into the current
+interpreter and executes the top\-level block in the caller's current namespace.
+
+.SH COMMANDS
+.SS "tbcx::save in out"
+.B Synopsis
+.PP
+Compile a script and write a \fB.tbcx\fR artifact.
+.PP
+.B Parameters
+.TP
+.I in
+One of:
+.RS
+.IP \(bu 2
+\fIString\fR \- a Tcl string value containing the script text.
+.IP \(bu 2
+\fIReadable channel\fR \- an open channel; the command enforces binary\-safe reads.
+.IP \(bu 2
+\fIReadable path\fR \- a filesystem path to a script file; it is opened, read, and closed by \fBtbcx::save\fR.
+.RE
+.TP
+.I out
+One of:
+.RS
+.IP \(bu 2
+\fIWritable channel\fR \- an open channel; the command writes binary data and does \fInot\fR close the channel.
+.IP \(bu 2
+\fIWritable path\fR \- a filesystem path for the new \fB.tbcx\fR file; it is created/truncated and closed on return.
+.RE
+.PP
+.B Behavior
+.RS
+.IP \(bu 2
+Compiles the top\-level block, discovers and precompiles \fBproc\fR bodies and TclOO method/ctor/dtor bodies,
+and captures \fIlambda literals\fR as lambda\-bytecode literals (for \fBapply\fR).
+.IP \(bu 2
+Serializes the header, top\-level block, Procs table, Classes catalog (advisory), and Methods table.
+.RE
+.PP
+.B Returns
+.RS
+The output object: either the normalized path written, or the writable channel handle.
+.RE
+.PP
+.B Errors
+.RS
+Typical errors include: unreadable input; unwritable output; version/format mismatch; unknown/unsupported AuxData;
+size limit exceeded (code, literals, AuxData, exception ranges, strings); short read/write.
+The interpreter result contains a descriptive message.
+.RE
+.PP
+.B Notes
+.RS
+.IP \(bu 2
+Channels are treated as binary for portability; encodings are not altered on the caller's behalf, and channels are not closed.
+.IP \(bu 2
+The produced artifact is intended for Tcl 9.1; other versions are rejected at load time.
+.RE
+.PP
+.B Examples
+.nf
+# Save from path \-> path
+set path [tbcx::save ./app.tcl ./app.tbcx]
+
+# Save from string value \-> path
+set script {proc hi {} {puts Hello}; hi}
+tbcx::save $script ./hello.tbcx
+
+# Save from channel \-> channel
+set in  [open ./lib/foo.tcl r]
+set out [open ./foo.tbcx w]
+fconfigure $in  -translation binary -eofchar {}
+fconfigure $out -translation binary -eofchar {}
+try {
+    tbcx::save $in $out
+} finally {
+    close $in
+    close $out
+}
+.fi
+
+.SS "tbcx::load in"
+.B Synopsis
+.PP
+Load a \fB.tbcx\fR artifact, install precompiled entities, and execute the top\-level block.
+.PP
+.B Parameters
+.TP
+.I in
+One of:
+.RS
+.IP \(bu 2
+\fIReadable channel\fR \- an open channel positioned at the beginning of a \fB.tbcx\fR stream (binary).
+.IP \(bu 2
+\fIReadable path\fR \- a filesystem path to a \fB.tbcx\fR file.
+.RE
+.PP
+.B Behavior
+.RS
+.IP \(bu 2
+Validates header and producer version; deserializes sections.
+.IP \(bu 2
+Materializes procs and TclOO methods (ctors/dtors) from precompiled bodies.
+.IP \(bu 2
+Rehydrates lambda\-bytecode literals so the first \fBapply\fR incurs no compilation.
+.IP \(bu 2
+Executes the precompiled top\-level block in the caller's current namespace.
+.RE
+.PP
+.B Returns
+.RS
+Empty string on success.
+.RE
+.PP
+.B Errors
+.RS
+Typical errors include: unreadable input; bad header; incompatible Tcl version; malformed/unknown section;
+size limit exceeded; short read; class or namespace creation errors during top\-level evaluation.
+.RE
+.PP
+.B Notes
+.RS
+.IP \(bu 2
+Load in a specific namespace by wrapping the call: \fBnamespace eval ::pkg { tbcx::load ./app.tbcx }\fR
+.IP \(bu 2
+Loading executes code; only load artifacts from trusted sources.
+.RE
+.PP
+.B Examples
+.nf
+# Load into current namespace
+tbcx::load ./app.tbcx
+
+# Load into a dedicated namespace
+namespace eval ::app { tbcx::load ./app.tbcx }
+
+# Load from an open channel
+set ch [open ./app.tbcx r]
+fconfigure $ch -translation binary -eofchar {}
+try {
+    tbcx::load $ch
+} finally {
+    close $ch
+}
+.fi
+
+.SS "tbcx::dump filename"
+.B Synopsis
+.PP
+Disassemble and describe a \fB.tbcx\fR artifact in human\-readable form.
+.PP
+.B Parameters
+.TP
+.I filename
+A readable path to a \fB.tbcx\fR file.
+.PP
+.B Behavior
+.RS
+Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;
+and a disassembly of the top\-level, proc, method, and lambda bodies.
+.RE
+.PP
+.B Returns
+.RS
+A string containing the formatted dump.
+.RE
+.PP
+.B Errors
+.RS
+Unreadable file; bad header; malformed section; short read.
+.RE
+.PP
+.B Examples
+.nf
+% package require tbcx
+% tbcx::save {set a 1} out
+% tbcx::dump out
+TBCX Header:
+  magic = 0x58434254 ('T''B''C''X')
+  format = 9
+  tcl_version = 9.1.0 (type 0)
+  top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
+
+Top-level block:
+  Disassembly (top-level):
+ByteCode 0x7f9963089e10, refCt 1, epoch 20, interp 0x7f9963816a10 (epoch 20)
+  Source ""
+  Cmds 0, src 0, inst 11, litObjs 1, aux 0, stkDepth 1, code/src 0.00
+    (0) push 0 	# "1"
+    (5) storeScalar %v0
+    (10) done
+
+  code=11, stack=1, lits=1, aux=0, except=0
+  Locals (1):
+    [0] "a"
+  Literals:
+    [0] (bignum) 1
+
+Procs: 0
+
+Classes: 0
+
+Methods: 0
+.fi
+
+.SH FILE FORMAT (OVERVIEW)
+.PP
+This section summarizes the on\-disk structure.
+.TP
+.B Header
+Magic + format version + producing Tcl version; size/count metadata for the top\-level block
+(code length, literal count, AuxData count, exception ranges, locals, max stack).
+.TP
+.B Sections (order)
+(1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue);
+(2) Procs (FQN, ns, arg spec, compiled block);
+(3) Classes (advisory catalog; actual creation occurs at load time);
+(4) Methods (class, kind, name, args, compiled block).
+.TP
+.B Literal kinds
+boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict, embedded bytecode,
+and \fBlambda\-bytecode\fR literals for use with \fBapply\fR.
+.TP
+.B AuxData families
+jump tables (string or numeric), dictupdate, foreach (legacy/new).
+
+.SH LAMBDA SUPPORT
+.PP
+Literals in the script that represent \fIlambdas\fR for \fBapply\fR (lists of the form
+\fC{args body ?ns?}\fR) are compiled and serialized as lambda\-bytecode literals at save time.
+On load, both the compiled body and the optional namespace element are rehydrated so that the
+first call to \fBapply\fR does not trigger compilation.
+
+.SH SEMANTICS AND PERFORMANCE
+.PP
+Artifacts are portable across little\- and big\-endian hosts. The loader detects host byte order
+once and applies a tight in\-place swap over bulk sections that require conversion, avoiding
+per\-field branching so cross\-endian loads remain close to native performance.
+.PP
+Loading executes the precompiled top\-level, then installs precompiled proc/method bodies and
+rehydrates lambda literals. The intent is to be functionally indistinguishable from \fBsource\fR
+of the original script, with the benefit of faster startup due to avoided parsing/compilation.
+
+.SH LIMITS
+.PP
+Sanity caps exist for code size, literal count (including lambdas), AuxData count, exception ranges,
+and string lengths. Exceeding limits produces an error.
+
+.SH DIAGNOSTICS
+.PP
+Representative messages include: "bad header", "incompatible Tcl version", "short read/write",
+"unsupported AuxData kind", "input is neither an open channel nor a readable file", and
+"errors while evaluating top\-level".
+
+.SH SECURITY
+.PP
+Loading executes code. Only load artifacts you trust.
+
+.SH SEE ALSO
+source(n), TclOO(n)
+
+.SH COPYRIGHT
+\[co] 2025 Miguel Banon
+
+MIT License.
