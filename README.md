@@ -15,7 +15,7 @@ package require tbcx
 # - in:  Tcl value (script text) | open readable channel | path to a readable .tcl file
 # - out: open writable binary channel | path to a new .tbcx file
 
-puts [tbcx::save ./hello.tcl ./hello.tbcx]
+tbcx::save ./hello.tcl ./hello.tbcx
 
 # Load: .tbcx → installs procs/methods/lambdas and executes top level
 # - in:  open readable binary channel | path to a .tbcx file
@@ -189,4 +189,5 @@ MIT license
 ## Acknowledgements
 
 Built on top of Tcl 9.1’s bytecode engine, object types, AuxData, and TclOO.
+
 Thanks to the Tcl/Tk community.
