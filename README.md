@@ -1,28 +1,31 @@
 # TBCX — Precompiled Tcl 9.1+ Bytecode (save / load / dump)
 
-TBCX is a tiny C extension for Tcl 9.1+ that can **serialize** compiled Tcl bytecode (plus enough metadata to reconstruct procs, OO classes/methods, and selected namespace‑eval bodies) into a compact `.tbcx` file — and later **load** that file into another interpreter for instant execution, without re‑parsing or re‑compiling the source. There’s also a **disassembler** that renders human‑readable dumps of `.tbcx` content.
+TBCX is a C extension for Tcl 9.1+ that **serializes** compiled Tcl bytecode (plus enough metadata to reconstruct `proc`s, TclOO methods, and **lambda constructs**) into a compact `.tbcx` file — and later **loads** that file into another interpreter for fast startup without re‑parsing or re‑compiling the original source. There’s also a **disassembler** for human‑readable inspection.
+
+> Status: draft implementation; interfaces are still evolving. We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout.
 
 ---
 
-## Getting Started
+## Quick Start
 
 ```tcl
-# Install (example: build locally, then package require)
-# See the Build section below to compile tbcx.so / tbcx.dll, then:
-package require tbcx 1.0
+package require tbcx
 
-# Save a script to a TBCX artifact
-tbcx::savefile ./app.tcl ./app.tbcx
+# Save: source text → .tbcx
+# - in:  Tcl value (script text) | open readable channel | path to a readable .tcl file
+# - out: open writable binary channel | path to a new .tbcx file
 
-# Load it later (installs procs/classes; runs top-level)
-namespace eval ::myapp {
-    tbcx::loadfile ./app.tbcx
-}
+puts [tbcx::save ./hello.tcl ./hello.tbcx]
 
-# Inspect the artifact (human-readable dump)
-puts [tbcx::dumpfile ./app.tbcx]
+# Load: .tbcx → installs procs/methods/lambdas and executes top level
+# - in:  open readable binary channel | path to a .tbcx file
+
+tbcx::load ./hello.tbcx
+
+# Dump: pretty disassembly
+
+puts [tbcx::dump ./hello.tbcx]
 ```
-
 ---
 
 ## Features
@@ -38,39 +41,44 @@ puts [tbcx::dumpfile ./app.tbcx]
 
 ---
 
-## Commands
+## Commands (3)
 
-The package registers a `tbcx` command namespace with six subcommands:
+### `tbcx::save in out`
+Compile and serialize to `.tbcx`.
 
-- `tbcx::save script out.tbcx` — compile `script` (a `Tcl_Obj`) and write to a new file
-- `tbcx::savechan script channel` — write to an existing channel (binary)
-- `tbcx::savefile in.tcl out.tbcx` — read a `.tcl` file, compile, and save a `.tbcx` (returns normalized path)
-- `tbcx::loadfile path` — load a `.tbcx` file into the **current namespace**, materializing procs/classes/methods and running the top-level
-- `tbcx::loadchan channel` — load from an open channel
-- `tbcx::dumpfile path` — produce a human-readable disassembly string of a `.tbcx` file
+- **`in`** may be:
+  - a **Tcl value** containing the script text (no file I/O needed),
+  - an **open readable channel** (must be in binary mode; the command will set binary options safely),
+  - a **path** to a readable file (opened, read, closed by TBCX).
+- **`out`** may be:
+  - an **open writable channel** (binary mode is enforced; channel is *not* closed),
+  - a **path** to write a new `.tbcx` file (created/truncated; channel is closed on return).
+- **Result**: returns the output channel handle or normalized output path.
 
-### Quick examples
+What gets saved:
 
-```tcl
-package require tbcx
+- The **top‑level** compiled block of the input script (code, literal pool, AuxData, exception ranges, local names/temps).
+- All discovered **`proc`** bodies precompiled.
+- TclOO **methods/constructors/destructors** precompiled.
+- **Lambda literals** appearing in the script (e.g. `apply {args body ?ns?}` forms) are compiled and serialized as **lambda‑bytecode literals** so they do **not** recompile on first use after load.
 
-# 1) Save straight from source file
-tbcx::savefile ./app.tcl ./app.tbcx
+### `tbcx::load in`
+Load a `.tbcx` artifact into the **current namespace**, materialize procs and OO methods, rehydrate lambda bytecode literals, and execute the top‑level block.
 
-# 2) Load later (installs procs/classes and executes top-level)
-namespace eval ::myapp {
-    tbcx::loadfile ./app.tbcx
-}
+- **`in`** may be an **open readable binary channel** or a **path** to a `.tbcx` file.
+- **Result**: the top‑level executes (like `source`), procs, OO methods, and embedded lambda literals become available without re‑compilation.
 
-# 3) Inspect a TBCX artifact
-puts [tbcx::dumpfile ./app.tbcx]
-```
+### `tbcx::dump filename`
+Produce a human‑readable string describing the artifact, including a **disassembly** of each compiled block and any **lambda literals**.
+
+- **`filename`** must be a path to a readable `.tbcx` file.
+- **Output**: header, summaries, literal listings, AuxData and exception info, plus disassembly of the top‑level/proc/method/lambda bytecode.
 
 ---
 
 ## How saving works
 
-`tbcx::save*` compiles the given script and **captures** definitions in several passes:
+`tbcx::save` compiles the given script and **captures** definitions in several passes:
 
 - **Static parse**: Walk tokens to find literal `proc` forms and `namespace eval` blocks; recurse into bodies under the correct namespace prefix.
 - **Dynamic probe**: Evaluate the script inside a **child interpreter** with shimmed commands that record (but do not execute) side effects (`proc`, `oo::class create`, `oo::define … method/constructor/destructor/superclass`, with `unknown` guarded). This discovers procs/classes/methods created via control flow.
@@ -88,7 +96,7 @@ Supported AuxData includes **jump tables (string/num), dict-update, foreach (new
 
 ## How loading works
 
-`tbcx::load*` reads the header, deserializes top-level and nested bytecode blocks, and **finalizes** them as precompiled for the target interpreter:
+`tbcx::load` reads the header, deserializes top-level and nested bytecode blocks, and **finalizes** them as precompiled for the target interpreter:
 
 - Top-level bytecode becomes a temporary proc executed once, then deleted, to mimic “run the script now.”
 - Each saved `proc` is recreated and its body installed as a precompiled `ByteCode`.
@@ -99,23 +107,32 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 
 ---
 
-## File format (nutshell)
+## File Format (overview)
 
-Header (`TbcxHeader`, little-endian fields):
+**Header** (compact, binary):
+- Magic and format version; stamped Tcl version that produced the artifact.
+- Size/count metadata for the **top‑level** block (code length, literal count, AuxData count, exception ranges, locals, max stack).
 
-```
-magic="TBCX", format=9, flags=0,
-codeLen, numCmds, numExcept, numLiterals, numAux, numLocals, maxStackDepth
-```
+**Sections (in order):**
+1. **Top‑level block** — code bytes, literal array, AuxData array, exception ranges, locals epilogue.
+2. **Procs** — repeated tuples: fully‑qualified name, namespace, argument spec, compiled block.
+3. **Classes** *(advisory)* — class FQN, superclasses list; creation still occurs by evaluating the builder at load time.
+4. **Methods** — repeated tuples: class FQN, kind (method/ctor/dtor), name, arg spec, compiled block.
+5. **Literals** supported inside blocks include: boolean, (wide)int/uint, double, **bignum**, string, bytearray, list, dict, embedded bytecode, and **lambda‑bytecode** literals for `apply`.
 
-Followed by top-level: `code`, `literals[]`, `aux[]`, `except[]`
-Then sections for **procs**, **classes**, **methods**, and **namespace bodies**.
+**AuxData** families covered include: jump tables (string or numeric), `dictupdate`, and `foreach` variants (legacy/new).
 
-**Limits (sanity caps):**
-- `TBCX_MAX_CODE` (≈1 GiB)
-- `TBCX_MAX_LITERALS`
-- `TBCX_MAX_AUX`
-- `TBCX_MAX_EXCEPT`
+### Performance & Endianness
+
+Artifacts are **portable** across little‑ and big‑endian hosts. On load, TBCX detects the host byte order once and uses a **tight, in‑place swap strategy** on bulk sections that require conversion (code/metadata arrays), avoiding per‑field branching. This keeps cross‑endian load time close to native‑endian performance.
+
+---
+
+## Guarantees & Semantics
+
+- **Functional equivalence**: `tbcx::load` aims to be *functionally identical* to `source` of the original script. Differences are intentionally limited to avoiding re‑parse/re‑compile time.
+- **Namespaces**: Loading happens in the **caller’s current namespace**; saved blocks carry enough namespace metadata to bind compiled code correctly. Lambda literals that include a namespace element keep that association.
+- **Sanity limits** (caps): code size, literal count (including lambdas), AuxData count, exception ranges, string lengths.
 
 ---
 
@@ -125,15 +142,13 @@ This package uses **Tcl 9.1+** APIs and selected internals (e.g., `tclInt.h`, `t
 You’ll need Tcl 9.1 headers/libs on your include path and to build as a standard loadable extension.
 The entry point `tbcx_Init` registers the commands and provides `tbcx 1.0`.
 
-Example (Linux/macOS):
+Example (TEA Linux/macOS):
 
 ```sh
-cc -fPIC -O2 -I/path/to/tcl9.1/generic -I/path/to/tcl9.1/unix   -shared -o tbcx.so   tbcx.c tbcxsave.c tbcxload.c tbcxdump.c
+./configure
+make install
+make test
 ```
-
-> Notes
-> • Link (or stub) against Tcl 9.1 and libtommath as needed.
-> • Because Tcl internals are used, **exact Tcl version alignment matters**.
 
 ---
 
@@ -148,24 +163,13 @@ cc -fPIC -O2 -I/path/to/tcl9.1/generic -I/path/to/tcl9.1/unix   -shared -o tbcx.
 
 ---
 
-## Disassembler output
-
-`tbcx::dumpfile` prints:
-
-- Header values and top-level block summary
-- Literals (type/name), AuxData summaries, exception ranges
-- Full disassembly with instruction names, operands, label targets, and stack-effect hints
-- Per-proc and per-method compiled block dumps (plus class/method metadata)
-
----
-
 ## Project layout
 
-- `tbcx.h` — public/shared definitions (header layout, tags, helpers, limits)
-- `tbcx.c` — package init, type discovery, endian setup, command registration
-- `tbcxsave.c` — serializer & capture logic (proc/OO/namespace detection, filtering, rewrites, emitters)
-- `tbcxload.c` — deserializer/loader (materialize procs/classes/methods; run top-level wrapper)
-- `tbcxdump.c` — dumper & disassembler
+- `tbcx.h` — shared definitions (header layout, tags, limits)
+- `tbcx.c` — package init, byte‑order detection, type discovery, command registration
+- `tbcxsave.c` — compile & serialize
+- `tbcxload.c` — deserialize & materialize
+- `tbcxdump.c` — disassembler/dumper
 
 ---
 
