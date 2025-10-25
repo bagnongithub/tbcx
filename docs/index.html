@@ -1,0 +1,422 @@
+<!doctype html><html lang='en'>
+<meta charset='utf-8'>
+  <title>tbcx</title>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <meta name='date' content='Oct 22, 2025'>
+  <meta name='generator' content='tbcx 1.0'>
+  <style>
+    :root{
+        --bg: #ffffff;
+        --fg: #1f2328;
+        --muted: #57606a;
+        --border: #d0d7de;
+        --accent: #0969da;
+        --code-bg: #f6f8fa;
+        --shadow: rgba(31,35,40,0.08);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; background: var(--bg); color: var(--fg); }
+    body { font: 16px/1.6 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Noto Sans", "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .container { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+    .header {
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 16px;
+    }
+    .header h1 { margin: 0; font-size: 28px; }
+    .header .meta { color: var(--muted); font-size: 14px; margin-top: 6px; }
+    .toc-index-wrap{
+        display: block;
+        padding: 12px 12px 4px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #fff;
+        box-shadow: 0 1px 0 var(--shadow);
+        margin-bottom: 20px;
+    }
+    .toc-top h2, .index-top h2 { font-size: 18px; margin: 10px 0; }
+    .toc-top ol { margin: 0 0 12px 18px; padding: 0; }
+    .index-list { columns: 2 260px; column-gap: 24px; list-style: none; padding-left: 0; margin: 0; }
+    .index-list li { break-inside: avoid; padding: 2px 0; }
+    h2 { margin-top: 28px; font-size: 22px; border-top: 1px solid var(--border); padding-top: 16px;}
+    h3 { margin-top: 22px; font-size: 18px; }
+    p { margin: 10px 0; }
+    pre, code, kbd, samp { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    pre { background: var(--code-bg); padding: 12px; border: 1px solid var(--border); border-radius: 8px; overflow: auto; }
+    code { background: var(--code-bg); padding: 1px 4px; }
+    .deflist { margin: 12px 0; }
+    .deflist dt { font-weight: 600; margin-top: 14px; }
+    .deflist dd { margin: 6px 0 10px 0; }
+    ul { margin: 10px 0 10px 20px; }
+    .indent { margin-left: 20px; border-left: 3px solid var(--border); padding-left: 12px; }
+    .footer { margin-top: 40px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px; }
+    .back-to-top { position: fixed; bottom: 16px; right: 16px; border: 1px solid var(--border); padding: 8px 10px; border-radius: 20px; background: #fff; box-shadow: 0 2px 12px var(--shadow); font-size: 14px;}
+  </style>
+  <body>
+    <div class='container'>
+      <header class='header'>
+        <h1 id='top'>TBCX</h1>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Oct 22, 2025</div>
+      </header>
+      <section class='toc-index-wrap'>
+        <nav class='toc-top'>
+          <h2>Contents</h2>
+          <ol>
+            <li><a href='#name'>NAME</a></li>
+            <li><a href='#synopsis'>SYNOPSIS</a></li>
+            <li><a href='#description'>DESCRIPTION</a></li>
+            <li><a href='#commands'>COMMANDS</a></li>
+            <li><a href='#file-format-overview'>FILE FORMAT (OVERVIEW)</a></li>
+            <li><a href='#lambda-support'>LAMBDA SUPPORT</a></li>
+            <li><a href='#semantics-and-performance'>SEMANTICS AND PERFORMANCE</a></li>
+            <li><a href='#limits'>LIMITS</a></li>
+            <li><a href='#diagnostics'>DIAGNOSTICS</a></li>
+            <li><a href='#security'>SECURITY</a></li>
+            <li><a href='#see-also'>SEE ALSO</a></li>
+            <li><a href='#copyright'>COPYRIGHT</a></li>
+          </ol>
+        </nav>
+        <nav class='index-top'>
+          <h2>Index</h2>
+          <ul class='index-list'>
+            <li><a href='#tbcx-save-in-out'>tbcx::save in out</a></li>
+            <li><a href='#tbcx-load-in'>tbcx::load in</a></li>
+            <li><a href='#tbcx-dump-filename'>tbcx::dump filename</a></li>
+          </ul>
+        </nav>
+      </section>
+      <h2 id='name'>NAME</h2><p>tbcx - serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs,
+        OO methods, and lambdas)</p><h2 id='synopsis'>SYNOPSIS</h2><pre>
+        <code>
+          tbcx::save in out
+          tbcx::load in
+          tbcx::dump filename</code>
+      </pre>
+      <h2 id='description'>DESCRIPTION</h2>
+      <p>
+        The <b>tbcx</b> extension provides three subcommands that enable an efficient
+        <i>save → load → eval</i> pipeline for Tcl 9.1 scripts.</p>
+      <p>
+        The goal is to pay the cost of parsing/compiling at save time so that loading is as fast as
+        reading a compact binary, while remaining functionally equivalent to <b>source</b> of the
+        original script.
+      </p>
+      <p>
+        Artifacts store the compiled top-level, precompiled <b>proc</b> bodies, TclOO method/ctor/dtor
+        bodies, and <b>lambda</b> literals for use with <b>apply</b>. Loading installs these into the current
+        interpreter and executes the top-level block in the caller's current namespace.
+      </p>
+      <h2 id='commands'>COMMANDS</h2>
+      <h3 id='tbcx-save-in-out'>tbcx::save in out</h3>
+      <p>
+        <b>Synopsis</b>
+      </p>
+      <p>Compile a script and write a <b>.tbcx</b> artifact.</p>
+      <p>
+        <b>Parameters</b>
+      </p>
+      <dl class='deflist'>
+        <dt id='section'/>
+        <dd>
+          <p><i>in</i> One of:</p>
+        </dd>
+        <div class='indent'>
+          <ul>
+            <li>
+              <i>String</i> - a Tcl string value containing the script text.</li>
+            <li>
+              <i>Readable channel</i> - an open channel; the command enforces binary-safe reads.</li>
+            <li>
+              <i>Readable path</i> - a filesystem path to a script file; it is opened, read, and closed by <b>tbcx::save</b>.</li>
+          </ul>
+        </div>
+      </dl>
+      <dl class='deflist'>
+        <dt id='section'/>
+        <dd>
+          <p>
+            <i>out</i> One of:</p>
+        </dd>
+        <div class='indent'>
+          <ul>
+            <li>
+              <i>Writable channel</i> - an open channel; the command writes binary data and does <i>not</i> close the channel.</li>
+            <li>
+              <i>Writable path</i> - a filesystem path for the new <b>.tbcx</b> file; it is created/truncated and closed on return.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Behavior</b>
+        </p>
+        <div class='indent'>
+          <ul>
+            <li>Compiles the top-level block, discovers and precompiles <b>proc</b> bodies and TclOO
+            method/ctor/dtor bodies, and captures <i>lambda literals</i> as lambda-bytecode literals
+            (for <b>apply</b>).</li>
+            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and
+            Methods table.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Returns</b>
+        </p>
+        <div class='indent'>
+          <p>The output object: either the normalized path written, or the writable channel
+          handle.</p>
+        </div>
+        <p>
+          <b>Errors</b>
+        </p>
+        <div class='indent'>
+          <p>Typical errors include: unreadable input; unwritable output; version/format mismatch; unknown/unsupported AuxData;
+            size limit exceeded (code, literals, AuxData, exception ranges, strings); short read/write.</p>
+          <p>The interpreter result contains a descriptive message.</p>
+        </div>
+        <p>
+          <b>Notes</b>
+        </p>
+        <div class='indent'>
+          <ul>
+            <li>Channels are treated as binary for portability; encodings are not altered on the caller's behalf, and channels are not closed.</li>
+            <li>The produced artifact is intended for Tcl 9.1; other versions are rejected at load time.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Examples</b>
+        </p>
+        <pre>
+          <code># Save from path \-&gt; path
+            set path [tbcx::save ./app.tcl ./app.tbcx]
+            # Save from string value \-&gt; path
+            set script {proc hi {} {puts Hello}; hi}
+            tbcx::save $script ./hello.tbcx
+            # Save from channel \-&gt; channel
+            set in  [open ./lib/foo.tcl r]
+            set out [open ./foo.tbcx w]
+            fconfigure $in  -translation binary -eofchar {}
+            fconfigure $out -translation binary -eofchar {}
+            try {
+              tbcx::save $in $out
+            } finally {
+              close $in
+              close $out
+            }
+          </code>
+        </pre>
+      </dl>
+      <h3 id='tbcx-load-in'>tbcx::load in</h3>
+      <p>
+        <b>Synopsis</b>
+      </p>
+      <p>Load a <b>.tbcx</b> artifact, install precompiled entities, and execute the top-level block.</p>
+      <p>
+        <b>Parameters</b>
+      </p>
+      <dl class='deflist'>
+        <dt id='section'/>
+        <dd>
+          <p>
+          <i>in</i> One of:</p>
+        </dd>
+        <div class='indent'>
+          <ul>
+            <li>
+            <i>Readable channel</i> - an open channel positioned at the beginning of a <b>.tbcx</b> stream (binary).</li>
+            <li>
+            <i>Readable path</i> - a filesystem path to a <b>.tbcx</b> file.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Behavior</b>
+        </p>
+        <div class='indent'>
+          <ul>
+            <li>Validates header and producer version; deserializes sections.</li>
+            <li>Materializes procs and TclOO methods (ctors/dtors) from precompiled bodies.</li>
+            <li>Rehydrates lambda-bytecode literals so the first <b>apply</b> incurs no compilation.</li>
+            <li>Executes the precompiled top-level block in the caller's current namespace.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Returns</b>
+        </p>
+        <div class='indent'>
+          <p>Empty string on success.</p>
+        </div>
+        <p>
+          <b>Errors</b>
+        </p>
+        <div class='indent'>
+          <p>Typical errors include: unreadable input; bad header; incompatible Tcl version; malformed/unknown section;
+          size limit exceeded; short read; class or namespace creation errors during top-level evaluation.</p>
+        </div>
+        <p>
+          <b>Notes</b>
+        </p>
+        <div class='indent'>
+          <ul>
+            <li>Load in a specific namespace by wrapping the call: <b>namespace eval ::pkg { tbcx::load ./app.tbcx }</b>
+            </li>
+            <li>Loading executes code; only load artifacts from trusted sources.</li>
+          </ul>
+        </div>
+        <p>
+          <b>Examples</b>
+        </p>
+        <pre>
+          <code># Load into current namespace
+          tbcx::load ./app.tbcx
+          # Load into a dedicated namespace
+          namespace eval ::app { tbcx::load ./app.tbcx }
+          # Load from an open channel
+          set ch [open ./app.tbcx r]
+          fconfigure $ch -translation binary -eofchar {}
+          try {
+          tbcx::load $ch
+          } finally {
+          close $ch
+          }
+          </code>
+        </pre>
+      </dl>
+      <h3 id='tbcx-dump-filename'>tbcx::dump filename</h3>
+      <p>
+        <b>Synopsis</b>
+      </p>
+      <p>Disassemble and describe a <b>.tbcx</b> artifact in human-readable form.</p>
+      <p>
+        <b>Parameters</b>
+      </p>
+      <dl class='deflist'>
+        <dt id='section'>
+        </dt>
+        <dd>
+          <p>
+          <i>filename</i> A readable path to a <b>.tbcx</b> file.</p>
+        </dd>
+        <p>
+          <b>Behavior</b>
+        </p>
+        <div class='indent'>
+          <p>Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;</p>
+          <p>and a disassembly of the top-level, proc, method, and lambda bodies.</p>
+        </div>
+        <p>
+          <b>Returns</b>
+        </p>
+        <div class='indent'>
+          <p>A string containing the formatted dump.</p>
+        </div>
+        <p>
+          <b>Errors</b>
+        </p>
+        <div class='indent'>
+          <p>Unreadable file; bad header; malformed section; short read.</p>
+        </div>
+        <p>
+          <b>Examples</b>
+        </p>
+        <pre>
+          <code>% package require tbcx
+          % tbcx::save {set a 1} out
+          % tbcx::dump out
+          TBCX Header:
+          magic = 0x58434254 (&#x27;T&#x27;&#x27;B&#x27;&#x27;C&#x27;&#x27;X&#x27;)
+          format = 9
+          tcl_version = 9.1.0 (type 0)
+          top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
+          Top-level block:
+          Disassembly (top-level):
+          ByteCode 0x7f9963089e10, refCt 1, epoch 20, interp 0x7f9963816a10 (epoch 20)
+          Source &quot;&quot;
+          Cmds 0, src 0, inst 11, litObjs 1, aux 0, stkDepth 1, code/src 0.00
+          (0) push 0 	# &quot;1&quot;
+          (5) storeScalar %v0
+          (10) done
+          code=11, stack=1, lits=1, aux=0, except=0
+          Locals (1):
+          [0] &quot;a&quot;
+          Literals:
+          [0] (bignum) 1
+          Procs: 0
+          Classes: 0
+          Methods: 0
+          </code>
+        </pre>
+      </dl>
+      <h2 id='file-format-overview'>FILE FORMAT (OVERVIEW)</h2>
+      <p>This section summarizes the on-disk structure.</p>
+      <dl class='deflist'>
+        <dt id='section'>
+        </dt>
+        <dd>
+          <p>
+            <b>Header</b> Magic + format version + producing Tcl version; size/count metadata
+            for the top-level block (code length, literal count, AuxData count, exception
+          ranges, locals, max stack).</p>
+        </dd>
+        <dt id='section'>
+        </dt>
+        <dd>
+          <p>
+            <b>Sections (order)</b> (1) Top-level block (code, literals, AuxData, exceptions,
+            locals epilogue); (2) Procs (FQN, ns, arg spec, compiled block); (3) Classes
+            (advisory catalog; actual creation occurs at load time); (4) Methods (class, kind,
+          name, args, compiled block).</p>
+        </dd>
+        <dt id='section'>
+        </dt>
+        <dd>
+          <p>
+            <b>Literal kinds</b> boolean, (wide)int/uint, double, bignum, string, bytearray,
+            list, dict, embedded bytecode, and <b>lambda-bytecode</b> literals for use with
+          <b>apply</b>.</p>
+        </dd>
+        <dt id='section'>
+        </dt>
+        <dd>
+          <p>
+            <b>AuxData families</b> jump tables (string or numeric), dictupdate, foreach
+          (legacy/new). </p>
+        </dd>
+      </dl>
+      <h2 id='lambda-support'>LAMBDA SUPPORT</h2>
+      <p>Literals in the script that represent <i>lambdas</i> for <b>apply</b> (lists of the form
+      {args body ns?}) are compiled and serialized as lambda-bytecode literals at save time.</p>
+      <p>On load, both the compiled body and the optional namespace element are rehydrated so that the
+      first call to <b>apply</b> does not trigger compilation.</p>
+      <h2 id='semantics-and-performance'>SEMANTICS AND PERFORMANCE</h2>
+      <p>
+        Artifacts are portable across little- and big-endian hosts. The loader detects host byte order
+        once and applies a tight in-place swap over bulk sections that require conversion, avoiding
+        per-field branching so cross-endian loads remain close to native performance.
+      </p>
+      <p>
+        Loading executes the precompiled top-level, then installs precompiled proc/method bodies
+        and rehydrates lambda literals. The intent is to be functionally indistinguishable from
+        <b>source</b> of the original script, with the benefit of faster startup due to avoided
+        parsing/compilation.
+      </p>
+      <h2 id='limits'>LIMITS</h2>
+      <p>
+        Sanity caps exist for code size, literal count (including lambdas), AuxData count, exception ranges,
+        and string lengths. Exceeding limits produces an error.
+      </p>
+      <h2 id='diagnostics'>DIAGNOSTICS</h2>
+      <p>
+        Representative messages include: "bad header", "incompatible Tcl version", "short
+        read/write", "unsupported AuxData kind", "input is neither an open channel nor a
+        readable file", and "errors while evaluating top-level".
+      </p>
+      <h2 id='security'>SECURITY</h2>
+      <p>Loading executes code. Only load artifacts you trust.</p>
+      <h2 id='see-also'>SEE ALSO</h2>
+      <p>source(n), TclOO(n)</p>
+      <h2 id='copyright'>COPYRIGHT</h2>
+      <p>© 2025 Miguel Banon</p>
+      <p>MIT License.</p>
+      <a class='back-to-top' href='#top' title='Back to top'>↑ Top</a>
+    </div>
+  </body>
+</html>
