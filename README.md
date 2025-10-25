@@ -4,6 +4,11 @@ TBCX is a C extension for Tcl 9.1+ that **serializes** compiled Tcl bytecode (p
 
 > Status: draft implementation; interfaces are still evolving. We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout.
 
+For versions prior to Tcl 9.1+, please check
+
+-  [tclcompiler](https://github.com/tcltk-depot/tclcompiler)
+-  [tbcload](https://github.com/tcltk-depot/tbcload)
+
 ---
 
 ## Quick Start

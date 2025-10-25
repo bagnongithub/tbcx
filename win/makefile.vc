@@ -1,0 +1,37 @@
+#------------------------------------------------------------- -*- makefile -*-
+#
+# Makefile for tclcompiler
+#
+# Basic build, test and install
+#   nmake /f makefile.vc INSTALLDIR=c:\tcl TCLDIR=c:\path\to\tcl\source
+#   nmake /f makefile.vc INSTALLDIR=c:\tcl TCLDIR=c:\path\to\tcl\source
+#   nmake /f makefile.vc INSTALLDIR=c:\tcl TCLDIR=c:\path\to\tcl\source install
+#
+# For other build options (debug, static etc.),
+# See TIP 477 (https://core.tcl.tk/tips/doc/trunk/tip/477.md) for
+# detailed documentation.
+#
+# See the file "LICENSE" for information on usage and redistribution
+# of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+PROJECT = tbcx
+NEED_TCL_SOURCE=1
+
+!include "rules-ext.vc"
+
+PRJ_OBJS = \
+	$(TMP_DIR)\tbcx.obj  \
+	$(TMP_DIR)\tbcxsave.obj  \
+	$(TMP_DIR)\tbcxload.obj  \
+	$(TMP_DIR)\tbcxdump.obj
+
+PRJ_HEADERS = \
+	$(ROOT)\tbcx.h
+
+PRJ_DEFINES = -D_CRT_SECURE_NO_WARNINGS -DTCL_NO_DEPRECATED
+
+!include "$(_RULESDIR)\targets.vc"
+
+pkgindex: default-pkgindex-tea
+
+$(PRJ_OBJS): $(ROOT)\configure.ac $(PRJ_HEADERS)
