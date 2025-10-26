@@ -49,24 +49,18 @@ typedef struct {
 
 static int         AddOOShim(Tcl_Interp *ip, OOShim *os);
 static int         AddProcShim(Tcl_Interp *ip, ProcShim *ps);
-static int         ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn);
 static Tcl_Obj    *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned char *code, uint32_t codeLen, Tcl_Obj **lits, uint32_t numLits, AuxData *auxArr, uint32_t numAux, ExceptionRange *exArr,
                                uint32_t numEx, int maxStackDepth, int setPrecompiled);
 static int         CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
 static int         CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
 static void        CompiledLocals(Proc *procPtr, int neededCount);
-static Tcl_Obj    *CtorWrapperBody(Tcl_Obj *hiddenName, Tcl_Obj *argsObj);
+static int         DefOO(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt);
 static void        DelOOShim(Tcl_Interp *ip, OOShim *os);
 static void        DelProcShim(Tcl_Interp *ip, ProcShim *ps);
-static Tcl_Obj    *DtorWrapperBody(Tcl_Obj *hiddenName);
 Tcl_Namespace     *EnsureNamespace(Tcl_Interp *ip, const char *fqn);
 static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch);
 static Tcl_Obj    *MethodKey(Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name);
-static int         OoDefineClassMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body);
-static int         OoDefineCtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *args, Tcl_Obj *body);
-static int         OoDefineCtorOrDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody);
-static int         OoDefineDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *body);
-static int         OoDefineMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body);
+static int         PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn);
 inline int         R_Bytes(TbcxIn *r, void *p, size_t n);
 static inline void R_Error(TbcxIn *r, const char *msg);
 inline int         R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
@@ -186,145 +180,151 @@ static Tcl_Obj *MethodKey(Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name) {
     return k;
 }
 
-static int OoDefineMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body) {
+static int DefOO(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt) {
+    int      rc    = TCL_OK;
     Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
-    Tcl_Obj *sub   = Tcl_NewStringObj("method", -1);
     Tcl_IncrRefCount(argv0);
-    Tcl_IncrRefCount(sub);
-    Tcl_IncrRefCount(name);
-    Tcl_IncrRefCount(args);
-    Tcl_IncrRefCount(body);
-    Tcl_Obj *argv[6] = {argv0, clsFqn, sub, name, args, body};
-    int      rc      = Tcl_EvalObjv(ip, 6, argv, 0);
-    Tcl_DecrRefCount(body);
-    Tcl_DecrRefCount(args);
-    Tcl_DecrRefCount(name);
-    Tcl_DecrRefCount(sub);
-    Tcl_DecrRefCount(argv0);
-    return rc;
-}
 
-static int OoDefineClassMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body) {
-    Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
-    Tcl_Obj *sub   = Tcl_NewStringObj("classmethod", -1);
-    Tcl_IncrRefCount(argv0);
-    Tcl_IncrRefCount(sub);
-    Tcl_IncrRefCount(name);
-    Tcl_IncrRefCount(args);
-    Tcl_IncrRefCount(body);
-    Tcl_Obj *argv[6] = {argv0, clsFqn, sub, name, args, body};
-    int      rc      = Tcl_EvalObjv(ip, 6, argv, 0);
-    Tcl_DecrRefCount(body);
-    Tcl_DecrRefCount(args);
-    Tcl_DecrRefCount(name);
-    Tcl_DecrRefCount(sub);
-    Tcl_DecrRefCount(argv0);
-    return rc;
-}
-
-static int OoDefineCtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *args, Tcl_Obj *body) {
-    Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
-    Tcl_Obj *sub   = Tcl_NewStringObj("constructor", -1);
-    Tcl_IncrRefCount(argv0);
-    Tcl_IncrRefCount(sub);
-    Tcl_IncrRefCount(args);
-    Tcl_IncrRefCount(body);
-    Tcl_Obj *argv[5] = {argv0, clsFqn, sub, args, body};
-    int      rc      = Tcl_EvalObjv(ip, 5, argv, 0);
-    Tcl_DecrRefCount(body);
-    Tcl_DecrRefCount(args);
-    Tcl_DecrRefCount(sub);
-    Tcl_DecrRefCount(argv0);
-    return rc;
-}
-
-static int OoDefineDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *body) {
-    Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
-    Tcl_Obj *sub   = Tcl_NewStringObj("destructor", -1);
-    Tcl_IncrRefCount(argv0);
-    Tcl_IncrRefCount(sub);
-    Tcl_IncrRefCount(body);
-    Tcl_Obj *argv[4] = {argv0, clsFqn, sub, body};
-    int      rc      = Tcl_EvalObjv(ip, 4, argv, 0);
-    Tcl_DecrRefCount(body);
-    Tcl_DecrRefCount(sub);
-    Tcl_DecrRefCount(argv0);
-    return rc;
-}
-
-static int OoDefineCtorOrDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody) {
-    Tcl_Obj *hidden = NULL;
-    Tcl_Obj *wrap   = NULL;
-    int      rc     = TCL_OK;
-
-    if (kind == TBCX_METH_CTOR) {
-        hidden = Tcl_NewStringObj("__tbcx_ctor_", -1);
-    } else if (kind == TBCX_METH_DTOR) {
-        hidden = Tcl_NewStringObj("__tbcx_dtor_", -1);
-    } else {
-        return TCL_ERROR;
+    /* Fast path for methods (instance/class): always direct */
+    if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
+        Tcl_Obj *sub = Tcl_NewStringObj((kind == TBCX_METH_CLASS) ? "classmethod" : "method", -1);
+        Tcl_IncrRefCount(sub);
+        Tcl_IncrRefCount(nameOpt);
+        Tcl_IncrRefCount(argsOpt);
+        Tcl_IncrRefCount(bodyOpt);
+        Tcl_Obj *av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
+        rc             = Tcl_EvalObjv(ip, 6, av, 0);
+        Tcl_DecrRefCount(bodyOpt);
+        Tcl_DecrRefCount(argsOpt);
+        Tcl_DecrRefCount(nameOpt);
+        Tcl_DecrRefCount(sub);
+        Tcl_DecrRefCount(argv0);
+        return rc;
     }
-    Tcl_AppendObjToObj(hidden, Tcl_NewIntObj(tbcxHiddenId++));
-    Tcl_IncrRefCount(hidden);
 
-    /* 1) hidden precompiled method */
-    if (kind == TBCX_METH_DTOR) {
+    /* Constructors/Destructors: if we have a precompiled procbody, install as hidden method and wrap. */
+    int hasPrecompiled = (bodyOpt && bodyOpt->typePtr == tbcxTyProcBody) ? 1 : 0;
+    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && hasPrecompiled) {
+        /* 1) Create unique hidden method name */
+        Tcl_Obj *hidden = Tcl_NewStringObj((kind == TBCX_METH_CTOR) ? "__tbcx_ctor_" : "__tbcx_dtor_", -1);
+        Tcl_Obj *hidIdx = Tcl_NewIntObj(tbcxHiddenId++);
+        Tcl_AppendObjToObj(hidden, hidIdx);
+        Tcl_DecrRefCount(hidIdx);
+        Tcl_IncrRefCount(hidden);
+
+        /* 2) Define hidden instance method with precompiled body (args: ctor args; dtor: empty list) */
+        Tcl_Obj *subMeth = Tcl_NewStringObj("method", -1);
+        Tcl_IncrRefCount(subMeth);
         Tcl_Obj *empty = Tcl_NewObj();
         Tcl_IncrRefCount(empty);
-        rc = OoDefineMethod(ip, clsFqn, hidden, empty, procBody);
+        Tcl_Obj *hiddenArgs = (kind == TBCX_METH_CTOR ? argsOpt : empty);
+        Tcl_IncrRefCount(hiddenArgs);
+        Tcl_IncrRefCount(bodyOpt);
+        Tcl_Obj *mav[6] = {argv0, clsFqn, subMeth, hidden, hiddenArgs, bodyOpt};
+        rc              = Tcl_EvalObjv(ip, 6, mav, 0);
+        Tcl_DecrRefCount(bodyOpt);
+        Tcl_DecrRefCount(hiddenArgs);
         Tcl_DecrRefCount(empty);
-    } else {
-        rc = OoDefineMethod(ip, clsFqn, hidden, args, procBody);
-    }
+        Tcl_DecrRefCount(subMeth);
+        if (rc != TCL_OK) {
+            Tcl_DecrRefCount(hidden);
+            Tcl_DecrRefCount(argv0);
+            return rc;
+        }
 
-    /* 2/3) wrapper + install */
-    if (rc == TCL_OK) {
+        /* 3) Build tiny wrapper body: "my __hidden ?$arg ...? {*}$args" (ctor) or "my __hidden" (dtor) */
+        Tcl_Obj *wrap = Tcl_NewStringObj("my ", -1);
+        Tcl_IncrRefCount(wrap);
+        Tcl_AppendObjToObj(wrap, hidden);
+        if (kind == TBCX_METH_CTOR && argsOpt) {
+            Tcl_Size  ac  = 0;
+            Tcl_Obj **avv = NULL;
+            if (Tcl_ListObjGetElements(NULL, argsOpt, &ac, &avv) == TCL_OK) {
+                for (Tcl_Size i = 0; i < ac; i++) {
+                    Tcl_Size  nf = 0;
+                    Tcl_Obj **fv = NULL;
+                    if (Tcl_ListObjGetElements(NULL, avv[i], &nf, &fv) != TCL_OK || nf < 1)
+                        continue;
+                    Tcl_Size    nlen = 0;
+                    const char *nm   = Tcl_GetStringFromObj(fv[0], &nlen);
+                    if (nlen == 4 && memcmp(nm, "args", 4) == 0) {
+                        Tcl_AppendToObj(wrap, " {*}$args", -1);
+                    } else {
+                        Tcl_AppendToObj(wrap, " $", 2);
+                        Tcl_AppendToObj(wrap, nm, (int)nlen);
+                    }
+                }
+            }
+        }
+
+        /* 4) Install constructor/destructor with wrapper body */
         if (kind == TBCX_METH_CTOR) {
-            wrap = CtorWrapperBody(hidden, args);
+            Tcl_Obj *sub = Tcl_NewStringObj("constructor", -1);
+            Tcl_IncrRefCount(sub);
+            Tcl_IncrRefCount(argsOpt);
             Tcl_IncrRefCount(wrap);
-            rc = OoDefineCtor(ip, clsFqn, args, wrap);
+            Tcl_Obj *cav[5] = {argv0, clsFqn, sub, argsOpt, wrap};
+            rc              = Tcl_EvalObjv(ip, 5, cav, 0);
+            Tcl_DecrRefCount(wrap);
+            Tcl_DecrRefCount(argsOpt);
+            Tcl_DecrRefCount(sub);
         } else {
-            wrap = DtorWrapperBody(hidden);
+            Tcl_Obj *sub = Tcl_NewStringObj("destructor", -1);
+            Tcl_IncrRefCount(sub);
             Tcl_IncrRefCount(wrap);
-            rc = OoDefineDtor(ip, clsFqn, wrap);
+            Tcl_Obj *dav[4] = {argv0, clsFqn, sub, wrap};
+            rc              = Tcl_EvalObjv(ip, 4, dav, 0);
+            Tcl_DecrRefCount(wrap);
+            Tcl_DecrRefCount(sub);
         }
-        Tcl_DecrRefCount(wrap);
+        Tcl_DecrRefCount(hidden);
+        Tcl_DecrRefCount(argv0);
+        return rc;
     }
-    Tcl_DecrRefCount(hidden);
-    return rc;
-}
 
-static Tcl_Obj *CtorWrapperBody(Tcl_Obj *hiddenName, Tcl_Obj *argsObj) {
-    Tcl_Obj *body = Tcl_NewStringObj("my ", -1);
-    Tcl_IncrRefCount(body);
-    Tcl_AppendObjToObj(body, hiddenName);
-    Tcl_Size  argc = 0;
-    Tcl_Obj **argv = NULL;
-    if (Tcl_ListObjGetElements(NULL, argsObj, &argc, &argv) == TCL_OK) {
-        for (Tcl_Size i = 0; i < argc; i++) {
-            Tcl_Size  nf = 0;
-            Tcl_Obj **fv = NULL;
-            if (Tcl_ListObjGetElements(NULL, argv[i], &nf, &fv) != TCL_OK || nf < 1) {
-                continue;
-            }
-            Tcl_Size    nlen = 0;
-            const char *name = Tcl_GetStringFromObj(fv[0], &nlen);
-            if (nlen == 4 && memcmp(name, "args", 4) == 0) {
-                Tcl_AppendToObj(body, " {*}$args", -1);
-            } else {
-                Tcl_AppendToObj(body, " $", 2);
-                Tcl_AppendToObj(body, name, (int)nlen);
-            }
+    /* Fallback ctor/dtor: forward to original with provided args/body */
+    if (kind == TBCX_METH_CTOR) {
+        Tcl_Obj *sub = Tcl_NewStringObj("constructor", -1);
+        Tcl_IncrRefCount(sub);
+        Tcl_IncrRefCount(argsOpt);
+        Tcl_IncrRefCount(bodyOpt);
+        Tcl_Obj *av[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
+        rc             = Tcl_EvalObjv(ip, 5, av, 0);
+        Tcl_DecrRefCount(bodyOpt);
+        Tcl_DecrRefCount(argsOpt);
+        Tcl_DecrRefCount(sub);
+        Tcl_DecrRefCount(argv0);
+        return rc;
+    } else { /* destructor */
+        Tcl_Obj *sub = Tcl_NewStringObj("destructor", -1);
+        Tcl_IncrRefCount(sub);
+        /* Choose 4-arg or 5-arg form based on argsOpt emptiness */
+        int useShort = 1;
+        if (argsOpt) {
+            Tcl_Size L = -1;
+            if (Tcl_ListObjLength(ip, argsOpt, &L) == TCL_OK && L > 0)
+                useShort = 0;
         }
+        if (useShort) {
+            Tcl_IncrRefCount(bodyOpt);
+            Tcl_Obj *dv[4] = {argv0, clsFqn, sub, bodyOpt};
+            rc             = Tcl_EvalObjv(ip, 4, dv, 0);
+            Tcl_DecrRefCount(bodyOpt);
+        } else {
+            Tcl_IncrRefCount(argsOpt);
+            Tcl_IncrRefCount(bodyOpt);
+            Tcl_Obj *dv[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
+            rc             = Tcl_EvalObjv(ip, 5, dv, 0);
+            Tcl_DecrRefCount(bodyOpt);
+            Tcl_DecrRefCount(argsOpt);
+        }
+        Tcl_DecrRefCount(sub);
+        Tcl_DecrRefCount(argv0);
+        return rc;
     }
-    return body;
 }
 
-static Tcl_Obj *DtorWrapperBody(Tcl_Obj *hiddenName) {
-    return CtorWrapperBody(hiddenName, Tcl_NewStringObj("", 0));
-}
-
-static int ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
+static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     Tcl_HashSearch s;
     Tcl_HashEntry *e;
     int            rc     = TCL_OK;
@@ -362,32 +362,14 @@ static int ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             continue;
         }
 
-        /* Build argv for ::tbcx::__oo_define_orig__ */
-        Tcl_Obj *argv0 = Tcl_NewStringObj("::tbcx::__oo_define_orig__", -1);
-        Tcl_Obj *sub   = NULL;
         Tcl_Obj *nameO = NULL;
-        Tcl_Obj *argsO = savedArgs;
-        Tcl_IncrRefCount(argv0);
-        Tcl_IncrRefCount(procBody);
         if (nameStr && *nameStr) {
             nameO = Tcl_NewStringObj(nameStr, -1);
             Tcl_IncrRefCount(nameO);
         }
-
-        if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
-            rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, argsO, procBody) : OoDefineMethod(ip, clsFqn, nameO, argsO, procBody);
-        } else if (kind == TBCX_METH_CTOR) {
-            rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, argsO, procBody);
-        } else if (kind == TBCX_METH_DTOR) {
-            rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, procBody);
-        }
-
+        rc = DefOO(ip, clsFqn, (uint8_t)kind, nameO, (kind == TBCX_METH_DTOR ? savedArgs /* may be "" */ : savedArgs), procBody);
         if (nameO)
             Tcl_DecrRefCount(nameO);
-        if (sub)
-            Tcl_DecrRefCount(sub);
-        Tcl_DecrRefCount(procBody);
-        Tcl_DecrRefCount(argv0);
         if (rc != TCL_OK) {
             /* leave the interp error as-is */
             return rc;
@@ -512,7 +494,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
        substitute the body argument and call the original. */
     if (preBody && savedArgs && !isBuilderForm) {
         if (kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) {
-            rc = OoDefineCtorOrDtor(ip, clsFqn, kind, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
+            rc = DefOO(ip, clsFqn, kind, NULL, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
             if (key)
                 Tcl_DecrRefCount(key);
             if (clsFqn != cls)
@@ -531,13 +513,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
         const char *b = Tcl_GetStringFromObj(savedArgs, &bLen);
 
         if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0) {
-            if (kind == TBCX_METH_CTOR) {
-                rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, savedArgs, preBody);
-            } else if (kind == TBCX_METH_DTOR) {
-                rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
-            } else {
-                rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, savedArgs, preBody) : OoDefineMethod(ip, clsFqn, nameO, savedArgs, preBody);
-            }
+            rc = DefOO(ip, clsFqn, kind, (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) ? nameO : NULL, (kind == TBCX_METH_DTOR ? savedArgs : savedArgs), preBody);
             if (key)
                 Tcl_DecrRefCount(key);
             if (clsFqn != cls)
@@ -548,23 +524,22 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             Tcl_Free(argv2);
             return rc;
         }
-
+        /* Fast path for stubbed empty bodies: install precompiled body directly. */
         if (preBody && bodyIdx >= 0) {
             Tcl_Size bodyLen = 0;
             (void)Tcl_GetStringFromObj(objv[bodyIdx], &bodyLen);
             if (bodyLen == 0) {
-                /* Empty body: unify ctor/dtor via helper; method path unchanged */
                 if (kind == TBCX_METH_CTOR) {
                     Tcl_Obj *argsForCtor = savedArgs ? savedArgs : Tcl_NewObj();
                     if (!savedArgs)
                         Tcl_IncrRefCount(argsForCtor);
-                    rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, argsForCtor, preBody);
+                    rc = DefOO(ip, clsFqn, TBCX_METH_CTOR, NULL, argsForCtor, preBody);
                     if (!savedArgs)
                         Tcl_DecrRefCount(argsForCtor);
                 } else if (kind == TBCX_METH_DTOR) {
-                    rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
+                    rc = DefOO(ip, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody);
                 } else {
-                    rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, savedArgs, preBody) : OoDefineMethod(ip, clsFqn, nameO, savedArgs, preBody);
+                    rc = DefOO(ip, clsFqn, kind, nameO, savedArgs, preBody);
                 }
                 /* cleanup and return */
                 if (key)
@@ -589,7 +564,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             Tcl_Size nEl = -1;
             if (Tcl_ListObjLength(ip, runtimeArgs, &nEl) == TCL_OK && nEl == 0) {
                 Tcl_Obj *body = objv[objc - 1];
-                rc            = OoDefineDtor(ip, clsFqn, body);
+                rc            = DefOO(ip, clsFqn, TBCX_METH_DTOR, NULL, NULL, body);
             } else {
                 /* Forward to original; normalize the class arg to FQN */
                 argv2[1] = clsFqn;
@@ -619,7 +594,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
         if (objc >= 2)
             Tcl_DecrRefCount(clsFqn);
         if (rc == TCL_OK) {
-            int patchRc = ApplyPrecompClass(ip, os, clsFqn);
+            int patchRc = PrecompClass(ip, os, clsFqn);
             if (patchRc != TCL_OK) {
                 rc = patchRc; /* leave error in interp */
             }
@@ -643,23 +618,18 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 Tcl_Obj *clsForCall = clsFqn;
                 if (clsForCall != cls)
                     Tcl_IncrRefCount(clsForCall);
-                if (kind == TBCX_METH_CTOR) {
-                    int rc2 = OoDefineCtorOrDtor(ip, clsForCall, TBCX_METH_CTOR, savedArgs2, preBody2);
-                    if (rc2 != TCL_OK)
-                        rc = rc2;
-                } else if (kind == TBCX_METH_DTOR) {
-                    int rc2 = OoDefineCtorOrDtor(ip, clsForCall, TBCX_METH_DTOR, NULL, preBody2);
-                    if (rc2 != TCL_OK)
-                        rc = rc2;
-                } else if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
-                    if (!nameO) {
-                        /* Best-effort: method name should have been set above; if not, skip safe patch */
-                    } else {
-                        int rc2 = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsForCall, nameO, savedArgs2, preBody2) : OoDefineMethod(ip, clsForCall, nameO, savedArgs2, preBody2);
-                        if (rc2 != TCL_OK)
-                            rc = rc2;
+                int rc2 = TCL_OK;
+                if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
+                    if (nameO) {
+                        rc2 = DefOO(ip, clsForCall, kind, nameO, savedArgs2, preBody2);
                     }
+                } else if (kind == TBCX_METH_CTOR) {
+                    rc2 = DefOO(ip, clsForCall, TBCX_METH_CTOR, NULL, savedArgs2, preBody2);
+                } else if (kind == TBCX_METH_DTOR) {
+                    rc2 = DefOO(ip, clsForCall, TBCX_METH_DTOR, NULL, NULL, preBody2);
                 }
+                if (rc2 != TCL_OK)
+                    rc = rc2;
                 if (clsForCall != cls)
                     Tcl_DecrRefCount(clsForCall);
             }
