@@ -64,7 +64,7 @@ static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch);
 static Tcl_Obj    *MethodKey(Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name);
 static int         OoDefineClassMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body);
 static int         OoDefineCtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *args, Tcl_Obj *body);
-static int         OoDefineCtorOrDtorFromPrecompiled(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody);
+static int         OoDefineCtorOrDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody);
 static int         OoDefineDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *body);
 static int         OoDefineMethod(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *body);
 inline int         R_Bytes(TbcxIn *r, void *p, size_t n);
@@ -252,7 +252,7 @@ static int OoDefineDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *body) {
     return rc;
 }
 
-static int OoDefineCtorOrDtorFromPrecompiled(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody) {
+static int OoDefineCtorOrDtor(Tcl_Interp *ip, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *args, Tcl_Obj *procBody) {
     Tcl_Obj *hidden = NULL;
     Tcl_Obj *wrap   = NULL;
     int      rc     = TCL_OK;
@@ -377,9 +377,9 @@ static int ApplyPrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
         if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
             rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, argsO, procBody) : OoDefineMethod(ip, clsFqn, nameO, argsO, procBody);
         } else if (kind == TBCX_METH_CTOR) {
-            rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_CTOR, argsO, procBody);
+            rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, argsO, procBody);
         } else if (kind == TBCX_METH_DTOR) {
-            rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_DTOR, NULL, procBody);
+            rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, procBody);
         }
 
         if (nameO)
@@ -512,7 +512,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
        substitute the body argument and call the original. */
     if (preBody && savedArgs && !isBuilderForm) {
         if (kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) {
-            rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, kind, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
+            rc = OoDefineCtorOrDtor(ip, clsFqn, kind, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
             if (key)
                 Tcl_DecrRefCount(key);
             if (clsFqn != cls)
@@ -532,9 +532,9 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
 
         if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0) {
             if (kind == TBCX_METH_CTOR) {
-                rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_CTOR, savedArgs, preBody);
+                rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, savedArgs, preBody);
             } else if (kind == TBCX_METH_DTOR) {
-                rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
+                rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
             } else {
                 rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, savedArgs, preBody) : OoDefineMethod(ip, clsFqn, nameO, savedArgs, preBody);
             }
@@ -558,11 +558,11 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                     Tcl_Obj *argsForCtor = savedArgs ? savedArgs : Tcl_NewObj();
                     if (!savedArgs)
                         Tcl_IncrRefCount(argsForCtor);
-                    rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_CTOR, argsForCtor, preBody);
+                    rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_CTOR, argsForCtor, preBody);
                     if (!savedArgs)
                         Tcl_DecrRefCount(argsForCtor);
                 } else if (kind == TBCX_METH_DTOR) {
-                    rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
+                    rc = OoDefineCtorOrDtor(ip, clsFqn, TBCX_METH_DTOR, NULL, preBody);
                 } else {
                     rc = (kind == TBCX_METH_CLASS) ? OoDefineClassMethod(ip, clsFqn, nameO, savedArgs, preBody) : OoDefineMethod(ip, clsFqn, nameO, savedArgs, preBody);
                 }
@@ -644,11 +644,11 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 if (clsForCall != cls)
                     Tcl_IncrRefCount(clsForCall);
                 if (kind == TBCX_METH_CTOR) {
-                    int rc2 = OoDefineCtorOrDtorFromPrecompiled(ip, clsForCall, TBCX_METH_CTOR, savedArgs2, preBody2);
+                    int rc2 = OoDefineCtorOrDtor(ip, clsForCall, TBCX_METH_CTOR, savedArgs2, preBody2);
                     if (rc2 != TCL_OK)
                         rc = rc2;
                 } else if (kind == TBCX_METH_DTOR) {
-                    int rc2 = OoDefineCtorOrDtorFromPrecompiled(ip, clsForCall, TBCX_METH_DTOR, NULL, preBody2);
+                    int rc2 = OoDefineCtorOrDtor(ip, clsForCall, TBCX_METH_DTOR, NULL, preBody2);
                     if (rc2 != TCL_OK)
                         rc = rc2;
                 } else if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
@@ -1924,17 +1924,50 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
     if (f->localCachePtr) {
         f->localCachePtr->refCount++;
     }
-
-    if (n > 0) {
-        Var *v = (Var *)Tcl_Alloc((size_t)n * sizeof(Var));
-        memset(v, 0, (size_t)n * sizeof(Var));
-        f->compiledLocals    = v;
-        f->numCompiledLocals = n;
-        sv->allocated        = v;
-    } else {
+    if (n <= 0) {
         f->compiledLocals    = NULL;
         f->numCompiledLocals = 0;
         sv->allocated        = NULL;
+        return;
+    }
+    /* Allocate compiled locals and directly link each slot to the target Var
+     * in the global namespace (no extra compilation, no upvar command call). */
+    f->compiledLocals = (Var *)Tcl_Alloc(sizeof(Var) * (size_t)n);
+    memset(f->compiledLocals, 0, sizeof(Var) * (size_t)n);
+    f->numCompiledLocals = n;
+    sv->allocated        = f->compiledLocals;
+
+    if (f->localCachePtr) {
+        Tcl_Obj *const *names = (Tcl_Obj *const *)&f->localCachePtr->varName0; /* Tcl 9.x trailing array */
+        Tcl_Namespace  *gNs   = Tcl_GetGlobalNamespace(ip);
+        for (Tcl_Size i = 0; i < n; i++) {
+            Tcl_Obj *nm = names ? names[i] : NULL;
+            if (!nm)
+                continue;
+            Tcl_Size    len = 0;
+            const char *s   = Tcl_GetStringFromObj(nm, &len);
+            if (len == 0)
+                continue; /* temp / unnamed */
+            if (memchr(s, ':', (size_t)len))
+                continue; /* skip qualified */
+
+            /* Ensure the global var table entry exists (undefined is fine).   */
+            if (!Tcl_GetVar2Ex(ip, s, NULL, TCL_GLOBAL_ONLY)) {
+                Tcl_Obj *empty = Tcl_NewObj();
+                Tcl_IncrRefCount(empty);
+                (void)Tcl_SetVar2Ex(ip, s, NULL, empty, TCL_GLOBAL_ONLY);
+                Tcl_DecrRefCount(empty);
+            }
+            /* Get the hashed Var* and link the compiled-local slot to it.     */
+            Tcl_Var vHandle = Tcl_FindNamespaceVar(ip, s, gNs, 0);
+            if (vHandle) {
+                Var *target = (Var *)vHandle; /* internal Var*, OK here */
+                Var *dst    = &f->compiledLocals[i];
+                memset(dst, 0, sizeof(Var));
+                dst->flags         = VAR_LINK;
+                dst->value.linkPtr = target;
+            }
+        }
     }
 }
 
@@ -2047,9 +2080,10 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
 
     int rc = TCL_OK;
     {
-        ByteCode *top = NULL;
-        ByteCodeGetInternalRep(topBC, tbcxTyBytecode, top);
+        ByteCode        *top = NULL;
         TbcxTopFrameSave _sv;
+
+        ByteCodeGetInternalRep(topBC, tbcxTyBytecode, top);
         TopLocals_Begin(ip, top, &_sv);
 
         Tcl_IncrRefCount(topBC);
