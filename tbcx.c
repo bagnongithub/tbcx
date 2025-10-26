@@ -4,12 +4,12 @@
 
 #include "tbcx.h"
 
+/* ==========================================================================
+ * File-local globals
+ * ========================================================================== */
+
 #define PKG_TBCX "tbcx"
 #define PKG_TBCX_VER "1.0"
-
-EXTERN int         Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int         Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-EXTERN int         Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 
 const Tcl_ObjType *tbcxTyBignum      = NULL;
 const Tcl_ObjType *tbcxTyBoolean     = NULL;
@@ -33,13 +33,37 @@ int                tbcxHostIsLE      = 1;
 
 TCL_DECLARE_MUTEX(tbcxTypeMutex);
 
-uint32_t PackTclVersion(void) {
+/* ==========================================================================
+ * Extern Declarations
+ * ========================================================================== */
+
+EXTERN int                Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int                Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+EXTERN int                Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+
+/* ==========================================================================
+ * Forward Declarations
+ * ========================================================================== */
+
+static const Tcl_ObjType *NeedObjType(const char *name);
+uint32_t                  PackTclVersion(void);
+static void               TbcxInitEndian(Tcl_Interp *interp);
+static void               TbcxInitTypes(Tcl_Interp *interp);
+
+DLLEXPORT int             tbcx_SafeInit(Tcl_Interp *ip);
+DLLEXPORT int             tbcx_Init(Tcl_Interp *interp);
+
+/* ==========================================================================
+ * Stuff
+ * ========================================================================== */
+
+uint32_t                  PackTclVersion(void) {
     int maj, min, pat, typ;
     Tcl_GetVersion(&maj, &min, &pat, &typ);
     return ((uint32_t)maj << 24) | ((uint32_t)min << 16) | ((uint32_t)pat << 8) | (uint32_t)typ;
 }
 
-void TbcxInitEndian(Tcl_Interp *interp) {
+static void TbcxInitEndian(Tcl_Interp *interp) {
     int isLE = -1;
 
     if (interp) {
@@ -91,7 +115,7 @@ static const Tcl_ObjType *NeedObjType(const char *name) {
     return t;
 }
 
-void Tbcx_InitTypes(Tcl_Interp *interp) {
+static void TbcxInitTypes(Tcl_Interp *interp) {
     if (tbcxTypesLoaded)
         return;
 
@@ -126,7 +150,7 @@ void Tbcx_InitTypes(Tcl_Interp *interp) {
     Tcl_MutexUnlock(&tbcxTypeMutex);
 }
 
-int tbcx_Init(Tcl_Interp *interp) {
+DLLEXPORT int tbcx_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, TCL_VERSION, 1) == NULL) {
         return TCL_ERROR;
     }
@@ -136,7 +160,7 @@ int tbcx_Init(Tcl_Interp *interp) {
         return TCL_ERROR;
     }
 
-    Tbcx_InitTypes(interp);
+    TbcxInitTypes(interp);
 
     Tcl_CreateObjCommand2(interp, "tbcx::save", Tbcx_SaveObjCmd, NULL, NULL);
     Tcl_CreateObjCommand2(interp, "tbcx::load", Tbcx_LoadObjCmd, NULL, NULL);
@@ -145,4 +169,8 @@ int tbcx_Init(Tcl_Interp *interp) {
     Tcl_PkgProvide(interp, PKG_TBCX, PKG_TBCX_VER);
 
     return TCL_OK;
+}
+
+DLLEXPORT int tbcx_SafeInit(Tcl_Interp *ip) {
+    return tbcx_Init(ip);
 }

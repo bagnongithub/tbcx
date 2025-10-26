@@ -30,8 +30,8 @@ PRJ_HEADERS = $(ROOT)\tbcx.h
 
 PRJ_DEFINES = /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE
 PRJ_DEFINES = $(PRJ_DEFINES) /D_CRT_SECURE_NO_WARNINGS
-PRJ_DEFINES = $(PRJ_DEFINES) $(ADDOPTDEFINES) -I$(TMP_DIR)
-PRJ_LIBS = $(ADDLINKOPTS)
+PRJ_DEFINES = $(PRJ_DEFINES) $(ADDOPTDEFINES) -I$(TMP_DIR) -I$(TCLDIR)\libtommath
+PRJ_LIBS = $(ADDLINKOPTS) $(INSTALLDIR)\lib\tommath.lib
 
 # Define the standard targets
 !include "$(_RULESDIR)\targets.vc"
@@ -42,6 +42,7 @@ PRJ_LIBS = $(ADDLINKOPTS)
 pkgindex:
 	@echo package ifneeded $(PRJ_PACKAGE_TCLNAME) $(DOTVERSION) \
 	    [list load [file join $$dir $(PRJLIBNAME9)] $(PRJ_PACKAGE_TCLNAME)] > $(OUT_DIR)\pkgIndex.tcl
+	@echo package provide $(PRJ_PACKAGE_TCLNAME) $(DOTVERSION) 				>> $(OUT_DIR)\pkgIndex.tcl
 
 $(ROOT)\manifest.uuid:
    copy $(WIN_DIR)\gitmanifest.in $(ROOT)\manifest.uuid

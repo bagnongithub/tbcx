@@ -512,9 +512,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
        substitute the body argument and call the original. */
     if (preBody && savedArgs && !isBuilderForm) {
         if (kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) {
-            rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, kind,
-                                                   (kind == TBCX_METH_CTOR ? savedArgs : NULL),
-                                                   preBody);
+            rc = OoDefineCtorOrDtorFromPrecompiled(ip, clsFqn, kind, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
             if (key)
                 Tcl_DecrRefCount(key);
             if (clsFqn != cls)
