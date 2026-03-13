@@ -689,10 +689,10 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
                           H.numLocalsTop,
                           H.maxStackTop);
 
-    /* Top-level block — use global namespace to match tbcx::load behavior */
-    Namespace* curNs = (Namespace*)EnsureNamespace(interp, "::");
+    /* Top-level block — use global namespace; never create namespaces in dump */
+    Namespace* curNs = (Namespace*)Tcl_GetGlobalNamespace(interp);
     uint32_t dummyNL = 0;
-    Tcl_Obj* topBC = ReadBlock(&r, interp, curNs, &dummyNL, 0);
+    Tcl_Obj* topBC = ReadBlock(&r, interp, curNs, &dummyNL, 0, 1);
     if (!topBC)
     {
         Tcl_DecrRefCount(out);
@@ -748,8 +748,11 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         }
 
         Tcl_Obj* nameFqn = Tcl_NewStringObj(nameC, (Tcl_Size)nameL);
+        Tcl_IncrRefCount(nameFqn);
         Tcl_Obj* nsObj = Tcl_NewStringObj(nsC, (Tcl_Size)nsL);
+        Tcl_IncrRefCount(nsObj);
         Tcl_Obj* argsObj = Tcl_NewStringObj(argsC, (Tcl_Size)argsL);
+        Tcl_IncrRefCount(argsObj);
         Tcl_Free(nameC);
         Tcl_Free(nsC);
         Tcl_Free(argsC);
@@ -763,11 +766,16 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
-        Namespace* nsPtr = (Namespace*)EnsureNamespace(interp, Tcl_GetString(nsObj));
+        Namespace* nsPtr = (Namespace*)Tcl_FindNamespace(interp, Tcl_GetString(nsObj), NULL, 0);
+        if (!nsPtr)
+            nsPtr = (Namespace*)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc = 0;
-        Tcl_Obj* bodyBC = ReadBlock(&r, interp, nsPtr, &nLoc, 0);
+        Tcl_Obj* bodyBC = ReadBlock(&r, interp, nsPtr, &nLoc, 0, 1);
         if (!bodyBC)
         {
+            Tcl_DecrRefCount(argsObj);
+            Tcl_DecrRefCount(nsObj);
+            Tcl_DecrRefCount(nameFqn);
             Tcl_DecrRefCount(topBC);
             Tcl_DecrRefCount(out);
             Tcl_Close(interp, in);
@@ -779,6 +787,9 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         DumpBCDetails(bodyBC, out);
 
         Tcl_DecrRefCount(bodyBC);
+        Tcl_DecrRefCount(argsObj);
+        Tcl_DecrRefCount(nsObj);
+        Tcl_DecrRefCount(nameFqn);
     }
 
     /* Classes */
@@ -803,6 +814,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             return TCL_ERROR;
         }
         Tcl_Obj* clsObj = Tcl_NewStringObj(cls, (Tcl_Size)cl);
+        Tcl_IncrRefCount(clsObj);
         Tcl_Free(cls);
         Tcl_AppendToObj(out, "  - class ", -1);
         Tcl_AppendObjToObj(out, clsObj);
@@ -811,6 +823,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         uint32_t nSup = 0;
         if (!R_U32(&r, &nSup))
         {
+            Tcl_DecrRefCount(clsObj);
             Tcl_DecrRefCount(topBC);
             Tcl_DecrRefCount(out);
             Tcl_Close(interp, in);
@@ -822,6 +835,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             uint32_t sl = 0;
             if (!R_LPString(&r, &su, &sl))
             {
+                Tcl_DecrRefCount(clsObj);
                 Tcl_DecrRefCount(topBC);
                 Tcl_DecrRefCount(out);
                 Tcl_Close(interp, in);
@@ -829,6 +843,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             }
             Tcl_Free(su); /* acknowledged; saver typically emits 0 */
         }
+        Tcl_DecrRefCount(clsObj);
     }
 
     /* Methods */
@@ -853,6 +868,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             return TCL_ERROR;
         }
         Tcl_Obj* clsFqn = Tcl_NewStringObj(clsf, (Tcl_Size)clsL);
+        Tcl_IncrRefCount(clsFqn);
         Tcl_Free(clsf);
 
         uint8_t kind = 0;
@@ -876,6 +892,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             return TCL_ERROR;
         }
         Tcl_Obj* nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
+        Tcl_IncrRefCount(nameObj);
         Tcl_Free(mname);
 
         char* args = NULL;
@@ -890,6 +907,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             return TCL_ERROR;
         }
         Tcl_Obj* argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
+        Tcl_IncrRefCount(argsObj);
         Tcl_Free(args);
 
         Tcl_AppendToObj(out, "  - ", -1);
@@ -906,11 +924,16 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
-        Namespace* clsNs = (Namespace*)EnsureNamespace(interp, Tcl_GetString(clsFqn));
+        Namespace* clsNs = (Namespace*)Tcl_FindNamespace(interp, Tcl_GetString(clsFqn), NULL, 0);
+        if (!clsNs)
+            clsNs = (Namespace*)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc = 0;
-        Tcl_Obj* bodyBC = ReadBlock(&r, interp, clsNs, &nLoc, 0);
+        Tcl_Obj* bodyBC = ReadBlock(&r, interp, clsNs, &nLoc, 0, 1);
         if (!bodyBC)
         {
+            Tcl_DecrRefCount(argsObj);
+            Tcl_DecrRefCount(nameObj);
+            Tcl_DecrRefCount(clsFqn);
             Tcl_DecrRefCount(topBC);
             Tcl_DecrRefCount(out);
             Tcl_Close(interp, in);
@@ -922,6 +945,9 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         DumpBCDetails(bodyBC, out);
 
         Tcl_DecrRefCount(bodyBC);
+        Tcl_DecrRefCount(argsObj);
+        Tcl_DecrRefCount(nameObj);
+        Tcl_DecrRefCount(clsFqn);
     }
 
     Tcl_DecrRefCount(topBC);

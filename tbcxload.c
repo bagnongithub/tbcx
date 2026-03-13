@@ -131,11 +131,14 @@ inline int R_U32(TbcxIn* r, uint32_t* vp);
 inline int R_U64(TbcxIn* r, uint64_t* vp);
 inline int R_U8(TbcxIn* r, uint8_t* v);
 static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut);
-Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled);
+Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
 static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut);
 int ReadHeader(TbcxIn* r, TbcxHeader* H);
-static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip);
+static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly);
 static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os);
+
+#define TBCX_MAX_LITERAL_DEPTH 64
+#define TBCX_MAX_CONTAINER_ELEMS (16u * 1024u * 1024u)
 static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx);
 static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr);
 static void RegisterPrecompiledLambda(Tcl_Interp* ip, Tcl_Obj* lambda, Proc* procPtr, Tcl_Obj* nsObj);
@@ -1095,7 +1098,10 @@ static int AddOOShim(Tcl_Interp* ip, OOShim* os)
     snprintf(os->origNameObjDef, sizeof(os->origNameObjDef), "::tbcx::__oo_objdef_orig_%d__", myId);
 
     if (TclRenameCommand(ip, "oo::define", os->origName) != TCL_OK)
+    {
+        Tcl_DeleteHashTable(&os->methodsByKey);
         return TCL_ERROR;
+    }
     Tcl_CreateObjCommand2(ip, "oo::define", CmdOOShim, os, NULL);
 
     /* Also shim oo::objdefine if it exists */
@@ -1553,11 +1559,12 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     /* compiled block (namespace default: class namespace) + receive numLocals */
     Namespace* clsNs = (Namespace*)EnsureNamespace(ip, Tcl_GetString(clsFqn));
     uint32_t nLoc = 0;
-    Tcl_Obj* bodyBC = ReadBlock(r, ip, clsNs, &nLoc, 1);
+    Tcl_Obj* bodyBC = ReadBlock(r, ip, clsNs, &nLoc, 1, 0);
     if (!bodyBC)
     {
         Tcl_DecrRefCount(argsObj);
         Tcl_DecrRefCount(nameObj);
+        Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     /* Build Proc + compiled locals from argsObj */
@@ -1636,8 +1643,14 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     return TCL_OK;
 }
 
-static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
+static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
 {
+    if (depth > TBCX_MAX_LITERAL_DEPTH)
+    {
+        R_Error(r, "tbcx: literal nesting too deep");
+        return NULL;
+    }
+
     uint32_t tag = 0;
     if (!R_U32(r, &tag))
         return NULL;
@@ -1738,7 +1751,12 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
             uint32_t n = 0;
             if (!R_U32(r, &n))
                 return NULL;
-            unsigned char* buf = (unsigned char*)Tcl_Alloc(n);
+            if (n > TBCX_MAX_STR)
+            {
+                R_Error(r, "tbcx: bytearray too large");
+                return NULL;
+            }
+            unsigned char* buf = (unsigned char*)Tcl_Alloc(n ? n : 1u);
             if (n && !R_Bytes(r, buf, n))
             {
                 Tcl_Free((char*)buf);
@@ -1753,22 +1771,24 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
             uint32_t cnt = 0;
             if (!R_U32(r, &cnt))
                 return NULL;
+            if (cnt > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(r, "tbcx: dict too many pairs");
+                return NULL;
+            }
             Tcl_Obj* d = Tcl_NewDictObj();
             for (uint32_t i = 0; i < cnt; i++)
             {
-                Tcl_Obj* k = ReadLiteral(r, ip);
+                Tcl_Obj* k = ReadLiteral(r, ip, depth + 1, dumpOnly);
                 if (!k)
                 {
-                    /* Bump-and-release: IncrRef 0→1 then DecrRef 1→0 triggers
-                       freeIntRepProc, which releases all already-inserted k/v pairs. */
                     Tcl_IncrRefCount(d);
                     Tcl_DecrRefCount(d);
                     return NULL;
                 }
-                Tcl_Obj* v = ReadLiteral(r, ip);
+                Tcl_Obj* v = ReadLiteral(r, ip, depth + 1, dumpOnly);
                 if (!v)
                 {
-                    /* k is at refcount 0 and not yet in the dict — release it. */
                     Tcl_IncrRefCount(k);
                     Tcl_DecrRefCount(k);
                     Tcl_IncrRefCount(d);
@@ -1797,13 +1817,17 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
             uint32_t n = 0;
             if (!R_U32(r, &n))
                 return NULL;
+            if (n > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(r, "tbcx: list too many elements");
+                return NULL;
+            }
             Tcl_Obj* lst = Tcl_NewListObj(0, NULL);
             for (uint32_t i = 0; i < n; i++)
             {
-                Tcl_Obj* e = ReadLiteral(r, ip);
+                Tcl_Obj* e = ReadLiteral(r, ip, depth + 1, dumpOnly);
                 if (!e)
                 {
-                    /* Bump-and-release: frees lst and all already-appended elements. */
                     Tcl_IncrRefCount(lst);
                     Tcl_DecrRefCount(lst);
                     return NULL;
@@ -1877,7 +1901,13 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
                 return NULL;
             Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
             Tcl_Free(nsStr);
-            Namespace* nsPtr = (Namespace*)EnsureNamespace(ip, Tcl_GetString(nsObj));
+            Namespace* nsPtr;
+            if (dumpOnly)
+                nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
+            else
+                nsPtr = (Namespace*)EnsureNamespace(ip, Tcl_GetString(nsObj));
+            if (!nsPtr)
+                nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
             Tcl_IncrRefCount(nsObj);
             uint32_t dummyNL = 0;
             /* setPrecompiled=1: TBCX literal bytecodes have no source text
@@ -1885,7 +1915,7 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
                skips compile-epoch validation — otherwise ProcShim/OOShim
                installation bumps the epoch and Tcl would recompile from
                the empty string, losing all compiled content. */
-            Tcl_Obj* bc = ReadBlock(r, ip, nsPtr, &dummyNL, 1);
+            Tcl_Obj* bc = ReadBlock(r, ip, nsPtr, &dummyNL, 1, dumpOnly);
             Tcl_DecrRefCount(nsObj);
             return bc;
         }
@@ -1907,7 +1937,13 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
             Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
             Tcl_Free(nsStr);
             Tcl_IncrRefCount(nsObj);
-            Namespace* nsPtr = (Namespace*)EnsureNamespace(ip, Tcl_GetString(nsObj));
+            Namespace* nsPtr;
+            if (dumpOnly)
+                nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
+            else
+                nsPtr = (Namespace*)EnsureNamespace(ip, Tcl_GetString(nsObj));
+            if (!nsPtr)
+                nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
             uint32_t numArgs = 0;
             if (!R_U32(r, &numArgs))
             {
@@ -1938,7 +1974,7 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
                 }
                 if (hasDef)
                 {
-                    Tcl_Obj* defVal = ReadLiteral(r, ip);
+                    Tcl_Obj* defVal = ReadLiteral(r, ip, depth + 1, dumpOnly);
                     if (!defVal)
                     {
                         Tcl_DecrRefCount(nsObj);
@@ -1979,7 +2015,7 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
             }
 
             uint32_t nLocalsBody = 0;
-            Tcl_Obj* bodyBC = ReadBlock(r, ip, nsPtr, &nLocalsBody, 1);
+            Tcl_Obj* bodyBC = ReadBlock(r, ip, nsPtr, &nLocalsBody, 1, dumpOnly);
             if (!bodyBC)
             {
                 Tcl_DecrRefCount(nsObj);
@@ -2054,8 +2090,24 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip)
                the shim installs the lambdaExpr rep (after any string-rep
                interpolation has already happened). */
 
-            /* Register in ApplyShim for shimmer recovery */
-            RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
+            /* Register in ApplyShim for shimmer recovery — but NOT in
+               dumpOnly mode, where we must avoid mutating the interpreter. */
+            if (!dumpOnly)
+            {
+                RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
+            }
+            else
+            {
+                /* In dumpOnly mode, nobody will own this Proc.  Detach it
+                   from the ByteCode to prevent circular cleanup, then free. */
+                ByteCode* bc2 = NULL;
+                ByteCodeGetInternalRep(bodyBC, tbcxTyBytecode, bc2);
+                if (bc2)
+                    bc2->procPtr = NULL;
+                Tcl_DecrRefCount(bodyBC); /* release the Proc's ref on bodyBC */
+                FreeLocals(procPtr->firstLocalPtr);
+                Tcl_Free((char*)procPtr);
+            }
 
             /* Release our protective references; the lambda list and
                ApplyShim registry now hold their own. */
@@ -2106,6 +2158,11 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
             uint32_t cnt = 0;
             if (!R_U32(r, &cnt))
                 goto fail_aux;
+            if (cnt > TBCX_MAX_LITERALS)
+            {
+                R_Error(r, "tbcx: jump table too large");
+                goto fail_aux;
+            }
             JumptableInfo* info = (JumptableInfo*)Tcl_Alloc(sizeof(*info));
             Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
             for (uint32_t k = 0; k < cnt; k++)
@@ -2140,6 +2197,11 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
             uint32_t cnt = 0;
             if (!R_U32(r, &cnt))
                 goto fail_aux;
+            if (cnt > TBCX_MAX_LITERALS)
+            {
+                R_Error(r, "tbcx: numeric jump table too large");
+                goto fail_aux;
+            }
             JumptableNumInfo* info = (JumptableNumInfo*)Tcl_Alloc(sizeof(*info));
 #if UINTPTR_MAX < 0xFFFFFFFFFFFFFFFFull
             Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
@@ -2177,7 +2239,19 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
             uint32_t L = 0;
             if (!R_U32(r, &L))
                 goto fail_aux;
-            size_t bytes = offsetof(DictUpdateInfo, varIndices) + (size_t)L * sizeof(Tcl_Size);
+            if (L > TBCX_MAX_LITERALS)
+            {
+                R_Error(r, "tbcx: dict-update aux too large");
+                goto fail_aux;
+            }
+            size_t elemBytes = (size_t)L * sizeof(Tcl_Size);
+            /* Overflow check: verify the multiplication didn't wrap */
+            if (L > 0 && elemBytes / L != sizeof(Tcl_Size))
+            {
+                R_Error(r, "tbcx: dict-update aux overflow");
+                goto fail_aux;
+            }
+            size_t bytes = offsetof(DictUpdateInfo, varIndices) + elemBytes;
             DictUpdateInfo* info = (DictUpdateInfo*)Tcl_Alloc(bytes);
             memset(info, 0, bytes);
             info->length = (Tcl_Size)L;
@@ -2210,7 +2284,18 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                 R_Error(r, "tbcx: foreach aux mismatch");
                 goto fail_aux;
             }
-            size_t bytes = offsetof(ForeachInfo, varLists) + (size_t)numLists * sizeof(ForeachVarList*);
+            if (numLists > TBCX_MAX_LITERALS)
+            {
+                R_Error(r, "tbcx: foreach aux too many lists");
+                goto fail_aux;
+            }
+            size_t listBytes = (size_t)numLists * sizeof(ForeachVarList*);
+            if (numLists > 0 && listBytes / numLists != sizeof(ForeachVarList*))
+            {
+                R_Error(r, "tbcx: foreach aux overflow");
+                goto fail_aux;
+            }
+            size_t bytes = offsetof(ForeachInfo, varLists) + listBytes;
             ForeachInfo* info = (ForeachInfo*)Tcl_Alloc(bytes);
             memset(info, 0, bytes);
             info->numLists = (Tcl_Size)numLists;
@@ -2226,7 +2311,24 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                     i++; /* count this entry so fail_aux frees it */
                     goto fail_aux;
                 }
-                size_t vlBytes = offsetof(ForeachVarList, varIndexes) + (size_t)nv * sizeof(Tcl_LVTIndex);
+                if (nv > TBCX_MAX_LITERALS)
+                {
+                    R_Error(r, "tbcx: foreach varlist too large");
+                    arr[i].type = tbcxAuxNewForeach;
+                    arr[i].clientData = info;
+                    i++;
+                    goto fail_aux;
+                }
+                size_t varIdxBytes = (size_t)nv * sizeof(Tcl_LVTIndex);
+                if (nv > 0 && varIdxBytes / nv != sizeof(Tcl_LVTIndex))
+                {
+                    R_Error(r, "tbcx: foreach varlist overflow");
+                    arr[i].type = tbcxAuxNewForeach;
+                    arr[i].clientData = info;
+                    i++;
+                    goto fail_aux;
+                }
+                size_t vlBytes = offsetof(ForeachVarList, varIndexes) + varIdxBytes;
                 ForeachVarList* vl = (ForeachVarList*)Tcl_Alloc(vlBytes);
                 memset(vl, 0, vlBytes);
                 vl->numVars = (Tcl_Size)nv;
@@ -2308,7 +2410,7 @@ static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut)
     return 1;
 }
 
-Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled)
+Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly)
 {
     /* 1) code */
     uint32_t codeLen = 0;
@@ -2357,7 +2459,7 @@ Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t*
     }
     for (uint32_t i = 0; i < numLits; i++)
     {
-        Tcl_Obj* lit = ReadLiteral(r, ip);
+        Tcl_Obj* lit = ReadLiteral(r, ip, 0, dumpOnly);
         if (!lit)
         {
             for (uint32_t j = 0; j < i; j++)
@@ -2815,7 +2917,10 @@ static int AddProcShim(Tcl_Interp* ip, ProcShim* ps)
 
     Tcl_Command token = Tcl_FindCommand(ip, "proc", NULL, 0);
     if (!token)
+    {
+        Tcl_DeleteHashTable(&ps->procsByFqn);
         return TCL_ERROR;
+    }
 
     ps->procCmdPtr = (Command*)token;
     ps->savedObjProc2 = ps->procCmdPtr->objProc2;
@@ -2990,9 +3095,10 @@ static void ApplyShimCleanup(void* cd, Tcl_Interp* ip)
         {
             if (le->procPtr && --le->procPtr->refCount <= 0)
             {
-                /* Proc cleanup would go here, but typically the Proc is
-                   still referenced by the lambdaExpr rep on the literal.
-                   If refCount hits 0, the body ByteCode owns the Proc. */
+                /* Proc refCount hit zero — the registry was the last owner.
+                   Clean up the Proc properly: release bodyPtr and free
+                   compiled locals, then the Proc struct itself. */
+                TclProcCleanupProc(le->procPtr);
             }
             if (le->nsObj)
                 Tcl_DecrRefCount(le->nsObj);
@@ -3058,8 +3164,10 @@ static void ApplyShimPurgeStale(ApplyShim* as)
             ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_GetHashValue(e);
             if (le)
             {
-                if (le->procPtr)
-                    le->procPtr->refCount--;
+                if (le->procPtr && --le->procPtr->refCount <= 0)
+                {
+                    TclProcCleanupProc(le->procPtr);
+                }
                 if (le->nsObj)
                     Tcl_DecrRefCount(le->nsObj);
                 Tcl_Free(le);
@@ -3252,7 +3360,7 @@ static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx)
     Namespace* nsPtr = (Namespace*)EnsureNamespace(ip, Tcl_GetString(nsObj));
     /* body block (+numLocals) */
     uint32_t nLoc = 0;
-    Tcl_Obj* bodyBC = ReadBlock(r, ip, nsPtr, &nLoc, 1);
+    Tcl_Obj* bodyBC = ReadBlock(r, ip, nsPtr, &nLoc, 1, 0);
     if (!bodyBC)
     {
         Tcl_DecrRefCount(nameFqn);
@@ -3298,6 +3406,9 @@ static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx)
         int numA = 0;
         if (BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK)
         {
+            Tcl_DecrRefCount(bodyBC);
+            FreeLocals(procPtr->firstLocalPtr);
+            Tcl_Free((char*)procPtr);
             Tcl_DecrRefCount(fqnKey);
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(argsObj);
@@ -3469,23 +3580,31 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
     Namespace* curNs = (Namespace*)EnsureNamespace(ip, "::");
     uint32_t dummyNL = 0;
 
-    Tcl_Obj* topBC = ReadBlock(&r, ip, curNs, &dummyNL, 1);
+    Tcl_Obj* topBC = ReadBlock(&r, ip, curNs, &dummyNL, 1, 0);
     if (!topBC)
         return TCL_ERROR;
+    Tcl_IncrRefCount(topBC); /* protect against all early-return paths */
+
+    int rc = TCL_ERROR;
+    int shimInited = 0;   /* 1 once AddProcShim succeeded */
+    int ooshimInited = 0; /* 1 once AddOOShim succeeded */
+
+    ProcShim shim;
+    memset(&shim, 0, sizeof(shim)); /* zero up front so DelProcShim is safe */
+    OOShim ooshim;
+    memset(&ooshim, 0, sizeof(ooshim));
 
     /* Procs */
     uint32_t numProcs = 0;
     if (!R_U32(&r, &numProcs))
-        return TCL_ERROR;
+        goto cleanup;
 
     /* Build proc shim registry and fill from section */
-    ProcShim shim;
-    shim.procsByIdx = NULL;
-    shim.numProcsIdx = 0;
     if (numProcs)
     {
         if (AddProcShim(ip, &shim) != TCL_OK)
-            return TCL_ERROR;
+            goto cleanup;
+        shimInited = 1;
         shim.procsByIdx = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * numProcs);
         memset(shim.procsByIdx, 0, sizeof(Tcl_Obj*) * numProcs);
         shim.numProcsIdx = numProcs;
@@ -3494,77 +3613,49 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
     for (uint32_t i = 0; i < numProcs; i++)
     {
         if (ReadProc(&r, ip, &shim, i) != TCL_OK)
-        {
-            DelProcShim(ip, &shim);
-            return TCL_ERROR;
-        }
+            goto cleanup;
     }
 
     /* Classes section (saver currently emits 0) */
     uint32_t numClasses = 0;
     if (!R_U32(&r, &numClasses))
-    {
-        DelProcShim(ip, &shim);
-        return TCL_ERROR;
-    }
+        goto cleanup;
     for (uint32_t c = 0; c < numClasses; c++)
     {
         /* classFqn + nSupers + supers… — saver writes 0; ignore here */
         char* cls = NULL;
         uint32_t cl = 0;
         if (!R_LPString(&r, &cls, &cl))
-        {
-            DelProcShim(ip, &shim);
-            return TCL_ERROR;
-        }
+            goto cleanup;
         Tcl_Free(cls);
         uint32_t nSup = 0;
         if (!R_U32(&r, &nSup))
-        {
-            DelProcShim(ip, &shim);
-            return TCL_ERROR;
-        }
+            goto cleanup;
         for (uint32_t s = 0; s < nSup; s++)
         {
             char* su = NULL;
             uint32_t sl = 0;
             if (!R_LPString(&r, &su, &sl))
-            {
-                DelProcShim(ip, &shim);
-                return TCL_ERROR;
-            }
+                goto cleanup;
             Tcl_Free(su);
         }
     }
     uint32_t numMethods = 0;
     if (!R_U32(&r, &numMethods))
-    {
-        DelProcShim(ip, &shim);
-        return TCL_ERROR;
-    }
-    OOShim ooshim;
+        goto cleanup;
     if (numMethods)
     {
         if (AddOOShim(ip, &ooshim) != TCL_OK)
-        {
-            if (numProcs)
-                DelProcShim(ip, &shim);
-            return TCL_ERROR;
-        }
+            goto cleanup;
+        ooshimInited = 1;
     }
     for (uint32_t m = 0; m < numMethods; m++)
     {
         if (ReadMethod(&r, ip, &ooshim) != TCL_OK)
-        {
-            if (numMethods)
-                DelOOShim(ip, &ooshim);
-            if (numProcs)
-                DelProcShim(ip, &shim);
-            return TCL_ERROR;
-        }
+            goto cleanup;
     }
 
-    int rc = TCL_OK;
+    /* Execute */
     {
         ByteCode* top = NULL;
         TbcxTopFrameSave _sv;
@@ -3583,29 +3674,23 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
 
         TopLocals_Begin(ip, top, &_sv);
 
-        Tcl_IncrRefCount(topBC);
         rc = Tcl_EvalObjEx(ip, topBC, TCL_EVAL_GLOBAL);
-        Tcl_DecrRefCount(topBC);
 
         TopLocals_End(ip, &_sv);
 
         /* Handle TCL_RETURN the same way Tcl's 'source' command
-           (Tcl_FSEvalFileEx) does.  A top-level 'return value' in the
-           loaded script should produce TCL_OK with the value as the
-           interp result, not propagate TCL_RETURN to the caller.
-           Without this, every tbcx script that uses 'return [...]'
-           at top-level causes the caller's script to exit early.
-           This was previously hidden because the LiftTopLocals bug
-           accidentally recompiled 'returnImm' into bare 'done'. */
+           (Tcl_FSEvalFileEx) does. */
         if (rc == TCL_RETURN)
         {
             rc = TclUpdateReturnInfo((Interp*)ip);
         }
     }
 
-    if (numMethods)
+cleanup:
+    Tcl_DecrRefCount(topBC);
+    if (ooshimInited)
         DelOOShim(ip, &ooshim);
-    if (numProcs)
+    if (shimInited)
         DelProcShim(ip, &shim);
     return rc;
 }

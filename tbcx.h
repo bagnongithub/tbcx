@@ -139,7 +139,7 @@ int R_U8(TbcxIn* r, uint8_t* v);
 void W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
 int W_Flush(TbcxOut* w);
 
-Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled);
+Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
 int ReadHeader(TbcxIn* r, TbcxHeader* H);
 
 void TbcxApplyShimPurgeAll(Tcl_Interp* ip);

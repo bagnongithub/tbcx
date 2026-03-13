@@ -106,10 +106,11 @@ static void CaptureClassBody(Tcl_Interp* ip,
                              int flags,
                              int depth);
 static Tcl_Obj*
-CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes);
+CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
 static inline const char* CmdCore(const char* s);
 static int CmpJTEntryUtf8_qsort(const void* pa, const void* pb);
 static int CmpJTNumEntry_qsort(const void* pa, const void* pb);
+static int CmpStrPtr_qsort(const void* pa, const void* pb);
 static int CompileProcLike(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* nsFQN, Tcl_Obj* argsList, Tcl_Obj* bodyObj, const char* whereTag);
 static uint32_t ComputeNumLocals(ByteCode* bc);
 static void CS_Add(ClsSet* cs, Tcl_Obj* clsFqn);
@@ -129,7 +130,7 @@ static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top);
 static void ScanForNsEvalBodies(TbcxCtx* ctx, const char* script, Tcl_Size len);
 static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, Tcl_Obj* curNs, int depth);
 static void RegisterBodyAndRecurse(TbcxCtx* ctx, const Tcl_Token* tok, Tcl_Obj* curNs, int depth);
-static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes);
+static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
 static void DV_Free(DefVec* dv);
 static void DV_Init(DefVec* dv);
 static void DV_Push(DefVec* dv, DefRec r);
@@ -188,6 +189,13 @@ static int CmpJTNumEntry_qsort(const void* pa, const void* pb)
     if (a->key > b->key)
         return 1;
     return 0;
+}
+
+static int CmpStrPtr_qsort(const void* pa, const void* pb)
+{
+    const char* a = *(const char* const*)pa;
+    const char* b = *(const char* const*)pb;
+    return strcmp(a ? a : "", b ? b : "");
 }
 
 static inline void W_Error(TbcxOut* w, const char* msg)
@@ -1452,8 +1460,11 @@ int BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, Com
             return TCL_ERROR;
         }
         const char* nm = Tcl_GetStringFromObj(fv[0], &nmLen);
-        CompiledLocal* cl = (CompiledLocal*)Tcl_Alloc(offsetof(CompiledLocal, name) + 1u + (size_t)nmLen);
-        memset(cl, 0, sizeof(CompiledLocal));
+        size_t allocSize = offsetof(CompiledLocal, name) + 1u + (size_t)nmLen;
+        if (allocSize < sizeof(CompiledLocal))
+            allocSize = sizeof(CompiledLocal);
+        CompiledLocal* cl = (CompiledLocal*)Tcl_Alloc(allocSize);
+        memset(cl, 0, allocSize);
         cl->nameLength = (int)nmLen;
         memcpy(cl->name, nm, (size_t)nmLen + 1);
         cl->frameIndex = (int)i;
@@ -2080,12 +2091,16 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
         /* Integer fidelity: Tcl's compiler sometimes stores integer
            constants as untyped string literals (typePtr == NULL).
            Detect them and emit as WIDEINT/WIDEUINT to avoid
-           string-to-int shimmer on first use after load. */
+           string-to-int shimmer on first use after load.
+           Probe a DUPLICATE to avoid mutating the live literal pool. */
         if (n >= 1 && n <= 20)
         {
+            Tcl_Obj* probe = Tcl_NewStringObj(s, n);
+            Tcl_IncrRefCount(probe);
             Tcl_WideInt wv = 0;
-            if (Tcl_GetWideIntFromObj(NULL, obj, &wv) == TCL_OK)
+            if (Tcl_GetWideIntFromObj(NULL, probe, &wv) == TCL_OK)
             {
+                Tcl_DecrRefCount(probe);
                 /* Verify the string rep IS the canonical integer form.
                    Reject non-canonical forms like "042", "+5", " 3 " to
                    preserve exact string-rep semantics. */
@@ -2105,6 +2120,10 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                     }
                     return;
                 }
+            }
+            else
+            {
+                Tcl_DecrRefCount(probe);
             }
         }
 
@@ -3330,8 +3349,10 @@ static Tcl_Obj* CanonTrivia(Tcl_Obj* in)
  * and return the rewritten text.  Returns NULL if the token is not a
  * literal OR if the body text is unchanged (no definitions found).
  * ========================================================================== */
-static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes)
+static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
 {
+    if (depth > TBCX_MAX_BLOCK_DEPTH)
+        return NULL;
     Tcl_Obj* bodyObj = WordLiteralObj(bodyTok);
     if (!bodyObj)
         return NULL;
@@ -3342,7 +3363,7 @@ static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_
         Tcl_DecrRefCount(bodyObj);
         return NULL;
     }
-    Tcl_Obj* rewritten = CaptureAndRewriteScript(ip, bs, bl, curNs, defs, classes);
+    Tcl_Obj* rewritten = CaptureAndRewriteScript(ip, bs, bl, curNs, defs, classes, depth);
     /* Only return non-NULL when the body was actually modified (i.e.
        proc/method/class definitions were found and stubbed).  Returning
        non-NULL for unchanged bodies triggers a command rebuild that
@@ -3361,8 +3382,12 @@ static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_
 }
 
 static Tcl_Obj*
-CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes)
+CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
 {
+    /* Guard against unbounded recursion from nested namespace eval / control flow */
+    if (depth > TBCX_MAX_BLOCK_DEPTH)
+        return Tcl_NewStringObj(script, len);
+
     Tcl_DString out;
     Tcl_DStringInit(&out);
     Tcl_Parse p;
@@ -3483,7 +3508,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                             /* Recurse: single-pass capture+rewrite of inner body */
                             Tcl_Size bodyLen = 0;
                             const char* bodyStr = Tcl_GetStringFromObj(bodyObj, &bodyLen);
-                            Tcl_Obj* rewritten = CaptureAndRewriteScript(ip, bodyStr, bodyLen, nsFqn, defs, classes);
+                            Tcl_Obj* rewritten = CaptureAndRewriteScript(ip, bodyStr, bodyLen, nsFqn, defs, classes, depth + 1);
                             Tcl_Obj* canonBody = CanonTrivia(rewritten);
                             Tcl_DString cmdLn;
                             Tcl_DStringInit(&cmdLn);
@@ -4170,7 +4195,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                 {
                     const Tcl_Token* wCond = NextWord(w0);
                     const Tcl_Token* wBody = NextWord(wCond);
-                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes);
+                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes, depth + 1);
                     if (rew)
                     {
                         Tcl_Obj* condO = WordLiteralObj(wCond);
@@ -4196,7 +4221,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                     const Tcl_Token* w2t = NextWord(w1t);
                     const Tcl_Token* w3t = NextWord(w2t);
                     const Tcl_Token* wBody = NextWord(w3t);
-                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes);
+                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes, depth + 1);
                     if (rew)
                     {
                         Tcl_Obj* o1 = WordLiteralObj(w1t);
@@ -4231,7 +4256,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                     const Tcl_Token* tok = w0;
                     for (int fw = 0; fw < p.numWords - 1; fw++)
                         tok = NextWord(tok);
-                    Tcl_Obj* rew = RecurseScriptBody(ip, tok, curNs, defs, classes);
+                    Tcl_Obj* rew = RecurseScriptBody(ip, tok, curNs, defs, classes, depth + 1);
                     if (rew)
                     {
                         /* Pre-scan: all middle words must be literals */
@@ -4273,7 +4298,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                 if (!handled && strcmp(c0, "catch") == 0 && p.numWords >= 2)
                 {
                     const Tcl_Token* wBody = NextWord(w0);
-                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes);
+                    Tcl_Obj* rew = RecurseScriptBody(ip, wBody, curNs, defs, classes, depth + 1);
                     if (rew)
                     {
                         /* Pre-scan trailing words */
@@ -4358,7 +4383,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                             }
                             /* fi is a body position */
                             {
-                                Tcl_Obj* ifRew = RecurseScriptBody(ip, twords[fi], curNs, defs, classes);
+                                Tcl_Obj* ifRew = RecurseScriptBody(ip, twords[fi], curNs, defs, classes, depth + 1);
                                 if (ifRew)
                                 {
                                     Tcl_DecrRefCount(rw[fi]);
@@ -4381,7 +4406,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                                 fi++; /* skip "else" */
                                 if (fi < p.numWords)
                                 {
-                                    Tcl_Obj* elRew = RecurseScriptBody(ip, twords[fi], curNs, defs, classes);
+                                    Tcl_Obj* elRew = RecurseScriptBody(ip, twords[fi], curNs, defs, classes, depth + 1);
                                     if (elRew)
                                     {
                                         Tcl_DecrRefCount(rw[fi]);
@@ -4450,7 +4475,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                         /* Identify body positions and try to rewrite them.
                            Word 1 is the main try body.  Then walk handlers. */
                         {
-                            Tcl_Obj* tryRew = RecurseScriptBody(ip, twords[1], curNs, defs, classes);
+                            Tcl_Obj* tryRew = RecurseScriptBody(ip, twords[1], curNs, defs, classes, depth + 1);
                             if (tryRew)
                             {
                                 Tcl_DecrRefCount(rw[1]);
@@ -4467,7 +4492,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                             {
                                 /* on/trap code varList body */
                                 int bodyIdx = fi + 3;
-                                Tcl_Obj* hRew = RecurseScriptBody(ip, twords[bodyIdx], curNs, defs, classes);
+                                Tcl_Obj* hRew = RecurseScriptBody(ip, twords[bodyIdx], curNs, defs, classes, depth + 1);
                                 if (hRew)
                                 {
                                     Tcl_DecrRefCount(rw[bodyIdx]);
@@ -4480,7 +4505,7 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                             else if (strcmp(ks, "finally") == 0 && fi + 1 < p.numWords)
                             {
                                 int bodyIdx = fi + 1;
-                                Tcl_Obj* fRew = RecurseScriptBody(ip, twords[bodyIdx], curNs, defs, classes);
+                                Tcl_Obj* fRew = RecurseScriptBody(ip, twords[bodyIdx], curNs, defs, classes, depth + 1);
                                 if (fRew)
                                 {
                                     Tcl_DecrRefCount(rw[bodyIdx]);
@@ -4565,7 +4590,7 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
        script with method bodies stubbed out. */
     if (srcLen > 0)
     {
-        Tcl_Obj* rew = CaptureAndRewriteScript(w->interp, srcStr, srcLen, rootNs, &defs, &classes);
+        Tcl_Obj* rew = CaptureAndRewriteScript(w->interp, srcStr, srcLen, rootNs, &defs, &classes, 0);
         if (rew)
         {
             Tcl_DecrRefCount(srcCopy);
@@ -4699,7 +4724,8 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
             }
         }
 
-    /* 6. Classes section (FQN + nSupers=0 for now) — use unique set */
+    /* 6. Classes section (FQN + nSupers=0 for now) — use unique set.
+       Sorted alphabetically for deterministic, reproducible output. */
     {
         Tcl_HashEntry* h;
         Tcl_HashSearch srch;
@@ -4710,13 +4736,23 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
             numClasses++;
         }
         W_U32(w, numClasses);
-        /* Stream each unique FQN once */
-        for (h = Tcl_FirstHashEntry(&classes.ht, &srch); h; h = Tcl_NextHashEntry(&srch))
+        if (numClasses > 0)
         {
-            const char* key = (const char*)Tcl_GetHashKey(&classes.ht, h);
-            Tcl_Size ln = (Tcl_Size)strlen(key);
-            W_LPString(w, key, ln);
-            W_U32(w, 0); /* nSupers */
+            /* Collect keys, sort, then emit for reproducibility */
+            const char** keys = (const char**)Tcl_Alloc(sizeof(const char*) * numClasses);
+            uint32_t ki = 0;
+            for (h = Tcl_FirstHashEntry(&classes.ht, &srch); h; h = Tcl_NextHashEntry(&srch))
+            {
+                keys[ki++] = (const char*)Tcl_GetHashKey(&classes.ht, h);
+            }
+            qsort(keys, (size_t)numClasses, sizeof(const char*), CmpStrPtr_qsort);
+            for (ki = 0; ki < numClasses; ki++)
+            {
+                Tcl_Size ln = (Tcl_Size)strlen(keys[ki]);
+                W_LPString(w, keys[ki], ln);
+                W_U32(w, 0); /* nSupers */
+            }
+            Tcl_Free((char*)keys);
         }
     }
 
@@ -4775,6 +4811,12 @@ cleanup:
     return rc;
 }
 
+/* Ensure a channel is in binary mode for .tbcx I/O.
+ * NOTE: This permanently modifies the channel's translation and eofchar
+ * settings.  For caller-provided channels, this is intentional — .tbcx
+ * streams require raw binary I/O, and leaving the channel in text mode
+ * would corrupt the data.  Callers who need the original settings should
+ * save/restore them themselves, or use file-path arguments instead. */
 int CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch)
 {
     if (Tcl_SetChannelOption(ip, ch, "-translation", "binary") != TCL_OK)
@@ -4924,6 +4966,7 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
 
     Tcl_Channel outCh = NULL;
     int weOpenedOut = 0;
+    Tcl_Obj* tmpPath = NULL; /* temp file path for atomic write (weOpenedOut only) */
 
     if (ProbeOpenChannel(interp, outObj, &outCh))
     {
@@ -4936,16 +4979,22 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
     }
     else
     {
-        /* Treat as path; open for writing */
+        /* Treat as path; write to a temp file in the same directory and
+           rename on success so a failed serialization never leaves a
+           truncated .tbcx at the final path. */
         Tcl_Obj* outNorm = Tcl_FSGetNormalizedPath(interp, outObj);
         if (!outNorm)
         {
             Tcl_DecrRefCount(script);
             return TCL_ERROR;
         }
-        outCh = Tcl_FSOpenFileChannel(interp, outNorm, "w", 0666);
+        tmpPath = Tcl_DuplicateObj(outNorm);
+        Tcl_AppendToObj(tmpPath, ".tbcx.tmp", -1);
+        Tcl_IncrRefCount(tmpPath);
+        outCh = Tcl_FSOpenFileChannel(interp, tmpPath, "w", 0666);
         if (!outCh)
         {
+            Tcl_DecrRefCount(tmpPath);
             Tcl_DecrRefCount(script);
             return TCL_ERROR;
         }
@@ -4953,6 +5002,8 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         if (CheckBinaryChan(interp, outCh) != TCL_OK)
         {
             Tcl_Close(interp, outCh);
+            Tcl_FSDeleteFile(tmpPath);
+            Tcl_DecrRefCount(tmpPath);
             Tcl_DecrRefCount(script);
             return TCL_ERROR;
         }
@@ -4973,20 +5024,32 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
     {
         if (weOpenedOut)
         {
+            /* Atomic rename: temp -> final destination */
             Tcl_Obj* outNorm = Tcl_FSGetNormalizedPath(interp, outObj);
-            if (outNorm)
+            if (outNorm && Tcl_FSRenameFile(tmpPath, outNorm) == TCL_OK)
             {
                 Tcl_SetObjResult(interp, outNorm);
             }
             else
             {
-                Tcl_SetObjResult(interp, outObj);
+                /* Rename failed — clean up temp and report */
+                Tcl_FSDeleteFile(tmpPath);
+                if (Tcl_GetStringResult(interp)[0] == '\0')
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: failed to rename temp file to output path", -1));
+                rc = TCL_ERROR;
             }
+            Tcl_DecrRefCount(tmpPath);
         }
         else
         {
             Tcl_SetObjResult(interp, outObj);
         }
+    }
+    else if (weOpenedOut)
+    {
+        /* Serialization failed — remove the partial temp file */
+        Tcl_FSDeleteFile(tmpPath);
+        Tcl_DecrRefCount(tmpPath);
     }
     return rc;
 }
