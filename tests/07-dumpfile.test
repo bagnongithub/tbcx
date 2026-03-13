@@ -11,4 +11,78 @@ test dump.1 {dumpfile prints header & sections} -body {
     expr {[string match "*Procs: 1*" $d] && [string match "*top:*" $d]}
 } -result 1
 
+# ---- NEW TESTS ----
+
+# Dump includes TBCX header info (magic, format, version)
+test dump.2 {dump shows TBCX header} -body {
+    set out [makeFile "" dump.2-out.tbcx]
+    tbcx::save {return ok} $out
+    set d [tbcx::dump $out]
+    expr {[string match "*TBCX*" $d] || [string match "*magic*" $d] || [string match "*format*" $d]}
+} -result 1
+
+# Dump with multiple procs shows correct count
+test dump.3 {dump multiple procs count} -body {
+    set in  [makeFile {
+        proc a {} {return 1}
+        proc b {} {return 2}
+        proc c {} {return 3}
+        return [list [a] [b] [c]]
+    } dump.3-in.tcl]
+    set out [makeFile "" dump.3-out.tbcx]
+    tbcx::save $in $out
+    set d [tbcx::dump $out]
+    string match "*Procs: 3*" $d
+} -result 1
+
+# Dump with OO shows methods section
+test dump.4 {dump with OO methods} -body {
+    set in  [makeFile {
+        oo::class create Foo
+        oo::define Foo method bar {} {return baz}
+        set o [Foo new]
+        return [$o bar]
+    } dump.4-in.tcl]
+    set out [makeFile "" dump.4-out.tbcx]
+    tbcx::save $in $out
+    set d [tbcx::dump $out]
+    expr {[string match "*Method*" $d] || [string match "*method*" $d]}
+} -result 1
+
+# Dump with no procs
+test dump.5 {dump no procs} -body {
+    set out [makeFile "" dump.5-out.tbcx]
+    tbcx::save {return [expr {1+2}]} $out
+    set d [tbcx::dump $out]
+    string match "*Procs: 0*" $d
+} -result 1
+
+# Dump is a non-empty string
+test dump.6 {dump returns non-empty string} -body {
+    set out [makeFile "" dump.6-out.tbcx]
+    tbcx::save {return ok} $out
+    set d [tbcx::dump $out]
+    expr {[string length $d] > 10}
+} -result 1
+
+# Dump with AuxData shows aux info
+test dump.7 {dump with AuxData} -body {
+    set in  [makeFile {
+        proc sw {x} {
+            switch -exact -- $x {
+                a {return 1}
+                b {return 2}
+            }
+        }
+        return [sw a]
+    } dump.7-in.tcl]
+    set out [makeFile "" dump.7-out.tbcx]
+    tbcx::save $in $out
+    set d [tbcx::dump $out]
+    # Should show jumptable info
+    expr {[string match "*umptable*" $d] || [string match "*ux*" $d]}
+} -result 1
+
+
+
 cleanupTests

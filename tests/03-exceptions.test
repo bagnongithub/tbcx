@@ -16,4 +16,224 @@ test exc.1 {exception ranges: try/catch} -body {
     tbcx::load $out
 } -result FOO
 
+# ---- NEW TESTS ----
+
+# try/on/finally
+test exc.2 {try/on/finally} -body {
+    set in  [makeFile {
+        set trail {}
+        try {
+            lappend trail try
+            error BOOM
+        } on error {msg} {
+            lappend trail "caught:$msg"
+        } finally {
+            lappend trail finally
+        }
+        return $trail
+    } exc.2-in.tcl]
+    set out [makeFile "" exc.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {try caught:BOOM finally}
+
+# try/finally without error
+test exc.3 {try/finally no error} -body {
+    set in  [makeFile {
+        set trail {}
+        try {
+            lappend trail ok
+        } finally {
+            lappend trail finally
+        }
+        return $trail
+    } exc.3-in.tcl]
+    set out [makeFile "" exc.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {ok finally}
+
+# catch command
+test exc.4 {catch command} -body {
+    set in  [makeFile {
+        set rc [catch {expr {1/0}} msg]
+        return [list $rc [string match "*divide by zero*" $msg]]
+    } exc.4-in.tcl]
+    set out [makeFile "" exc.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 1}
+
+# catch with options
+test exc.5 {catch with options dict} -body {
+    set in  [makeFile {
+        set rc [catch {error "test" "test-info" {MYCODE}} msg opts]
+        return [list $rc $msg [dict get $opts -errorcode]]
+    } exc.5-in.tcl]
+    set out [makeFile "" exc.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 test MYCODE}
+
+# throw
+test exc.6 {throw command} -body {
+    set in  [makeFile {
+        try {
+            throw {MY ERROR CODE} "custom error"
+        } on error {msg opts} {
+            return [list $msg [dict get $opts -errorcode]]
+        }
+    } exc.6-in.tcl]
+    set out [makeFile "" exc.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{custom error} {MY ERROR CODE}}
+
+# trap handler
+test exc.7 {try/trap} -body {
+    set in  [makeFile {
+        try {
+            throw {ARITH DIVZERO} "divide by zero"
+        } trap {ARITH DIVZERO} {msg} {
+            return "trapped:$msg"
+        } on error {msg} {
+            return "generic:$msg"
+        }
+    } exc.7-in.tcl]
+    set out [makeFile "" exc.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {trapped:divide by zero}
+
+# Nested try/catch
+test exc.8 {nested try/catch} -body {
+    set in  [makeFile {
+        try {
+            try {
+                error "inner"
+            } on error {msg} {
+                error "rethrown:$msg"
+            }
+        } on error {msg} {
+            return $msg
+        }
+    } exc.8-in.tcl]
+    set out [makeFile "" exc.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result rethrown:inner
+
+# Exception in proc
+test exc.9 {exception in proc body} -body {
+    set in  [makeFile {
+        proc safediv {a b} {
+            try {
+                return [expr {$a / $b}]
+            } on error {msg} {
+                return "ERR"
+            }
+        }
+        return [list [safediv 10 2] [safediv 10 0]]
+    } exc.9-in.tcl]
+    set out [makeFile "" exc.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {5 ERR}
+
+# Multiple exception ranges (several try/catch in same proc)
+test exc.10 {multiple exception ranges in one proc} -body {
+    set in  [makeFile {
+        proc multi {} {
+            set r1 ""
+            set r2 ""
+            try {
+                error "first"
+            } on error {msg} {
+                set r1 $msg
+            }
+            try {
+                error "second"
+            } on error {msg} {
+                set r2 $msg
+            }
+            return "$r1|$r2"
+        }
+        return [multi]
+    } exc.10-in.tcl]
+    set out [makeFile "" exc.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result first|second
+
+# try/on ok handler
+test exc.11 {try/on ok} -body {
+    set in  [makeFile {
+        set result [try {
+            expr {2 + 3}
+        } on ok {val} {
+            set val
+        } on error {msg} {
+            set msg
+        }]
+        return $result
+    } exc.11-in.tcl]
+    set out [makeFile "" exc.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 5
+
+# Exception in foreach loop
+test exc.12 {exception in foreach} -body {
+    set in  [makeFile {
+        set results {}
+        foreach x {1 0 3} {
+            try {
+                lappend results [expr {10 / $x}]
+            } on error {} {
+                lappend results ERR
+            }
+        }
+        return $results
+    } exc.12-in.tcl]
+    set out [makeFile "" exc.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {10 ERR 3}
+
+# Return within try
+test exc.13 {return within try} -body {
+    set in  [makeFile {
+        proc earlyret {} {
+            try {
+                return "early"
+            } finally {
+                # finally still runs but cannot override return
+            }
+        }
+        return [earlyret]
+    } exc.13-in.tcl]
+    set out [makeFile "" exc.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result early
+
+# Break within try inside loop
+test exc.14 {break within try in loop} -body {
+    set in  [makeFile {
+        set res {}
+        foreach x {1 2 3 4 5} {
+            try {
+                if {$x == 3} break
+                lappend res $x
+            } on error {} {}
+        }
+        return $res
+    } exc.14-in.tcl]
+    set out [makeFile "" exc.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 2}
+
+
+
 cleanupTests

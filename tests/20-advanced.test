@@ -1,0 +1,215 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Apply with namespace
+test adv.1 {apply with namespace qualifier} -body {
+    set in  [makeFile {
+        namespace eval ::myns {}
+        set fn [list x {expr {$x * 10}} ::myns]
+        return [apply $fn 4]
+    } adv.1-in.tcl]
+    set out [makeFile "" adv.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 40
+
+# Higher-order: filter
+test adv.2 {higher-order filter with apply} -body {
+    set in  [makeFile {
+        proc filter {fn lst} {
+            set res {}
+            foreach x $lst {
+                if {[apply $fn $x]} { lappend res $x }
+            }
+            return $res
+        }
+        return [filter {x {expr {$x > 3}}} {1 2 3 4 5 6}]
+    } adv.2-in.tcl]
+    set out [makeFile "" adv.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {4 5 6}
+
+# Higher-order: map
+test adv.3 {higher-order map} -body {
+    set in  [makeFile {
+        proc mymap {fn lst} {
+            set res {}
+            foreach x $lst {
+                lappend res [apply $fn $x]
+            }
+            return $res
+        }
+        return [mymap {x {string toupper $x}} {hello world foo}]
+    } adv.3-in.tcl]
+    set out [makeFile "" adv.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {HELLO WORLD FOO}
+
+# Higher-order: reduce/fold
+test adv.4 {higher-order reduce} -body {
+    set in  [makeFile {
+        proc reduce {fn init lst} {
+            set acc $init
+            foreach x $lst {
+                set acc [apply $fn $acc $x]
+            }
+            return $acc
+        }
+        return [reduce {{a b} {expr {$a + $b}}} 0 {1 2 3 4 5}]
+    } adv.4-in.tcl]
+    set out [makeFile "" adv.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+# Multiple classes with inheritance chain
+test adv.5 {OO: inheritance chain} -body {
+    set in  [makeFile {
+        oo::class create Shape
+        oo::define Shape method type {} {return shape}
+        oo::class create Rectangle {superclass Shape}
+        oo::define Rectangle method type {} {return rectangle}
+        oo::class create Square {superclass Rectangle}
+        oo::define Square method type {} {return square}
+        set s [Square new]
+        return [$s type]
+    } adv.5-in.tcl]
+    set out [makeFile "" adv.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result square
+
+# OO with next (superclass method call)
+test adv.6 {OO: next for superclass delegation} -body {
+    set in  [makeFile {
+        oo::class create Logger
+        oo::define Logger method log {msg} {return "LOG:$msg"}
+        oo::class create PrefixLogger {superclass Logger}
+        oo::define PrefixLogger method log {msg} {
+            return [next "PREFIX:$msg"]
+        }
+        set l [PrefixLogger new]
+        return [$l log hello]
+    } adv.6-in.tcl]
+    set out [makeFile "" adv.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result LOG:PREFIX:hello
+
+# Proc generating procs
+test adv.7 {metaprogramming: proc creating procs} -body {
+    set in  [makeFile {
+        proc make_adder {n} {
+            proc "add$n" {x} "expr \{\$x + $n\}"
+        }
+        make_adder 10
+        make_adder 20
+        return [list [add10 5] [add20 5]]
+    } adv.7-in.tcl]
+    set out [makeFile "" adv.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {15 25}
+
+# Complex data structure (list of dicts)
+test adv.8 {complex data: list of dicts} -body {
+    set in  [makeFile {
+        proc make_person {name age} {
+            dict create name $name age $age
+        }
+        set people [list [make_person Alice 30] [make_person Bob 25]]
+        set names {}
+        foreach p $people {
+            lappend names [dict get $p name]
+        }
+        return $names
+    } adv.8-in.tcl]
+    set out [makeFile "" adv.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {Alice Bob}
+
+# String is command
+test adv.9 {string is: type checking} -body {
+    set in  [makeFile {
+        return [list \
+            [string is integer 42] \
+            [string is integer abc] \
+            [string is double 3.14] \
+            [string is alpha hello] \
+            [string is alpha "hello world"]]
+    } adv.9-in.tcl]
+    set out [makeFile "" adv.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 0 1 1 0}
+
+# Binary format/scan roundtrip
+test adv.10 {binary: format and scan} -body {
+    set in  [makeFile {
+        set packed [binary format "ii" 12345 67890]
+        binary scan $packed "ii" a b
+        return [list $a $b]
+    } adv.10-in.tcl]
+    set out [makeFile "" adv.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {12345 67890}
+
+# Ternary chained
+test adv.11 {chained ternary expressions} -body {
+    set in  [makeFile {
+        proc sign {x} {
+            expr {$x > 0 ? "positive" : $x < 0 ? "negative" : "zero"}
+        }
+        return [list [sign 5] [sign -3] [sign 0]]
+    } adv.11-in.tcl]
+    set out [makeFile "" adv.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {positive negative zero}
+
+# Clock operations
+test adv.12 {clock: format and scan} -body {
+    set in  [makeFile {
+        set t [clock scan "2025-06-15" -format "%Y-%m-%d" -gmt 1]
+        return [clock format $t -format "%Y-%m-%d" -gmt 1]
+    } adv.12-in.tcl]
+    set out [makeFile "" adv.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 2025-06-15
+
+# Interp alias (command aliasing)
+test adv.13 {interp alias} -body {
+    set in  [makeFile {
+        proc myadd {a b} {expr {$a + $b}}
+        interp alias {} plus {} myadd
+        return [plus 10 20]
+    } adv.13-in.tcl]
+    set out [makeFile "" adv.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 30
+
+# Complex: Fibonacci memoized
+test adv.14 {memoized fibonacci} -body {
+    set in  [makeFile {
+        proc fib {n} {
+            if {[info exists ::memo($n)]} {return $::memo($n)}
+            if {$n <= 1} {set ::memo($n) $n; return $n}
+            set ::memo($n) [expr {[fib [expr {$n-1}]] + [fib [expr {$n-2}]]}]
+            return $::memo($n)
+        }
+        return [fib 20]
+    } adv.14-in.tcl]
+    set out [makeFile "" adv.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 6765
+
+cleanupTests

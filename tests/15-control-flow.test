@@ -1,0 +1,188 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# While loop with break
+test flow.1 {while with break} -body {
+    set in  [makeFile {
+        set i 0
+        set res {}
+        while {1} {
+            if {$i >= 5} break
+            lappend res $i
+            incr i
+        }
+        return $res
+    } flow.1-in.tcl]
+    set out [makeFile "" flow.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 2 3 4}
+
+# While loop with continue
+test flow.2 {while with continue} -body {
+    set in  [makeFile {
+        set res {}
+        set i 0
+        while {$i < 10} {
+            incr i
+            if {$i % 2 == 0} continue
+            lappend res $i
+        }
+        return $res
+    } flow.2-in.tcl]
+    set out [makeFile "" flow.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 3 5 7 9}
+
+# For loop with break
+test flow.3 {for with break} -body {
+    set in  [makeFile {
+        set res {}
+        for {set i 0} {$i < 100} {incr i} {
+            if {$i >= 3} break
+            lappend res $i
+        }
+        return $res
+    } flow.3-in.tcl]
+    set out [makeFile "" flow.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 2}
+
+# Nested loops with break (inner only)
+test flow.4 {nested loops: inner break} -body {
+    set in  [makeFile {
+        set res {}
+        for {set i 0} {$i < 3} {incr i} {
+            for {set j 0} {$j < 5} {incr j} {
+                if {$j >= 2} break
+                lappend res "$i.$j"
+            }
+        }
+        return $res
+    } flow.4-in.tcl]
+    set out [makeFile "" flow.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0.0 0.1 1.0 1.1 2.0 2.1}
+
+# Tailcall
+test flow.5 {tailcall} -body {
+    set in  [makeFile {
+        proc tcloop {n acc} {
+            if {$n <= 0} {return $acc}
+            tailcall tcloop [expr {$n - 1}] [expr {$acc + $n}]
+        }
+        return [tcloop 100 0]
+    } flow.5-in.tcl]
+    set out [makeFile "" flow.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 5050
+
+# If/elseif/else chain
+test flow.6 {if/elseif/else chain} -body {
+    set in  [makeFile {
+        proc classify {n} {
+            if {$n < 0} {
+                return negative
+            } elseif {$n == 0} {
+                return zero
+            } elseif {$n < 10} {
+                return small
+            } else {
+                return big
+            }
+        }
+        return [list [classify -5] [classify 0] [classify 3] [classify 100]]
+    } flow.6-in.tcl]
+    set out [makeFile "" flow.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {negative zero small big}
+
+# Ternary-style expr
+test flow.7 {ternary expression} -body {
+    set in  [makeFile {
+        proc abs {x} {
+            return [expr {$x >= 0 ? $x : -$x}]
+        }
+        return [list [abs 5] [abs -3] [abs 0]]
+    } flow.7-in.tcl]
+    set out [makeFile "" flow.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {5 3 0}
+
+# Return with -code (custom return code)
+test flow.8 {return -code break in proc} -body {
+    set in  [makeFile {
+        proc breakloop {} {
+            return -code break
+        }
+        set res {}
+        foreach x {1 2 3 4 5} {
+            if {$x == 3} { breakloop }
+            lappend res $x
+        }
+        return $res
+    } flow.8-in.tcl]
+    set out [makeFile "" flow.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 2}
+
+# Coroutine basic
+test flow.9 {coroutine basic yield} -body {
+    set in  [makeFile {
+        proc gen {} {
+            yield
+            yield 1
+            yield 2
+            yield 3
+        }
+        coroutine mygen gen
+        set res [list [mygen] [mygen] [mygen]]
+        return $res
+    } flow.9-in.tcl]
+    set out [makeFile "" flow.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 2 3}
+
+# After/vwait not applicable, but test "after idle" equivalent
+# Simple eval with uplevel
+test flow.10 {uplevel in proc} -body {
+    set in  [makeFile {
+        proc setvar {name val} {
+            uplevel 1 [list set $name $val]
+        }
+        setvar myvar 42
+        return $myvar
+    } flow.10-in.tcl]
+    set out [makeFile "" flow.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+# Return with -level
+test flow.11 {return from nested call} -body {
+    set in  [makeFile {
+        proc inner {} {
+            return -level 2 "from inner"
+        }
+        proc outer {} {
+            inner
+            return "not reached"
+        }
+        return [outer]
+    } flow.11-in.tcl]
+    set out [makeFile "" flow.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {from inner}
+
+cleanupTests

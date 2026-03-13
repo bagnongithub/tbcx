@@ -1,0 +1,970 @@
+# -*-Tcl-*-
+# 23-all-features.test — TBCX test harness for the comprehensive
+# tcl91_all_features.tcl language exerciser.
+#
+# This test file verifies that every Tcl 9.1 construct exercised by
+# tcl91_all_features.tcl survives a full tbcx::save → tbcx::load
+# roundtrip, including: all grammatical constructs, all data types,
+# all control-flow statements, all expression operators, coroutines,
+# tailcall, upvar/uplevel, namespaces, and the full TclOO object
+# system (classmethod, private, forward, filter, mixin, initialise,
+# oo::abstract, oo::singleton, oo::copy, oo::objdefine, metaclass,
+# info object / info class, and more).
+#
+# The tcl91_all_features.tcl script must be in the same directory as
+# this test file.
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Locate the all-features script next to this test file
+set featuresScript [file join [file dirname [info script]] tcl91_all_features.tcl]
+testConstraint have_features_script [file readable $featuresScript]
+
+# --------------------------------------------------------------------------
+# Helper: run tbcx::load of a .tbcx file inside a fresh child interp,
+# with exit overridden, returning a dict of {rc result errorinfo pass fail errors}.
+# --------------------------------------------------------------------------
+proc loadInChild {interpName tbcxPath} {
+    interp create $interpName
+    interp eval $interpName [list package require tbcx]
+    # Override exit so assertion failures inside the script don't kill us.
+    interp eval $interpName {
+        proc exit {args} {
+            error "TBCX_FEATURES_EXIT [lindex $args 0]"
+        }
+    }
+
+    set rc [interp eval $interpName [list catch [list tbcx::load $tbcxPath] _res _opts]]
+    set result [interp eval $interpName {set _res}]
+
+    set errorinfo ""
+    catch {set errorinfo [interp eval $interpName {dict get $_opts -errorinfo}]}
+
+    set pass 0
+    set fail 0
+    set errors {}
+    catch {set pass [interp eval $interpName {set ::_pass}]}
+    catch {set fail [interp eval $interpName {set ::_fail}]}
+    if {$fail > 0} {
+        catch {set errors [interp eval $interpName {set ::_errors}]}
+    }
+    interp delete $interpName
+
+    return [dict create rc $rc result $result errorinfo $errorinfo \
+                         pass $pass fail $fail errors $errors]
+}
+
+# --------------------------------------------------------------------------
+# Helper: run the script via source inside a fresh child interp,
+# returning same dict shape as loadInChild.
+# --------------------------------------------------------------------------
+proc sourceInChild {interpName tclPath} {
+    interp create $interpName
+    interp eval $interpName {
+        proc exit {args} {
+            error "TBCX_FEATURES_EXIT [lindex $args 0]"
+        }
+    }
+
+    set rc [interp eval $interpName [list catch [list source $tclPath] _res _opts]]
+    set result [interp eval $interpName {set _res}]
+
+    set errorinfo ""
+    catch {set errorinfo [interp eval $interpName {dict get $_opts -errorinfo}]}
+
+    set pass 0
+    set fail 0
+    set errors {}
+    catch {set pass [interp eval $interpName {set ::_pass}]}
+    catch {set fail [interp eval $interpName {set ::_fail}]}
+    if {$fail > 0} {
+        catch {set errors [interp eval $interpName {set ::_errors}]}
+    }
+    interp delete $interpName
+
+    return [dict create rc $rc result $result errorinfo $errorinfo \
+                         pass $pass fail $fail errors $errors]
+}
+
+# ==========================================================================
+# af.0  Sanity: the features script passes when sourced directly
+# ==========================================================================
+test af.0 {sanity: tcl91_all_features.tcl passes under source} \
+    -constraints have_features_script -body {
+
+    set info [sourceInChild SRC0 $featuresScript]
+    set fail [dict get $info fail]
+    set pass [dict get $info pass]
+    set rc   [dict get $info rc]
+
+    if {$fail != 0} {
+        error "$fail assertion(s) failed under source: [dict get $info errors]"
+    }
+    if {$rc != 0} {
+        error "source errored after $pass assertions: [dict get $info result]\n[dict get $info errorinfo]"
+    }
+    # Must have a significant number of assertions
+    expr {$pass > 400}
+} -result 1
+
+# ==========================================================================
+# af.1  Save + load + verify all 400+ internal assertions pass
+# ==========================================================================
+test af.1 {all features: save + load + all assertions pass} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.1-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set info [loadInChild AF1 $out]
+    set fail [dict get $info fail]
+    set pass [dict get $info pass]
+    set rc   [dict get $info rc]
+
+    if {$fail != 0} {
+        error "$fail assertion failure(s) out of [expr {$pass + $fail}]: [dict get $info errors]"
+    }
+    if {$rc != 0} {
+        error "tbcx::load error after $pass assertions: [dict get $info result]\n[dict get $info errorinfo]"
+    }
+    # Must pass 400+ assertions
+    expr {$pass > 400}
+} -result 1
+
+# ==========================================================================
+# af.2  Verify the .tbcx is a valid binary (correct magic, format, size)
+# ==========================================================================
+test af.2 {all features: compiled .tbcx has valid header} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.2-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set tbcxSize [file size $out]
+
+    # Read header: 4 bytes magic + 4 bytes format
+    set f [open $out rb]
+    set magic [read $f 4]
+    set fmtBytes [read $f 4]
+    close $f
+
+    # Magic must be "TBCX" (little-endian 0x58434254)
+    set magicOk [expr {$magic eq "TBCX"}]
+
+    # Format version 91, little-endian uint32 → 0x5B000000
+    binary scan $fmtBytes iu fmtVal
+    set fmtOk [expr {$fmtVal == 91}]
+
+    # Non-trivial size — source is ~2000 lines, bytecode should be substantial
+    set sizeOk [expr {$tbcxSize > 4096}]
+
+    list $magicOk $fmtOk $sizeOk
+} -result {1 1 1}
+
+# ==========================================================================
+# af.3  Dump is well-formed and contains all expected structural sections
+# ==========================================================================
+test af.3 {all features: dump contains all structural sections} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.3-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set dump [tbcx::dump $out]
+
+    set checks 0
+    foreach pat {
+        "TBCX Header:*"
+        "*magic = 0x58434254*"
+        "*format = 91*"
+        "*Top-level block:*"
+        "*Procs: *"
+        "*Classes: *"
+        "*Methods: *"
+    } {
+        if {[string match $pat $dump]} {
+            incr checks
+        }
+    }
+    set checks
+} -result 7
+
+# ==========================================================================
+# af.4  Deterministic re-load: two loads produce identical pass/fail counts
+# ==========================================================================
+test af.4 {all features: deterministic re-load} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.4-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set results {}
+    foreach tag {A B} {
+        set info [loadInChild AF4$tag $out]
+        lappend results [list [dict get $info pass] [dict get $info fail]]
+    }
+
+    # Both runs must produce identical pass/fail counts, zero failures
+    set eq [expr {[lindex $results 0] eq [lindex $results 1]}]
+    set noFail [expr {[lindex [lindex $results 0] 1] == 0}]
+    list $eq $noFail
+} -result {1 1}
+
+# ==========================================================================
+# af.5  Channel-based save and load (not file-path)
+# ==========================================================================
+test af.5 {all features: channel-based save and load} \
+    -constraints have_features_script -body {
+
+    set tbcxPath [makeFile "" af.5-out.tbcx]
+
+    # Save: read source from channel, write to channel
+    set inCh [open $featuresScript r]
+    set outCh [open $tbcxPath w]
+    fconfigure $outCh -translation binary
+    tbcx::save $inCh $outCh
+    close $inCh
+    close $outCh
+
+    # Load from channel via child interp
+    set ch [open $tbcxPath r]
+    interp create AF5
+    interp eval AF5 [list package require tbcx]
+    interp eval AF5 {proc exit {args} {error "exit $args"}}
+    interp transfer {} $ch AF5
+    set rc [interp eval AF5 [list catch [list tbcx::load $ch] _r _o]]
+    set pass 0; set fail 0
+    catch {set pass [interp eval AF5 {set ::_pass}]}
+    catch {set fail [interp eval AF5 {set ::_fail}]}
+    interp eval AF5 [list catch [list close $ch]]
+    interp delete AF5
+
+    if {$fail != 0} {
+        error "$fail assertion failure(s) via channel load"
+    }
+    if {$rc != 0} {
+        error "channel load error after $pass assertions"
+    }
+    expr {$pass > 400}
+} -result 1
+
+# ==========================================================================
+# af.6  Source vs compiled equivalence: pass counts must match
+# ==========================================================================
+test af.6 {all features: source and compiled produce identical assertion counts} \
+    -constraints have_features_script -body {
+
+    # Run via source
+    set srcInfo [sourceInChild AF6SRC $featuresScript]
+    set srcPass [dict get $srcInfo pass]
+    set srcFail [dict get $srcInfo fail]
+
+    # Compile and run via tbcx::load
+    set out [makeFile "" af.6-out.tbcx]
+    tbcx::save $featuresScript $out
+    set bcInfo [loadInChild AF6BC $out]
+    set bcPass [dict get $bcInfo pass]
+    set bcFail [dict get $bcInfo fail]
+
+    # Both must have 0 failures and identical pass counts
+    list [expr {$srcFail == 0}] [expr {$bcFail == 0}] [expr {$srcPass == $bcPass}]
+} -result {1 1 1}
+
+# ==========================================================================
+# af.7  Dump reports correct proc count
+#        The features script defines dozens of procs (factorial, classify,
+#        sw_str, add, greet, sum_all, etc.).
+# ==========================================================================
+test af.7 {all features: dump reports expected number of procs} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.7-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set dump [tbcx::dump $out]
+
+    if {![regexp {Procs: (\d+)} $dump -> nProcs]} {
+        error "Could not find Procs count in dump"
+    }
+    # The features script defines 40+ explicit procs (add, greet, sum_all,
+    # factorial, classify, sw_str, sw_exact, sw_glob, sw_re, hof_map,
+    # hof_filter, hof_fold, gen_numbers, counter_gen, echo_gen, fib_gen,
+    # tc_loop, tc_even, tc_odd, divmod, make_adder, dispatch, deep_if,
+    # big_switch, gen_proc_0..gen_proc_19, trace_handler, etc.)
+    expr {$nProcs >= 40}
+} -result 1
+
+# ==========================================================================
+# af.8  Dump reports OO classes and methods
+#        The features script defines many classes: Point, Counter, Shape,
+#        Circle, ColorCircle, Widget, Access, Forwarder, Serializable,
+#        Loggable, Item, Filtered, Registry, Vault, Base, Reflective,
+#        Copyable, AbstractAnimal, Dog, SingleService, TrackedMeta,
+#        TrackedClass, WithInit, SelfTest, MethodOptions, A/B/C/D_diamond,
+#        Base39/Mid39/Top39, DtorBase/DtorMid/DtorTop, VarIntrospect,
+#        SharedState, Accumulator, Processor, etc.
+# ==========================================================================
+test af.8 {all features: dump reports OO classes and methods} \
+    -constraints have_features_script -body {
+
+    set out [makeFile "" af.8-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set dump [tbcx::dump $out]
+
+    set nCls 0
+    set nMeth 0
+    if {[regexp {Classes: (\d+)} $dump -> n]} { set nCls $n }
+    if {[regexp {Methods: (\d+)} $dump -> n]} { set nMeth $n }
+
+    # 30+ classes, 50+ methods expected
+    list [expr {$nCls >= 30}] [expr {$nMeth >= 50}]
+} -result {1 1}
+
+# ==========================================================================
+# af.9  Source obscurity: representative proc/method bodies must not
+#        appear verbatim in the .tbcx binary.
+# ==========================================================================
+test af.9 {all features: proc/method source bodies not in .tbcx binary} \
+    -constraints have_features_script \
+    -setup {
+        # Body fragments that should be compiled away (not stored as source).
+        # These are unique enough to avoid false positives from string literals.
+        set needle_factorial "return \[expr \{\$n * \[factorial"
+        set needle_classify  "return \"negative\""
+        set needle_assert_match "string match \$pattern \$got"
+        set needle_deep_if  "elseif \{\$n == 7\} \{ return 7"
+    } \
+    -body {
+
+    set out [makeFile "" af.9-out.tbcx]
+    tbcx::save $featuresScript $out
+
+    set f [open $out rb]
+    set raw [read $f]
+    close $f
+
+    set problems {}
+    foreach {label needle} [list \
+        factorial  $needle_factorial  \
+        classify   $needle_classify   \
+        assert     $needle_assert_match \
+        deep_if    $needle_deep_if    \
+    ] {
+        if {[string first $needle $raw] >= 0} {
+            lappend problems "$label body source found in binary"
+        }
+    }
+    if {[llength $problems] > 0} {
+        error "source leak: $problems"
+    }
+    expr {1}
+} -result 1
+
+# ==========================================================================
+# af.10  Specific feature: coroutines survive roundtrip
+# ==========================================================================
+test af.10 {all features: coroutines work after tbcx roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc fib_gen {} {
+            yield [info coroutine]
+            set a 0; set b 1
+            while {1} {
+                yield $a
+                lassign [list $b [expr {$a + $b}]] a b
+            }
+        }
+        coroutine fib fib_gen
+        set result {}
+        for {set i 0} {$i < 8} {incr i} { lappend result [fib] }
+        rename fib ""
+        return $result
+    } af.10-in.tcl]
+    set out [makeFile "" af.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 1 2 3 5 8 13}
+
+# ==========================================================================
+# af.11  Specific feature: tailcall survives roundtrip
+# ==========================================================================
+test af.11 {all features: tailcall works after tbcx roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc tc_sum {n acc} {
+            if {$n <= 0} { return $acc }
+            tailcall tc_sum [expr {$n - 1}] [expr {$acc + $n}]
+        }
+        return [tc_sum 100 0]
+    } af.11-in.tcl]
+    set out [makeFile "" af.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 5050
+
+# ==========================================================================
+# af.12  Specific feature: oo::abstract / oo::singleton survive roundtrip
+# ==========================================================================
+test af.12 {all features: oo::abstract and oo::singleton after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        # Abstract class — cannot be instantiated directly
+        oo::abstract create AbstractBase {
+            method get {} { my variable val_; return $val_ }
+        }
+        set abstractOk [catch {AbstractBase new} msg]
+
+        # Concrete subclass
+        oo::class create Concrete {
+            superclass AbstractBase
+            constructor {v} { my variable val_; set val_ $v }
+        }
+        set obj [Concrete new 42]
+        set concreteVal [$obj get]
+        $obj destroy
+
+        # Singleton — all new calls return same object
+        oo::singleton create MySingleton {
+            constructor {} { my variable state_; set state_ "init" }
+            method state {} { my variable state_; return $state_ }
+            method set_state {s} { my variable state_; set state_ $s }
+        }
+        set s1 [MySingleton new]
+        set s2 [MySingleton new]
+        set sameObj [expr {$s1 eq $s2}]
+        $s1 set_state "changed"
+        set sharedState [$s2 state]
+
+        return [list $abstractOk $concreteVal $sameObj $sharedState]
+    } af.12-in.tcl]
+    set out [makeFile "" af.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 42 1 changed}
+
+# ==========================================================================
+# af.13  Specific feature: classmethod + initialise + classvariable
+# ==========================================================================
+test af.13 {all features: classmethod + initialise + classvariable after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Reg {
+            initialize {
+                variable instances
+                set instances 0
+            }
+            classmethod count {} {
+                variable instances
+                return $instances
+            }
+            constructor {} {
+                classvariable instances
+                incr instances
+            }
+        }
+        set r1 [Reg new]
+        set r2 [Reg new]
+        set r3 [Reg new]
+        set c [Reg count]
+        # Also call on instance
+        set ci [$r1 count]
+        return [list $c $ci]
+    } af.13-in.tcl]
+    set out [makeFile "" af.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {3 3}
+
+# ==========================================================================
+# af.14  Specific feature: private methods + private variables
+# ==========================================================================
+test af.14 {all features: private methods and variables after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Safe {
+            private {
+                variable secret
+                method _internal {} { return "secret=$secret" }
+            }
+            constructor {s} { set secret $s }
+            method reveal {} { my _internal }
+        }
+        set obj [Safe new "hidden"]
+        set val [$obj reveal]
+        set err [catch {$obj _internal} msg]
+        return [list $val $err]
+    } af.14-in.tcl]
+    set out [makeFile "" af.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {secret=hidden 1}
+
+# ==========================================================================
+# af.15  Specific feature: forward (method forwarding)
+# ==========================================================================
+test af.15 {all features: forward after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc ::myhelper {args} { return "H:[join $args ,]" }
+        oo::class create Fwd {
+            forward help ::myhelper
+            forward len llength
+        }
+        set o [Fwd new]
+        set r1 [$o help a b c]
+        set r2 [$o len {1 2 3 4 5}]
+        $o destroy
+        return [list $r1 $r2]
+    } af.15-in.tcl]
+    set out [makeFile "" af.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {H:a,b,c 5}
+
+# ==========================================================================
+# af.16  Specific feature: filter (method call interception)
+# ==========================================================================
+test af.16 {all features: filter after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Logged {
+            variable log_
+            constructor {} { set log_ {} }
+            method greet {} { return "hi" }
+            method farewell {} { return "bye" }
+            method getLog {} { return $log_ }
+            method Track {args} {
+                lappend log_ [lindex [self target] 1]
+                next {*}$args
+            }
+            filter Track
+        }
+        set o [Logged new]
+        $o greet
+        $o farewell
+        set log [$o getLog]
+        $o destroy
+        expr {[lsearch $log greet] >= 0 && [lsearch $log farewell] >= 0}
+    } af.16-in.tcl]
+    set out [makeFile "" af.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1
+
+# ==========================================================================
+# af.17  Specific feature: mixin (class-level + object-level)
+# ==========================================================================
+test af.17 {all features: mixin after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Describable {
+            method describe {} { return "I am [self]" }
+        }
+        oo::class create Cfg {
+            variable host_
+            constructor {h} { set host_ $h }
+            method host {} { return $host_ }
+        }
+        # Class-level mixin
+        oo::define Cfg mixin Describable
+        set c [Cfg new "localhost"]
+        set r1 [$c host]
+        set r2 [string match "I am *" [$c describe]]
+
+        # Object-level mixin (per-object)
+        oo::class create Extra {
+            method bonus {} { return "bonus!" }
+        }
+        oo::objdefine $c mixin -append Extra
+        set r3 [$c bonus]
+        $c destroy
+        return [list $r1 $r2 $r3]
+    } af.17-in.tcl]
+    set out [makeFile "" af.17-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {localhost 1 bonus!}
+
+# ==========================================================================
+# af.18  Specific feature: oo::copy
+# ==========================================================================
+test af.18 {all features: oo::copy after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Clonable {
+            variable v_
+            constructor {v} { set v_ $v }
+            method get {} { return $v_ }
+            method set {v} { set v_ $v }
+        }
+        set orig [Clonable new 100]
+        set copy [oo::copy $orig]
+        $copy set 200
+        set r1 [$orig get]
+        set r2 [$copy get]
+        $orig destroy
+        $copy destroy
+        return [list $r1 $r2]
+    } af.18-in.tcl]
+    set out [makeFile "" af.18-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {100 200}
+
+# ==========================================================================
+# af.19  Specific feature: metaclass
+# ==========================================================================
+test af.19 {all features: metaclass after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create CountingMeta {
+            superclass oo::class
+            variable count_
+            constructor {args} {
+                set count_ 0
+                next {*}$args
+            }
+            method new {args} {
+                incr count_
+                next {*}$args
+            }
+            method count {} { return $count_ }
+        }
+        CountingMeta create MyClass {
+            variable x_
+            constructor {x} { set x_ $x }
+            method get {} { return $x_ }
+        }
+        set a [MyClass new 1]
+        set b [MyClass new 2]
+        set c [MyClass new 3]
+        set cnt [MyClass count]
+        return [list $cnt [$a get] [$b get] [$c get]]
+    } af.19-in.tcl]
+    set out [makeFile "" af.19-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {3 1 2 3}
+
+# ==========================================================================
+# af.20  Specific feature: diamond inheritance with next chain
+# ==========================================================================
+test af.20 {all features: diamond inheritance MRO after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create A { method who {} { return "A" } }
+        oo::class create B { superclass A; method who {} { return "B->[next]" } }
+        oo::class create C { superclass A; method who {} { return "C->[next]" } }
+        oo::class create D { superclass B C; method who {} { return "D->[next]" } }
+        set d [D new]
+        set r [$d who]
+        $d destroy
+        return $r
+    } af.20-in.tcl]
+    set out [makeFile "" af.20-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {D->B->C->A}
+
+# ==========================================================================
+# af.21  Specific feature: upvar + uplevel inside procs
+# ==========================================================================
+test af.21 {all features: upvar and uplevel after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc setter {varname val} {
+            upvar 1 $varname v
+            set v $val
+        }
+        proc runner {script} {
+            uplevel 1 $script
+        }
+        set x 0
+        setter x 42
+        set y 0
+        runner {set y 99}
+        return [list $x $y]
+    } af.21-in.tcl]
+    set out [makeFile "" af.21-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {42 99}
+
+# ==========================================================================
+# af.22  Specific feature: complex lambdas (higher-order, namespace)
+# ==========================================================================
+test af.22 {all features: complex lambdas after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc hmap {fn lst} {
+            set r {}
+            foreach x $lst { lappend r [apply $fn $x] }
+            return $r
+        }
+        proc hfilter {fn lst} {
+            set r {}
+            foreach x $lst { if {[apply $fn $x]} { lappend r $x } }
+            return $r
+        }
+        proc hfold {fn init lst} {
+            set a $init
+            foreach x $lst { set a [apply $fn $a $x] }
+            return $a
+        }
+        set squares [hmap {{x} {expr {$x*$x}}} {1 2 3 4 5}]
+        set big [hfilter {{x} {expr {$x > 10}}} $squares]
+        set total [hfold {{a b} {expr {$a + $b}}} 0 $big]
+        return [list $squares $big $total]
+    } af.22-in.tcl]
+    set out [makeFile "" af.22-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{1 4 9 16 25} {16 25} 41}
+
+# ==========================================================================
+# af.23  Specific feature: namespace ensemble
+# ==========================================================================
+test af.23 {all features: namespace ensemble after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        namespace eval ::calc {
+            namespace export add sub mul
+            namespace ensemble create
+            proc add {a b} { expr {$a + $b} }
+            proc sub {a b} { expr {$a - $b} }
+            proc mul {a b} { expr {$a * $b} }
+        }
+        return [list [calc add 10 3] [calc sub 10 3] [calc mul 10 3]]
+    } af.23-in.tcl]
+    set out [makeFile "" af.23-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {13 7 30}
+
+# ==========================================================================
+# af.24  Specific feature: dict update (DictUpdateInfo AuxData)
+# ==========================================================================
+test af.24 {all features: dict update AuxData after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        set d [dict create x 10 y 20 z 30]
+        dict update d x X y Y {
+            set X [expr {$X * 2}]
+            set Y [expr {$Y * 3}]
+        }
+        return [list [dict get $d x] [dict get $d y] [dict get $d z]]
+    } af.24-in.tcl]
+    set out [makeFile "" af.24-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {20 60 30}
+
+# ==========================================================================
+# af.25  Specific feature: switch with many arms (jump table AuxData)
+# ==========================================================================
+test af.25 {all features: large switch jump table after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        proc classify {ch} {
+            switch $ch {
+                a { return vowel }
+                b { return consonant }
+                c { return consonant }
+                d { return consonant }
+                e { return vowel }
+                f { return consonant }
+                g { return consonant }
+                h { return consonant }
+                i { return vowel }
+                j { return consonant }
+                k { return consonant }
+                l { return consonant }
+                m { return consonant }
+                n { return consonant }
+                o { return vowel }
+                p { return consonant }
+                q { return consonant }
+                r { return consonant }
+                s { return consonant }
+                t { return consonant }
+                u { return vowel }
+                default { return other }
+            }
+        }
+        return [list [classify a] [classify b] [classify u] [classify z]]
+    } af.25-in.tcl]
+    set out [makeFile "" af.25-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {vowel consonant vowel other}
+
+# ==========================================================================
+# af.26  Specific feature: try/trap/finally with nested loops
+# ==========================================================================
+test af.26 {all features: try/trap/finally with nested loops after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        set results {}
+        for {set i 0} {$i < 5} {incr i} {
+            try {
+                if {$i == 2} { throw {SKIP} "skip" }
+                if {$i == 4} { error "err" }
+                lappend results "ok:$i"
+            } trap {SKIP} {msg} {
+                lappend results "skip:$i"
+            } on error {msg} {
+                lappend results "err:$i"
+            } finally {
+                lappend results "fin:$i"
+            }
+        }
+        return $results
+    } af.26-in.tcl]
+    set out [makeFile "" af.26-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {ok:0 fin:0 ok:1 fin:1 skip:2 fin:2 ok:3 fin:3 err:4 fin:4}
+
+# ==========================================================================
+# af.27  Specific feature: oo::objdefine per-object methods
+# ==========================================================================
+test af.27 {all features: oo::objdefine after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Base27 {
+            method hello {} { return "base" }
+        }
+        set obj [Base27 new]
+        oo::objdefine $obj {
+            method hello {} { return "custom" }
+            method extra {} { return "added" }
+        }
+        set r1 [$obj hello]
+        set r2 [$obj extra]
+        $obj destroy
+        return [list $r1 $r2]
+    } af.27-in.tcl]
+    set out [makeFile "" af.27-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {custom added}
+
+# ==========================================================================
+# af.28  Specific feature: destructor chain with next
+# ==========================================================================
+test af.28 {all features: destructor chain after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        set ::dlog {}
+        oo::class create DBase {
+            destructor { lappend ::dlog "DBase" }
+        }
+        oo::class create DMid {
+            superclass DBase
+            destructor { lappend ::dlog "DMid"; next }
+        }
+        oo::class create DTop {
+            superclass DMid
+            destructor { lappend ::dlog "DTop"; next }
+        }
+        set o [DTop new]
+        $o destroy
+        return $::dlog
+    } af.28-in.tcl]
+    set out [makeFile "" af.28-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {DTop DMid DBase}
+
+# ==========================================================================
+# af.29  Specific feature: info object / info class introspection
+# ==========================================================================
+test af.29 {all features: OO introspection after roundtrip} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        oo::class create Intro {
+            method x {} { return 1 }
+            method y {} { return 2 }
+        }
+        set o [Intro new]
+        set cls [info object class $o]
+        set isObj [info object isa object $o]
+        set methods [lsort [info class methods Intro]]
+        set isInst [expr {$o in [info class instances Intro]}]
+        $o destroy
+        return [list $cls $isObj $methods $isInst]
+    } af.29-in.tcl]
+    set out [makeFile "" af.29-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {::Intro 1 {x y} 1}
+
+# ==========================================================================
+# af.30  Combined: OO + coroutine + lambda + namespace in one script
+# ==========================================================================
+test af.30 {all features: combined OO + coroutine + lambda + namespace} \
+    -constraints have_features_script -body {
+
+    set in [makeFile {
+        namespace eval ::combo {
+            oo::class create Pipeline {
+                variable stages_
+                constructor {args} { set stages_ $args }
+                method run {input} {
+                    set val $input
+                    foreach fn $stages_ {
+                        set val [apply $fn $val]
+                    }
+                    return $val
+                }
+            }
+
+            proc gen_range {} {
+                yield [info coroutine]
+                set i 0
+                while {$i < 5} { yield $i; incr i }
+            }
+        }
+        set pipe [::combo::Pipeline new \
+            {{x} {expr {$x * 2}}} \
+            {{x} {expr {$x + 1}}} \
+        ]
+        coroutine myrange ::combo::gen_range
+        set results {}
+        while {1} {
+            set val [myrange]
+            if {$val eq ""} break
+            lappend results [$pipe run $val]
+        }
+        $pipe destroy
+        return $results
+    } af.30-in.tcl]
+    set out [makeFile "" af.30-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 3 5 7 9}
+
+cleanupTests

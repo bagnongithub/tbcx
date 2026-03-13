@@ -1,0 +1,263 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Math expressions
+test expr.1 {expr: arithmetic} -body {
+    set in  [makeFile {return [expr {(2 + 3) * 4 - 1}]} expr.1-in.tcl]
+    set out [makeFile "" expr.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 19
+
+test expr.2 {expr: modulo and division} -body {
+    set in  [makeFile {return [list [expr {17 / 5}] [expr {17 % 5}]]} expr.2-in.tcl]
+    set out [makeFile "" expr.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {3 2}
+
+test expr.3 {expr: floating point math} -body {
+    set in  [makeFile {return [expr {sqrt(144.0)}]} expr.3-in.tcl]
+    set out [makeFile "" expr.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 12.0
+
+test expr.4 {expr: comparison operators} -body {
+    set in  [makeFile {
+        return [list [expr {1 < 2}] [expr {2 > 3}] [expr {5 == 5}] [expr {5 != 6}]]
+    } expr.4-in.tcl]
+    set out [makeFile "" expr.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 0 1 1}
+
+test expr.5 {expr: logical operators} -body {
+    set in  [makeFile {
+        return [list [expr {1 && 0}] [expr {1 || 0}] [expr {!0}] [expr {!1}]]
+    } expr.5-in.tcl]
+    set out [makeFile "" expr.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 1 0}
+
+test expr.6 {expr: bitwise operators} -body {
+    set in  [makeFile {
+        return [list [expr {0xFF & 0x0F}] [expr {0xF0 | 0x0F}] [expr {0xFF ^ 0xF0}] [expr {1 << 8}]]
+    } expr.6-in.tcl]
+    set out [makeFile "" expr.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {15 255 15 256}
+
+test expr.7 {expr: power operator} -body {
+    set in  [makeFile {return [expr {2**16}]} expr.7-in.tcl]
+    set out [makeFile "" expr.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 65536
+
+test expr.8 {expr: math functions} -body {
+    set in  [makeFile {
+        return [list [expr {abs(-42)}] [expr {max(3,7)}] [expr {min(3,7)}]]
+    } expr.8-in.tcl]
+    set out [makeFile "" expr.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {42 7 3}
+
+# String operations
+test string.1 {string: length and index} -body {
+    set in  [makeFile {
+        set s "hello"
+        return [list [string length $s] [string index $s 1]]
+    } string.1-in.tcl]
+    set out [makeFile "" string.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {5 e}
+
+test string.2 {string: range} -body {
+    set in  [makeFile {return [string range "abcdefgh" 2 5]} string.2-in.tcl]
+    set out [makeFile "" string.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result cdef
+
+test string.3 {string: map} -body {
+    set in  [makeFile {return [string map {a A e E i I} "abcdefi"]} string.3-in.tcl]
+    set out [makeFile "" string.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result AbcdEfI
+
+test string.4 {string: toupper/tolower} -body {
+    set in  [makeFile {
+        return [list [string toupper "hello"] [string tolower "WORLD"]]
+    } string.4-in.tcl]
+    set out [makeFile "" string.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {HELLO world}
+
+test string.5 {string: trim} -body {
+    set in  [makeFile {return [string trim "  hello  "]} string.5-in.tcl]
+    set out [makeFile "" string.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result hello
+
+test string.6 {string: match (glob)} -body {
+    set in  [makeFile {
+        return [list [string match "h*o" "hello"] [string match "h*o" "hilo"] [string match "h*o" "world"]]
+    } string.6-in.tcl]
+    set out [makeFile "" string.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 1 0}
+
+test string.7 {string: first and last} -body {
+    set in  [makeFile {
+        set s "abcabc"
+        return [list [string first "bc" $s] [string last "bc" $s]]
+    } string.7-in.tcl]
+    set out [makeFile "" string.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 4}
+
+test string.8 {string: repeat} -body {
+    set in  [makeFile {return [string repeat "ab" 4]} string.8-in.tcl]
+    set out [makeFile "" string.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result abababab
+
+test string.9 {string: reverse} -body {
+    set in  [makeFile {return [string reverse "hello"]} string.9-in.tcl]
+    set out [makeFile "" string.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result olleh
+
+# List operations
+test list.1 {list: lsort} -body {
+    set in  [makeFile {return [lsort {banana apple cherry}]} list.1-in.tcl]
+    set out [makeFile "" list.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {apple banana cherry}
+
+test list.2 {list: lsearch} -body {
+    set in  [makeFile {return [lsearch {a b c d e} c]} list.2-in.tcl]
+    set out [makeFile "" list.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 2
+
+test list.3 {list: lreplace} -body {
+    set in  [makeFile {return [lreplace {a b c d e} 1 2 X Y]} list.3-in.tcl]
+    set out [makeFile "" list.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {a X Y d e}
+
+test list.4 {list: linsert} -body {
+    set in  [makeFile {return [linsert {a b c} 1 X Y]} list.4-in.tcl]
+    set out [makeFile "" list.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {a X Y b c}
+
+test list.5 {list: join and split} -body {
+    set in  [makeFile {
+        set s [join {a b c} ","]
+        set l [split $s ","]
+        return [list $s $l]
+    } list.5-in.tcl]
+    set out [makeFile "" list.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {a,b,c {a b c}}
+
+# Dict operations
+test dict.1 {dict: for} -body {
+    set in  [makeFile {
+        set res {}
+        dict for {k v} {x 1 y 2 z 3} {
+            lappend res "$k=$v"
+        }
+        return $res
+    } dict.1-in.tcl]
+    set out [makeFile "" dict.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {x=1 y=2 z=3}
+
+test dict.2 {dict: with} -body {
+    set in  [makeFile {
+        set d [dict create name Alice age 30]
+        dict with d {
+            set greeting "Hi $name, age $age"
+        }
+        return $greeting
+    } dict.2-in.tcl]
+    set out [makeFile "" dict.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {Hi Alice, age 30}
+
+test dict.3 {dict: set/get nested} -body {
+    set in  [makeFile {
+        set d [dict create]
+        dict set d a b c 42
+        return [dict get $d a b c]
+    } dict.3-in.tcl]
+    set out [makeFile "" dict.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+test dict.4 {dict: lappend and append} -body {
+    set in  [makeFile {
+        set d [dict create items {} name ""]
+        dict lappend d items a b c
+        dict append d name hello " " world
+        return [list [dict get $d items] [dict get $d name]]
+    } dict.4-in.tcl]
+    set out [makeFile "" dict.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{a b c} {hello world}}
+
+test dict.5 {dict: exists} -body {
+    set in  [makeFile {
+        set d [dict create a 1 b 2]
+        return [list [dict exists $d a] [dict exists $d c]]
+    } dict.5-in.tcl]
+    set out [makeFile "" dict.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 0}
+
+# Format and scan
+test format.1 {format command} -body {
+    set in  [makeFile {return [format "%05d %6.2f %s" 42 3.14 hello]} format.1-in.tcl]
+    set out [makeFile "" format.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {00042   3.14 hello}
+
+test format.2 {scan command} -body {
+    set in  [makeFile {
+        scan "42 3.14 hello" "%d %f %s" a b c
+        return [list $a $b $c]
+    } format.2-in.tcl]
+    set out [makeFile "" format.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {42 3.14 hello}
+
+cleanupTests

@@ -14,4 +14,85 @@ test io.1 {savechan + loadchan} -body {
     set r
 } -result via-chan
 
+# ---- NEW TESTS ----
+
+# Save script string (not file) to file path
+test io.2 {save inline script to file path} -body {
+    set out [makeFile "" io.2-out.tbcx]
+    tbcx::save {return "inline"} $out
+    tbcx::load $out
+} -result inline
+
+# Save script string with procs to file
+test io.3 {save inline script with proc to file} -body {
+    set out [makeFile "" io.3-out.tbcx]
+    tbcx::save {
+        proc double {x} {expr {$x * 2}}
+        return [double 21]
+    } $out
+    tbcx::load $out
+} -result 42
+
+# Save file to channel, load from channel
+test io.4 {save file to channel, load from channel} -body {
+    set in  [makeFile {return "file2chan"} io.4-in.tcl]
+    set out [makeFile "" io.4-out.tbcx]
+    set ch [open $out w]
+    tbcx::save $in $ch
+    close $ch
+    set ch2 [open $out r]
+    set r [tbcx::load $ch2]
+    close $ch2
+    set r
+} -result file2chan
+
+# Save file to file path
+test io.5 {save file to file path (standard)} -body {
+    set in  [makeFile {return "file2file"} io.5-in.tcl]
+    set out [makeFile "" io.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result file2file
+
+# Multiple saves to different files, then load each
+test io.6 {multiple independent save/load} -body {
+    set out1 [makeFile "" io.6a-out.tbcx]
+    set out2 [makeFile "" io.6b-out.tbcx]
+    tbcx::save {return "alpha"} $out1
+    tbcx::save {return "beta"} $out2
+    list [tbcx::load $out1] [tbcx::load $out2]
+} -result {alpha beta}
+
+# Save returns the output path
+test io.7 {save returns output path} -body {
+    set out [makeFile "" io.7-out.tbcx]
+    set ret [tbcx::save {return ok} $out]
+    # ret should be the normalized path of the output file
+    expr {[file exists $ret]}
+} -result 1
+
+# Load same file twice (verify no state corruption)
+test io.8 {load same file twice} -body {
+    set out [makeFile "" io.8-out.tbcx]
+    tbcx::save {return "twice"} $out
+    set r1 [tbcx::load $out]
+    set r2 [tbcx::load $out]
+    expr {$r1 eq $r2 && $r1 eq "twice"}
+} -result 1
+
+# Large script via inline string
+test io.9 {save large inline script} -body {
+    # Build a script with many statements
+    set script "set total 0\n"
+    for {set i 1} {$i <= 100} {incr i} {
+        append script "incr total $i\n"
+    }
+    append script "return \$total"
+    set out [makeFile "" io.9-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 5050
+
+
+
 cleanupTests

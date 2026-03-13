@@ -15,4 +15,92 @@ test args.3 {dumpfile: wrong #args} -body {
     list [catch {tbcx::dump} e] $e
 } -result {1 {wrong # args: should be "tbcx::dump filename"}}
 
+# ---- NEW TESTS ----
+
+# Too many args
+test args.4 {save: too many args} -body {
+    list [catch {tbcx::save a b c} e] $e
+} -result {1 {wrong # args: should be "tbcx::save in out"}}
+
+test args.5 {load: too many args} -body {
+    list [catch {tbcx::load a b} e] $e
+} -result {1 {wrong # args: should be "tbcx::load in"}}
+
+test args.6 {dump: too many args} -body {
+    list [catch {tbcx::dump a b} e] $e
+} -result {1 {wrong # args: should be "tbcx::dump filename"}}
+
+# Load nonexistent file
+test args.7 {load: nonexistent file} -body {
+    set rc [catch {tbcx::load /nonexistent/path/to/file.tbcx} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Save to unwritable path
+test args.8 {save: bad output path} -body {
+    set rc [catch {tbcx::save {return ok} /nonexistent/dir/out.tbcx} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Dump nonexistent file
+test args.9 {dump: nonexistent file} -body {
+    set rc [catch {tbcx::dump /nonexistent/path/to/file.tbcx} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Load corrupt file (not valid TBCX)
+test args.10 {load: corrupt/non-TBCX file} -body {
+    set f [makeFile "this is not a tbcx file at all" args.10-bad.tbcx]
+    set rc [catch {tbcx::load $f} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Dump corrupt file
+test args.11 {dump: corrupt/non-TBCX file} -body {
+    set f [makeFile "not valid tbcx data" args.11-bad.tbcx]
+    set rc [catch {tbcx::dump $f} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Load from empty channel
+test args.12 {load: empty channel} -body {
+    set f [makeFile "" args.12-empty.tbcx]
+    set ch [open $f r]
+    set rc [catch {tbcx::load $ch} msg]
+    close $ch
+    expr {$rc == 1}
+} -result 1
+
+# Load truncated file (partial TBCX magic)
+test args.13 {load: truncated file} -body {
+    set f [makeFile "" args.13-trunc.tbcx]
+    set ch [open $f w]
+    fconfigure $ch -translation binary
+    puts -nonewline $ch "TBCX"
+    close $ch
+    set rc [catch {tbcx::load $f} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Load empty file
+test args.14 {load: empty file} -body {
+    set f [makeFile "" args.14-empty.tbcx]
+    set rc [catch {tbcx::load $f} msg]
+    expr {$rc == 1}
+} -result 1
+
+# Save from nonexistent input file
+test args.15 {save: nonexistent input file} -body {
+    # When the input is neither a channel, a readable file, nor valid Tcl,
+    # it should be treated as a script string.  But a string like a path
+    # that doesn't look like a path should just compile as a script.
+    # A truly nonexistent file that *looks* like a path will fail to read.
+    set out [makeFile "" args.15-out.tbcx]
+    # This is treated as a script string (not a file), so it should succeed
+    # (the string "/no/such/file.tcl" is valid Tcl—it just evaluates to itself).
+    set rc [catch {tbcx::save /no/such/file.tcl $out} msg]
+    # It should NOT error because it falls through to "treat as script"
+    expr {$rc == 0}
+} -result 1
+
 cleanupTests

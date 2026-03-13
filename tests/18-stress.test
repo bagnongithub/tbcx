@@ -1,0 +1,151 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Many string literals
+test stress.1 {stress: many string literals} -body {
+    set body "set res {}\n"
+    for {set i 0} {$i < 200} {incr i} {
+        append body "lappend res \"item_$i\"\n"
+    }
+    append body "return \[llength \$res\]"
+    set out [makeFile "" stress.1-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 200
+
+# Many integer literals
+test stress.2 {stress: many integer literals in expr} -body {
+    set terms {}
+    for {set i 1} {$i <= 50} {incr i} {
+        lappend terms $i
+    }
+    set body "return \[expr \{[join $terms +]\}\]"
+    set out [makeFile "" stress.2-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 1275
+
+# Many procs
+test stress.3 {stress: many procs} -body {
+    set body ""
+    for {set i 0} {$i < 50} {incr i} {
+        append body "proc p$i {} {return $i}\n"
+    }
+    append body "set total 0\n"
+    for {set i 0} {$i < 50} {incr i} {
+        append body "incr total \[p$i\]\n"
+    }
+    append body "return \$total"
+    set out [makeFile "" stress.3-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 1225
+
+# Deep nesting (nested if)
+test stress.4 {stress: deeply nested if} -body {
+    set body "set x 0\n"
+    for {set i 0} {$i < 30} {incr i} {
+        append body [string repeat "  " $i]
+        append body "if \{1\} \{\n"
+    }
+    append body [string repeat "  " 30]
+    append body "set x 42\n"
+    for {set i 29} {$i >= 0} {incr i -1} {
+        append body [string repeat "  " $i]
+        append body "\}\n"
+    }
+    append body "return \$x"
+    set out [makeFile "" stress.4-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 42
+
+# Many local variables in a proc
+test stress.5 {stress: proc with many locals} -body {
+    set body "proc bigproc {} {\n"
+    for {set i 0} {$i < 100} {incr i} {
+        append body "  set v$i $i\n"
+    }
+    append body "  set total 0\n"
+    for {set i 0} {$i < 100} {incr i} {
+        append body "  incr total \$v$i\n"
+    }
+    append body "  return \$total\n}\nreturn \[bigproc\]"
+    set out [makeFile "" stress.5-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 4950
+
+# Large loop iteration
+test stress.6 {stress: large loop} -body {
+    set in  [makeFile {
+        set s 0
+        for {set i 1} {$i <= 10000} {incr i} {
+            incr s $i
+        }
+        return $s
+    } stress.6-in.tcl]
+    set out [makeFile "" stress.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 50005000
+
+# Many foreach iterations
+test stress.7 {stress: foreach over long list} -body {
+    set body "set lst \[list"
+    for {set i 1} {$i <= 1000} {incr i} {
+        append body " $i"
+    }
+    append body "\]\nset s 0\nforeach x \$lst \{ incr s \$x \}\nreturn \$s"
+    set out [makeFile "" stress.7-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 500500
+
+# Many exception ranges
+test stress.8 {stress: many try/catch blocks} -body {
+    set body "set results {}\n"
+    for {set i 0} {$i < 20} {incr i} {
+        append body "try \{ lappend results ok_$i \} on error \{msg\} \{ lappend results err_$i \}\n"
+    }
+    append body "return \[llength \$results\]"
+    set out [makeFile "" stress.8-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 20
+
+# Mixed: procs, OO, foreach, switch all together
+test stress.9 {stress: mixed features} -body {
+    set in  [makeFile {
+        proc square {x} {expr {$x * $x}}
+        proc sumlist {lst} {
+            set s 0
+            foreach x $lst { incr s $x }
+            return $s
+        }
+        oo::class create Accum
+        oo::define Accum {
+            constructor {} {my variable total; set total 0}
+            method add {x} {my variable total; incr total $x; return $total}
+            method get {} {my variable total; return $total}
+        }
+        set a [Accum new]
+        foreach n {1 2 3 4 5} {
+            $a add [square $n]
+        }
+        set r1 [$a get]
+        set r2 [sumlist {10 20 30}]
+        switch -exact -- "x" {
+            a {set r3 A}
+            x {set r3 X}
+        }
+        return [list $r1 $r2 $r3]
+    } stress.9-in.tcl]
+    set out [makeFile "" stress.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {55 60 X}
+
+cleanupTests

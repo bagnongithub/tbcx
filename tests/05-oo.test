@@ -27,4 +27,211 @@ test oo.2 {oo: constructor passes args} -body {
     tbcx::load $out
 } -result hello
 
+# ---- NEW TESTS ----
+
+# Multiple methods on one class
+test oo.3 {oo: multiple methods} -body {
+    set in  [makeFile {
+        oo::class create Calc
+        oo::define Calc {
+            method add {a b} {return [expr {$a + $b}]}
+            method mul {a b} {return [expr {$a * $b}]}
+            method neg {a}   {return [expr {-$a}]}
+        }
+        set c [Calc new]
+        return [list [$c add 3 4] [$c mul 3 4] [$c neg 5]]
+    } oo.3-in.tcl]
+    set out [makeFile "" oo.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {7 12 -5}
+
+# Constructor with instance variable
+test oo.4 {oo: constructor with instance var} -body {
+    set in  [makeFile {
+        oo::class create Named
+        oo::define Named {
+            constructor {n} {my variable name; set name $n}
+            method getname {} {my variable name; return $name}
+        }
+        set o [Named new Alice]
+        return [$o getname]
+    } oo.4-in.tcl]
+    set out [makeFile "" oo.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result Alice
+
+# Destructor
+test oo.5 {oo: destructor runs} -body {
+    set in  [makeFile {
+        oo::class create Tracked
+        oo::define Tracked {
+            constructor {} {set ::track created}
+            destructor {set ::track destroyed}
+        }
+        set o [Tracked new]
+        set r1 $::track
+        $o destroy
+        return [list $r1 $::track]
+    } oo.5-in.tcl]
+    set out [makeFile "" oo.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {created destroyed}
+
+# Inheritance: superclass
+test oo.6 {oo: superclass} -body {
+    set in  [makeFile {
+        oo::class create Base
+        oo::define Base method greet {} {return "hello from Base"}
+        oo::class create Child {superclass Base}
+        oo::define Child method who {} {return "I am Child"}
+        set o [Child new]
+        return [list [$o greet] [$o who]]
+    } oo.6-in.tcl]
+    set out [makeFile "" oo.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{hello from Base} {I am Child}}
+
+# Method override
+test oo.7 {oo: method override} -body {
+    set in  [makeFile {
+        oo::class create Animal
+        oo::define Animal method speak {} {return "..."}
+        oo::class create Dog {superclass Animal}
+        oo::define Dog method speak {} {return "woof"}
+        oo::class create Cat {superclass Animal}
+        oo::define Cat method speak {} {return "meow"}
+        set d [Dog new]
+        set c [Cat new]
+        return [list [$d speak] [$c speak]]
+    } oo.7-in.tcl]
+    set out [makeFile "" oo.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {woof meow}
+
+# Method with arguments
+test oo.8 {oo: method with multiple args} -body {
+    set in  [makeFile {
+        oo::class create Point
+        oo::define Point {
+            constructor {ax ay} {my variable x y; set x $ax; set y $ay}
+            method distto {ox oy} {
+                my variable x y
+                return [expr {sqrt(($x-$ox)**2 + ($y-$oy)**2)}]
+            }
+        }
+        set p [Point new 3.0 4.0]
+        return [expr {int([$p distto 0.0 0.0])}]
+    } oo.8-in.tcl]
+    set out [makeFile "" oo.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 5
+
+# oo::define with method block (multi-method in block)
+test oo.9 {oo: define block with multiple methods} -body {
+    set in  [makeFile {
+        oo::class create Stack
+        oo::define Stack {
+            constructor {} {my variable data; set data {}}
+            method push {val} {my variable data; lappend data $val; return}
+            method pop {} {
+                my variable data
+                set val [lindex $data end]
+                set data [lrange $data 0 end-1]
+                return $val
+            }
+            method size {} {my variable data; return [llength $data]}
+        }
+        set s [Stack new]
+        $s push a
+        $s push b
+        $s push c
+        set p [$s pop]
+        return [list $p [$s size]]
+    } oo.9-in.tcl]
+    set out [makeFile "" oo.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {c 2}
+
+# Multiple classes in one script
+test oo.10 {oo: multiple classes} -body {
+    set in  [makeFile {
+        oo::class create A
+        oo::define A method who {} {return A}
+        oo::class create B
+        oo::define B method who {} {return B}
+        set a [A new]
+        set b [B new]
+        return [list [$a who] [$b who]]
+    } oo.10-in.tcl]
+    set out [makeFile "" oo.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {A B}
+
+# Constructor with default args
+test oo.11 {oo: constructor default args} -body {
+    set in  [makeFile {
+        oo::class create Widget
+        oo::define Widget {
+            constructor {{l default}} {my variable label; set label $l}
+            method getlabel {} {my variable label; return $label}
+        }
+        set w1 [Widget new]
+        set w2 [Widget new custom]
+        return [list [$w1 getlabel] [$w2 getlabel]]
+    } oo.11-in.tcl]
+    set out [makeFile "" oo.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {default custom}
+
+# Method calling another method via self
+test oo.12 {oo: method calling method via my} -body {
+    set in  [makeFile {
+        oo::class create Counter
+        oo::define Counter {
+            constructor {} {my variable n; set n 0}
+            method incr {} {my variable n; incr n; return $n}
+            method incr3 {} {
+                my incr; my incr; my incr
+            }
+            method val {} {my variable n; return $n}
+        }
+        set c [Counter new]
+        $c incr3
+        return [$c val]
+    } oo.12-in.tcl]
+    set out [makeFile "" oo.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 3
+
+# OO with exception handling in method
+test oo.13 {oo: exception in method} -body {
+    set in  [makeFile {
+        oo::class create Safe
+        oo::define Safe method div {a b} {
+            try {
+                return [expr {$a / $b}]
+            } on error {} {
+                return Inf
+            }
+        }
+        set s [Safe new]
+        return [list [$s div 10 2] [$s div 10 0]]
+    } oo.13-in.tcl]
+    set out [makeFile "" oo.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {5 Inf}
+
+
+
 cleanupTests

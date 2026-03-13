@@ -10,8 +10,268 @@ test proc.1 {procs: compiled body substituted} -body {
     } proc.1-in.tcl]
     set out [makeFile "" proc.1-out.tbcx]
     tbcx::save $in $out
-    # During load, the proc shim should substitute the precompiled body
     tbcx::load $out
 } -result 7
+
+# ---- NEW TESTS ----
+
+# Multiple procs
+test proc.2 {multiple procs} -body {
+    set in  [makeFile {
+        proc double {x} {expr {$x * 2}}
+        proc triple {x} {expr {$x * 3}}
+        proc addone {x} {expr {$x + 1}}
+        return [list [double 5] [triple 5] [addone 5]]
+    } proc.2-in.tcl]
+    set out [makeFile "" proc.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {10 15 6}
+
+# Procs calling each other
+test proc.3 {procs calling procs} -body {
+    set in  [makeFile {
+        proc square {x} {expr {$x * $x}}
+        proc sumsq {a b} {expr {[square $a] + [square $b]}}
+        return [sumsq 3 4]
+    } proc.3-in.tcl]
+    set out [makeFile "" proc.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 25
+
+# Recursive proc (factorial)
+test proc.4 {recursive proc} -body {
+    set in  [makeFile {
+        proc fact {n} {
+            if {$n <= 1} {return 1}
+            expr {$n * [fact [expr {$n - 1}]]}
+        }
+        return [fact 10]
+    } proc.4-in.tcl]
+    set out [makeFile "" proc.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 3628800
+
+# Proc with two required arguments
+test proc.5 {proc with multiple required args} -body {
+    set in  [makeFile {
+        proc greet {greeting name} {
+            return "$greeting $name"
+        }
+        return [list [greet Hello World] [greet Hi Tcl]]
+    } proc.5-in.tcl]
+    set out [makeFile "" proc.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{Hello World} {Hi Tcl}}
+
+# Proc with args (variadic)
+test proc.6 {proc with variadic args} -body {
+    set in  [makeFile {
+        proc mysum {args} {
+            set s 0
+            foreach x $args { incr s $x }
+            return $s
+        }
+        return [list [mysum] [mysum 1] [mysum 1 2 3]]
+    } proc.6-in.tcl]
+    set out [makeFile "" proc.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 6}
+
+# Proc with required + variadic args (no defaults - TBCX limitation)
+test proc.7 {proc required plus args} -body {
+    set in  [makeFile {
+        proc fmt {prefix args} {
+            return "$prefix:[join $args -]"
+        }
+        return [fmt items a b c]
+    } proc.7-in.tcl]
+    set out [makeFile "" proc.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {items:a-b-c}
+
+# Proc with upvar
+test proc.8 {proc with upvar} -body {
+    set in  [makeFile {
+        proc incr2 {varname} {
+            upvar 1 $varname v
+            incr v 2
+        }
+        set x 10
+        incr2 x
+        return $x
+    } proc.8-in.tcl]
+    set out [makeFile "" proc.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 12
+
+# Proc with global
+test proc.9 {proc with global var} -body {
+    set in  [makeFile {
+        set ::gvar 100
+        proc readglobal {} {
+            global gvar
+            return $gvar
+        }
+        return [readglobal]
+    } proc.9-in.tcl]
+    set out [makeFile "" proc.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 100
+
+# Proc with local variable shadowing
+test proc.10 {proc local var shadowing} -body {
+    set in  [makeFile {
+        set x outer
+        proc shadow {} {
+            set x inner
+            return $x
+        }
+        return [list [shadow] $x]
+    } proc.10-in.tcl]
+    set out [makeFile "" proc.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {inner outer}
+
+# Proc returning list
+test proc.11 {proc returning complex type} -body {
+    set in  [makeFile {
+        proc mkpair {a b} {
+            return [list $a $b]
+        }
+        set p [mkpair hello world]
+        return [list [lindex $p 0] [lindex $p 1]]
+    } proc.11-in.tcl]
+    set out [makeFile "" proc.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {hello world}
+
+# Proc with many local variables
+test proc.12 {proc many locals} -body {
+    set in  [makeFile {
+        proc manylocals {} {
+            set a 1; set b 2; set c 3; set d 4; set e 5
+            set f 6; set g 7; set h 8; set i 9; set j 10
+            return [expr {$a+$b+$c+$d+$e+$f+$g+$h+$i+$j}]
+        }
+        return [manylocals]
+    } proc.12-in.tcl]
+    set out [makeFile "" proc.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 55
+
+# Proc with string operations
+test proc.13 {proc with string ops} -body {
+    set in  [makeFile {
+        proc rev {s} {
+            set result ""
+            for {set i [expr {[string length $s]-1}]} {$i >= 0} {incr i -1} {
+                append result [string index $s $i]
+            }
+            return $result
+        }
+        return [rev "abcde"]
+    } proc.13-in.tcl]
+    set out [makeFile "" proc.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result edcba
+
+# Proc with while loop
+test proc.14 {proc with while loop} -body {
+    set in  [makeFile {
+        proc countdown {n} {
+            set res {}
+            while {$n > 0} {
+                lappend res $n
+                incr n -1
+            }
+            return $res
+        }
+        return [countdown 5]
+    } proc.14-in.tcl]
+    set out [makeFile "" proc.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {5 4 3 2 1}
+
+# Proc with for loop
+test proc.15 {proc with for loop} -body {
+    set in  [makeFile {
+        proc range {n} {
+            set res {}
+            for {set i 0} {$i < $n} {incr i} {
+                lappend res $i
+            }
+            return $res
+        }
+        return [range 5]
+    } proc.15-in.tcl]
+    set out [makeFile "" proc.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1 2 3 4}
+
+# Proc used as value in computation
+test proc.16 {proc as building block} -body {
+    set in  [makeFile {
+        proc inc {x} {expr {$x + 1}}
+        proc dec {x} {expr {$x - 1}}
+        set val 10
+        set val [inc [inc [inc $val]]]
+        set val [dec $val]
+        return $val
+    } proc.16-in.tcl]
+    set out [makeFile "" proc.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 12
+
+# Mutual recursion
+test proc.17 {mutual recursion} -body {
+    set in  [makeFile {
+        proc iseven {n} {
+            if {$n == 0} {return 1}
+            isodd [expr {$n - 1}]
+        }
+        proc isodd {n} {
+            if {$n == 0} {return 0}
+            iseven [expr {$n - 1}]
+        }
+        return [list [iseven 4] [iseven 3] [isodd 5] [isodd 6]]
+    } proc.17-in.tcl]
+    set out [makeFile "" proc.17-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 0 1 0}
+
+# Proc with apply inside
+test proc.18 {proc using apply/lambda} -body {
+    set in  [makeFile {
+        proc mapfn {fn lst} {
+            set res {}
+            foreach x $lst {
+                lappend res [apply $fn $x]
+            }
+            return $res
+        }
+        return [mapfn {x {expr {$x * $x}}} {1 2 3 4}]
+    } proc.18-in.tcl]
+    set out [makeFile "" proc.18-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 4 9 16}
+
+
 
 cleanupTests

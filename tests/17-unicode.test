@@ -1,0 +1,108 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Basic non-ASCII: accented chars via format %c
+test unicode.1 {unicode: accented latin chars} -body {
+    set out [makeFile "" unicode.1-out.tbcx]
+    tbcx::save {return [format %c%c%c%c 0xe9 0xe8 0xea 0xeb]} $out
+    set r [tbcx::load $out]
+    expr {$r eq "\u00e9\u00e8\u00ea\u00eb"}
+} -result 1
+
+# CJK characters
+test unicode.2 {unicode: CJK ideographs} -body {
+    set out [makeFile "" unicode.2-out.tbcx]
+    tbcx::save {return [format %c%c 0x4e16 0x754c]} $out
+    set r [tbcx::load $out]
+    expr {$r eq "\u4e16\u754c"}
+} -result 1
+
+# Cyrillic
+test unicode.3 {unicode: Cyrillic} -body {
+    set out [makeFile "" unicode.3-out.tbcx]
+    tbcx::save {return [format %c%c%c%c%c%c 0x41f 0x440 0x438 0x432 0x435 0x442]} $out
+    set r [tbcx::load $out]
+    expr {$r eq "\u041f\u0440\u0438\u0432\u0435\u0442"}
+} -result 1
+
+# Unicode proc name
+test unicode.4 {unicode: proc name with unicode} -body {
+    set out [makeFile "" unicode.4-out.tbcx]
+    set name "caf[format %c 0xe9]"
+    set script "proc $name {} {return coffee}\nreturn \[$name\]"
+    tbcx::save $script $out
+    tbcx::load $out
+} -result coffee
+
+# String length counts chars not bytes
+test unicode.5 {unicode: string length counts chars not bytes} -body {
+    set out [makeFile "" unicode.5-out.tbcx]
+    tbcx::save {
+        set s [format %c%c%c 0xe9 0xe8 0xea]
+        return [string length $s]
+    } $out
+    tbcx::load $out
+} -result 3
+
+# Unicode in dict keys
+test unicode.6 {unicode: dict with unicode keys} -body {
+    set out [makeFile "" unicode.6-out.tbcx]
+    tbcx::save {
+        set k1 [format %c 0xe9]
+        set k2 [format %c 0xe8]
+        set d [dict create $k1 yes $k2 no]
+        return [dict get $d $k1]
+    } $out
+    tbcx::load $out
+} -result yes
+
+# Unicode in list elements
+test unicode.7 {unicode: list with unicode elements} -body {
+    set out [makeFile "" unicode.7-out.tbcx]
+    tbcx::save {
+        set lst [list [format %c 0x3b1] [format %c 0x3b2] [format %c 0x3b3]]
+        return [lindex $lst 1]
+    } $out
+    set r [tbcx::load $out]
+    expr {$r eq "\u03b2"}
+} -result 1
+
+# Mixed ASCII and Unicode
+test unicode.8 {unicode: mixed ASCII and non-ASCII} -body {
+    set out [makeFile "" unicode.8-out.tbcx]
+    tbcx::save {return "Hello [format %c%c 0x4e16 0x754c]!"} $out
+    set r [tbcx::load $out]
+    expr {$r eq "Hello \u4e16\u754c!"}
+} -result 1
+
+# Unicode in switch keys (use if/eq instead of switch to avoid jumptable encoding)
+test unicode.9 {unicode: dispatch with unicode keys} -body {
+    set out [makeFile "" unicode.9-out.tbcx]
+    tbcx::save {
+        proc greet {lang} {
+            set jp [format %c%c 0x65e5 0x672c]
+            set konnichi [format %c%c%c%c%c 0x3053 0x3093 0x306b 0x3061 0x306f]
+            if {$lang eq "en"} {return hello}
+            if {$lang eq $jp} {return $konnichi}
+            return hi
+        }
+        return [greet [format %c%c 0x65e5 0x672c]]
+    } $out
+    set r [tbcx::load $out]
+    expr {$r eq "\u3053\u3093\u306b\u3061\u306f"}
+} -result 1
+
+# Null byte in bytearray
+test unicode.10 {unicode: bytearray with null} -body {
+    set in  [makeFile {
+        set ba [binary format ccc 65 0 66]
+        return [string length $ba]
+    } unicode.10-in.tcl]
+    set out [makeFile "" unicode.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 3
+
+cleanupTests

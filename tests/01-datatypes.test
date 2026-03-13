@@ -83,4 +83,170 @@ test literal.9 {LIT: LAMBDA_BC} -body {
     tbcx::load $out
 } -result 42
 
+# ---- NEW TESTS ----
+
+# EMPTY STRING
+test literal.10 {LIT: empty string} -body {
+    set in  [makeFile {return ""} literal.10-in.tcl]
+    set out [makeFile "" literal.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {}
+
+# SMALL INT (fits in word, no bignum)
+test literal.11 {LIT: small int} -body {
+    set in  [makeFile {return [expr {42}]} literal.11-in.tcl]
+    set out [makeFile "" literal.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+# ZERO
+test literal.12 {LIT: zero} -body {
+    set in  [makeFile {return [expr {0}]} literal.12-in.tcl]
+    set out [makeFile "" literal.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 0
+
+# NEGATIVE INT
+test literal.13 {LIT: negative int} -body {
+    set in  [makeFile {return [expr {-1}]} literal.13-in.tcl]
+    set out [makeFile "" literal.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result -1
+
+# NESTED LIST
+test literal.14 {LIT: nested list} -body {
+    set in  [makeFile {return [list [list a b] [list c d] [list e f]]} literal.14-in.tcl]
+    set out [makeFile "" literal.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{a b} {c d} {e f}}
+
+# EMPTY LIST
+test literal.15 {LIT: empty list} -body {
+    set in  [makeFile {return [list]} literal.15-in.tcl]
+    set out [makeFile "" literal.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {}
+
+# DOUBLE - special values
+test literal.16 {LIT: DOUBLE negative} -body {
+    set in  [makeFile {return [expr {-3.14}]} literal.16-in.tcl]
+    set out [makeFile "" literal.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result -3.14
+
+# DOUBLE - very small
+test literal.17 {LIT: DOUBLE very small} -body {
+    set in  [makeFile {return [expr {1e-300}]} literal.17-in.tcl]
+    set out [makeFile "" literal.17-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1e-300
+
+# DOUBLE - very large
+test literal.18 {LIT: DOUBLE very large} -body {
+    set in  [makeFile {return [expr {1e+300}]} literal.18-in.tcl]
+    set out [makeFile "" literal.18-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1e+300
+
+# BIGNUM negative
+test literal.19 {LIT: BIGNUM negative} -body {
+    set in  [makeFile {return [expr {-(2**80)}]} literal.19-in.tcl]
+    set out [makeFile "" literal.19-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result -1208925819614629174706176
+
+# STRING with special characters (braces, brackets, backslash)
+test literal.20 {LIT: STRING with special chars} -body {
+    set in  [makeFile {return "a\tb\nc"} literal.20-in.tcl]
+    set out [makeFile "" literal.20-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result "a\tb\nc"
+
+# STRING with backslash sequences
+test literal.21 {LIT: STRING with backslash escapes} -body {
+    set in  [makeFile {return "hello\\world"} literal.21-in.tcl]
+    set out [makeFile "" literal.21-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result "hello\\world"
+
+# BYTEARRAY - empty
+test literal.22 {LIT: BYTEARRAY empty} -body {
+    set in  [makeFile {return [binary format c* {}]} literal.22-in.tcl]
+    set out [makeFile "" literal.22-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {}
+
+# BYTEARRAY - all zeros
+test literal.23 {LIT: BYTEARRAY all zeros} -body {
+    set in  [makeFile {return [binary format c* {0 0 0 0}]} literal.23-in.tcl]
+    set out [makeFile "" literal.23-out.tbcx]
+    tbcx::save $in $out
+    string length [tbcx::load $out]
+} -result 4
+
+# DICT - empty dict
+test literal.24 {LIT: empty dict create} -body {
+    set in  [makeFile {return [dict size [dict create]]} literal.24-in.tcl]
+    set out [makeFile "" literal.24-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 0
+
+# Multiple distinct literal types in one script
+test literal.25 {LIT: mixed types in one script} -body {
+    set in  [makeFile {
+        set a "hello"
+        set b [expr {42}]
+        set c [expr {3.14}]
+        set d [list x y z]
+        return "$a $b $c $d"
+    } literal.25-in.tcl]
+    set out [makeFile "" literal.25-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {hello 42 3.14 x y z}
+
+# Lambda with multiple args
+test literal.26 {LIT: LAMBDA multi-arg} -body {
+    set in  [makeFile {return [apply {{a b} {expr {$a + $b}}} 10 32]} literal.26-in.tcl]
+    set out [makeFile "" literal.26-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+# Lambda with default arg
+test literal.27 {LIT: LAMBDA default arg} -body {
+    set in  [makeFile {return [apply {{x {y 10}} {expr {$x + $y}}} 5]} literal.27-in.tcl]
+    set out [makeFile "" literal.27-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+# Multiple lambdas
+test literal.28 {LIT: multiple lambdas} -body {
+    set in  [makeFile {
+        set add [list {a b} {expr {$a + $b}}]
+        set mul [list {a b} {expr {$a * $b}}]
+        return [list [apply $add 3 4] [apply $mul 3 4]]
+    } literal.28-in.tcl]
+    set out [makeFile "" literal.28-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {7 12}
+
+
+
 cleanupTests

@@ -15,4 +15,102 @@ test rt.1 {roundtrip: compile->save->load->eval->dump} -body {
     expr {$r eq "ok" && [string match "*proc p*" $d]}
 } -result 1
 
+# ---- NEW TESTS ----
+
+# Roundtrip with complex script
+test rt.2 {roundtrip: complex script} -body {
+    set in  [makeFile {
+        proc fib {n} {
+            if {$n <= 1} {return $n}
+            expr {[fib [expr {$n-1}]] + [fib [expr {$n-2}]]}
+        }
+        return [fib 10]
+    } rt.2-in.tcl]
+    set out [makeFile "" rt.2-out.tbcx]
+    tbcx::save $in $out
+    set r [tbcx::load $out]
+    set d [tbcx::dump $out]
+    expr {$r == 55 && [string match "*Procs: 1*" $d]}
+} -result 1
+
+# Roundtrip with OO
+test rt.3 {roundtrip: OO class} -body {
+    set in  [makeFile {
+        oo::class create Box
+        oo::define Box {
+            constructor {v} {my variable val; set val $v}
+            method get {} {my variable val; return $val}
+        }
+        set b [Box new 42]
+        return [$b get]
+    } rt.3-in.tcl]
+    set out [makeFile "" rt.3-out.tbcx]
+    tbcx::save $in $out
+    set r [tbcx::load $out]
+    set d [tbcx::dump $out]
+    expr {$r == 42 && [string length $d] > 0}
+} -result 1
+
+# Roundtrip: save inline, load, verify
+test rt.4 {roundtrip: inline script} -body {
+    set out [makeFile "" rt.4-out.tbcx]
+    tbcx::save {
+        proc hello {name} {return "Hello, $name!"}
+        return [hello Tcl]
+    } $out
+    set r [tbcx::load $out]
+    set d [tbcx::dump $out]
+    expr {$r eq "Hello, Tcl!" && [string match "*hello*" $d]}
+} -result 1
+
+# Roundtrip with all AuxData types
+test rt.5 {roundtrip: mixed AuxData} -body {
+    set in  [makeFile {
+        set results {}
+        # foreach (NewForeachInfo)
+        set s 0
+        foreach x {1 2 3} { incr s $x }
+        lappend results $s
+        # switch (JumptableInfo)
+        switch -exact -- "b" {
+            a {lappend results A}
+            b {lappend results B}
+        }
+        # dict update (DictUpdateInfo)
+        set d [dict create k val]
+        dict update d k K { lappend results $K }
+        return $results
+    } rt.5-in.tcl]
+    set out [makeFile "" rt.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {6 B val}
+
+# Roundtrip preserves result semantics across load calls
+test rt.6 {roundtrip: deterministic results} -body {
+    set out [makeFile "" rt.6-out.tbcx]
+    tbcx::save {return [expr {2**10}]} $out
+    set r1 [tbcx::load $out]
+    set r2 [tbcx::load $out]
+    set r3 [tbcx::load $out]
+    expr {$r1 == 1024 && $r1 eq $r2 && $r2 eq $r3}
+} -result 1
+
+# Roundtrip with exception handling
+test rt.7 {roundtrip: exception handling} -body {
+    set in  [makeFile {
+        proc safecall {cmd} {
+            try {
+                return [uplevel 1 $cmd]
+            } on error {msg} {
+                return "ERR:$msg"
+            }
+        }
+        return [list [safecall {expr {1+2}}] [safecall {error boom}]]
+    } rt.7-in.tcl]
+    set out [makeFile "" rt.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {3 ERR:boom}
+
 cleanupTests

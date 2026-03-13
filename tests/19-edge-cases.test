@@ -1,0 +1,218 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Empty script
+test edge.1 {edge: empty script} -body {
+    set out [makeFile "" edge.1-out.tbcx]
+    tbcx::save {} $out
+    set r [tbcx::load $out]
+    expr {$r eq ""}
+} -result 1
+
+# Script with only whitespace
+test edge.2 {edge: whitespace-only script} -body {
+    set out [makeFile "" edge.2-out.tbcx]
+    tbcx::save "   \n  \n  " $out
+    set r [tbcx::load $out]
+    expr {$r eq ""}
+} -result 1
+
+# Script with only comments
+test edge.3 {edge: comment-only script} -body {
+    set out [makeFile "" edge.3-out.tbcx]
+    tbcx::save "# this is a comment\n# another comment\n" $out
+    set r [tbcx::load $out]
+    expr {$r eq ""}
+} -result 1
+
+# Script returning empty list
+test edge.4 {edge: return empty list} -body {
+    set out [makeFile "" edge.4-out.tbcx]
+    tbcx::save {return [list]} $out
+    tbcx::load $out
+} -result {}
+
+# Script returning empty string explicitly
+test edge.5 {edge: return empty string} -body {
+    set out [makeFile "" edge.5-out.tbcx]
+    tbcx::save {return ""} $out
+    tbcx::load $out
+} -result {}
+
+# Very long string literal
+test edge.6 {edge: long string} -body {
+    set longstr [string repeat "abcdefghij" 500]
+    set out [makeFile "" edge.6-out.tbcx]
+    tbcx::save [list return $longstr] $out
+    set r [tbcx::load $out]
+    expr {$r eq $longstr}
+} -result 1
+
+# Proc with empty body
+test edge.7 {edge: proc empty body} -body {
+    set in  [makeFile {
+        proc noop {} {}
+        noop
+        return ok
+    } edge.7-in.tcl]
+    set out [makeFile "" edge.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result ok
+
+# Proc with only a return
+test edge.8 {edge: proc with bare return} -body {
+    set in  [makeFile {
+        proc bare {} {return}
+        set r [bare]
+        return [expr {$r eq ""}]
+    } edge.8-in.tcl]
+    set out [makeFile "" edge.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1
+
+# Script using set as last command (implicit result)
+test edge.9 {edge: implicit result from set} -body {
+    set out [makeFile "" edge.9-out.tbcx]
+    tbcx::save {set x 42} $out
+    tbcx::load $out
+} -result 42
+
+# Multiple return paths
+test edge.10 {edge: conditional return} -body {
+    set in  [makeFile {
+        proc choose {flag} {
+            if {$flag} {
+                return yes
+            }
+            return no
+        }
+        return [list [choose 1] [choose 0]]
+    } edge.10-in.tcl]
+    set out [makeFile "" edge.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {yes no}
+
+# Semicolons (multiple commands on one line)
+test edge.11 {edge: semicolons} -body {
+    set out [makeFile "" edge.11-out.tbcx]
+    tbcx::save {set a 1; set b 2; set c 3; return [expr {$a+$b+$c}]} $out
+    tbcx::load $out
+} -result 6
+
+# Command substitution in string
+test edge.12 {edge: command substitution} -body {
+    set out [makeFile "" edge.12-out.tbcx]
+    tbcx::save {return "result is [expr {6*7}]"} $out
+    tbcx::load $out
+} -result {result is 42}
+
+# Variable substitution in string
+test edge.13 {edge: variable substitution} -body {
+    set out [makeFile "" edge.13-out.tbcx]
+    tbcx::save {set name World; return "Hello, $name!"} $out
+    tbcx::load $out
+} -result {Hello, World!}
+
+# Backslash newline continuation
+test edge.14 {edge: backslash continuation} -body {
+    set in  [makeFile "set x \[expr \{1 + \\\n    2 + \\\n    3\}\]\nreturn \$x" edge.14-in.tcl]
+    set out [makeFile "" edge.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 6
+
+# Array operations via set (in proc to avoid top-level precompiled local conflict)
+test edge.15 {edge: array access} -body {
+    set in  [makeFile {
+        proc arrtest {} {
+            set arr(x) 10
+            set arr(y) 20
+            return [expr {$arr(x) + $arr(y)}]
+        }
+        return [arrtest]
+    } edge.15-in.tcl]
+    set out [makeFile "" edge.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 30
+
+# Info commands after load
+test edge.16 {edge: info exists after load} -body {
+    set in  [makeFile {
+        proc myproc {x} {return [expr {$x + 1}]}
+        return [list [myproc 5] [info commands myproc]]
+    } edge.16-in.tcl]
+    set out [makeFile "" edge.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {6 myproc}
+
+# Rename command
+test edge.17 {edge: rename proc} -body {
+    set in  [makeFile {
+        proc original {} {return orig}
+        rename original aliased
+        return [aliased]
+    } edge.17-in.tcl]
+    set out [makeFile "" edge.17-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result orig
+
+# Eval in script
+test edge.18 {edge: eval command} -body {
+    set in  [makeFile {
+        set cmd {expr {21 * 2}}
+        return [eval $cmd]
+    } edge.18-in.tcl]
+    set out [makeFile "" edge.18-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+# Incr
+test edge.19 {edge: incr patterns} -body {
+    set in  [makeFile {
+        set x 0
+        incr x
+        incr x 5
+        incr x -2
+        return $x
+    } edge.19-in.tcl]
+    set out [makeFile "" edge.19-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 4
+
+# Append
+test edge.20 {edge: append and lappend} -body {
+    set in  [makeFile {
+        set s ""
+        append s a b c
+        set l {}
+        lappend l x y z
+        return [list $s $l]
+    } edge.20-in.tcl]
+    set out [makeFile "" edge.20-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {abc {x y z}}
+
+# Regexp
+test edge.21 {edge: regexp and regsub} -body {
+    set in  [makeFile {
+        set match [regexp {^(\d+)-(\d+)$} "123-456" -> a b]
+        set fixed [regsub -all {[aeiou]} "hello world" "*"]
+        return [list $match $a $b $fixed]
+    } edge.21-in.tcl]
+    set out [makeFile "" edge.21-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 123 456 {h*ll* w*rld}}
+
+cleanupTests

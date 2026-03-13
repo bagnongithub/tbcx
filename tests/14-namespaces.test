@@ -1,0 +1,125 @@
+# -*-Tcl-*-
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Proc in a namespace
+test ns.1 {namespace: proc in namespace} -body {
+    set in  [makeFile {
+        namespace eval ::myns {
+            proc greet {} {return "hello from myns"}
+        }
+        return [::myns::greet]
+    } ns.1-in.tcl]
+    set out [makeFile "" ns.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {hello from myns}
+
+# Multiple procs in same namespace
+test ns.2 {namespace: multiple procs} -body {
+    set in  [makeFile {
+        namespace eval ::math {
+            proc add {a b} {expr {$a + $b}}
+            proc sub {a b} {expr {$a - $b}}
+        }
+        return [list [::math::add 10 3] [::math::sub 10 3]]
+    } ns.2-in.tcl]
+    set out [makeFile "" ns.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {13 7}
+
+# Nested namespace
+test ns.3 {namespace: nested namespace} -body {
+    set in  [makeFile {
+        namespace eval ::a::b::c {
+            proc deep {} {return "deep"}
+        }
+        return [::a::b::c::deep]
+    } ns.3-in.tcl]
+    set out [makeFile "" ns.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result deep
+
+# Proc in namespace using namespace variable
+test ns.4 {namespace: variable command} -body {
+    set in  [makeFile {
+        namespace eval ::counter {
+            variable count 0
+            proc incr {} {
+                variable count
+                ::incr count
+                return $count
+            }
+        }
+        list [::counter::incr] [::counter::incr] [::counter::incr]
+    } ns.4-in.tcl]
+    set out [makeFile "" ns.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 2 3}
+
+# Namespace with proc calling sibling proc
+test ns.5 {namespace: proc calls sibling} -body {
+    set in  [makeFile {
+        namespace eval ::util {
+            proc helper {x} {expr {$x * 2}}
+            proc main {x} {return [helper $x]}
+        }
+        return [::util::main 21]
+    } ns.5-in.tcl]
+    set out [makeFile "" ns.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+# Multiple distinct namespaces
+test ns.6 {namespace: multiple distinct namespaces} -body {
+    set in  [makeFile {
+        namespace eval ::ns1 {
+            proc id {} {return ns1}
+        }
+        namespace eval ::ns2 {
+            proc id {} {return ns2}
+        }
+        return [list [::ns1::id] [::ns2::id]]
+    } ns.6-in.tcl]
+    set out [makeFile "" ns.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {ns1 ns2}
+
+# Namespace eval with expressions
+test ns.7 {namespace: eval with computation} -body {
+    set in  [makeFile {
+        namespace eval ::calc {
+            proc factorial {n} {
+                if {$n <= 1} {return 1}
+                expr {$n * [factorial [expr {$n-1}]]}
+            }
+        }
+        return [::calc::factorial 6]
+    } ns.7-in.tcl]
+    set out [makeFile "" ns.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 720
+
+# Namespace with OO class
+test ns.8 {namespace: OO class in namespace} -body {
+    set in  [makeFile {
+        namespace eval ::pkg {
+            oo::class create Thing
+            oo::define Thing method name {} {return "Thing"}
+        }
+        set t [::pkg::Thing new]
+        return [$t name]
+    } ns.8-in.tcl]
+    set out [makeFile "" ns.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result Thing
+
+cleanupTests

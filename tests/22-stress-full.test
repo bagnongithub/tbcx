@@ -1,0 +1,268 @@
+# -*-Tcl-*-
+# 22-stress-full.test — full 256KB stress exerciser for every TBCX path
+#
+# Requires tbcx_stress.tcl in the project root (parent of tests/).
+# That script contains ~2800 self-checking assertions covering:
+#   all literal types, all AuxData types, exception ranges,
+#   procs, OO, namespaces, control flow, lambdas, unicode, etc.
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Locate the stress script relative to this test file
+set stressScript [file join [file dirname [info script]] tbcx_stress.tcl]
+testConstraint have_stress_script [file readable $stressScript]
+
+# --------------------------------------------------------------------------
+# sf.1  Save + load + verify all internal assertions pass
+# --------------------------------------------------------------------------
+test sf.1 {full 256KB stress: save + load + verify all assertions} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.1-out.tbcx]
+    tbcx::save $stressScript $out
+
+    # Load in a child interp to isolate namespace/variable pollution.
+    # Override exit so assertion failures don't kill the test process.
+    interp create STRESS1
+    interp eval STRESS1 [list package require tbcx]
+    interp eval STRESS1 {
+        proc exit {args} {
+            error "TBCX_STRESS_EXIT [lindex $args 0]"
+        }
+    }
+
+    set rc [interp eval STRESS1 [list catch [list tbcx::load $out] _res _opts]]
+    set loadResult [interp eval STRESS1 {set _res}]
+    set loadInfo ""
+    catch {set loadInfo [interp eval STRESS1 {dict get $_opts -errorinfo}]}
+
+    # Read assertion counters (may not exist if load failed very early)
+    set pass 0
+    set fail 0
+    catch {set pass [interp eval STRESS1 {set ::_pass}]}
+    catch {set fail [interp eval STRESS1 {set ::_fail}]}
+    set errors {}
+    if {$fail > 0} {
+        catch {set errors [interp eval STRESS1 {set ::_errors}]}
+    }
+    interp delete STRESS1
+
+    # Report any errors
+    if {$fail != 0} {
+        error "$fail assertion failures out of [expr {$pass + $fail}]: $errors"
+    }
+    if {$rc != 0} {
+        # tbcx::load errored — report the message and where it happened
+        error "tbcx::load error after $pass assertions: $loadResult\n$loadInfo"
+    }
+    set pass
+} -match glob -result {2*}
+
+# --------------------------------------------------------------------------
+# sf.2  Verify the .tbcx is a valid binary (correct magic, non-trivial size)
+# --------------------------------------------------------------------------
+test sf.2 {stress: compiled .tbcx is valid binary with correct magic} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.2-out.tbcx]
+    tbcx::save $stressScript $out
+
+    set tbcxSize [file size $out]
+
+    # Read first 4 bytes and check TBCX magic (little-endian: "TBCX" = 0x58434254)
+    set f [open $out rb]
+    set magic [read $f 4]
+    close $f
+
+    # Must be non-trivial size and have correct magic
+    list [expr {$tbcxSize > 1024}] [expr {$magic eq "TBCX"}]
+} -result {1 1}
+
+# --------------------------------------------------------------------------
+# sf.3  Dump of the .tbcx is well-formed (no errors, has expected sections)
+# --------------------------------------------------------------------------
+test sf.3 {stress: dump is well-formed and contains all sections} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.3-out.tbcx]
+    tbcx::save $stressScript $out
+
+    set dump [tbcx::dump $out]
+
+    # Verify structural markers present
+    set checks 0
+    foreach pat {
+        "TBCX Header:*"
+        "*magic = 0x58434254*"
+        "*format = 91*"
+        "*Top-level block:*"
+        "*Procs: *"
+        "*Classes: *"
+        "*Methods: *"
+    } {
+        if {[string match $pat $dump]} {
+            incr checks
+        }
+    }
+    # All 7 structural patterns must match
+    set checks
+} -result 7
+
+# --------------------------------------------------------------------------
+# sf.4  Re-load produces identical results (deterministic)
+# --------------------------------------------------------------------------
+test sf.4 {stress: deterministic re-load} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.4-out.tbcx]
+    tbcx::save $stressScript $out
+
+    # Load twice in separate child interps
+    set results {}
+    foreach tag {A B} {
+        interp create STRESS4$tag
+        interp eval STRESS4$tag [list package require tbcx]
+        interp eval STRESS4$tag {proc exit {args} {error "exit $args"}}
+        interp eval STRESS4$tag [list catch [list tbcx::load $out]]
+        lappend results [interp eval STRESS4$tag {list $::_pass $::_fail}]
+        interp delete STRESS4$tag
+    }
+
+    # Both runs must produce identical pass/fail counts
+    expr {[lindex $results 0] eq [lindex $results 1]}
+} -result 1
+
+# --------------------------------------------------------------------------
+# sf.5  Save from channel, load from channel
+# --------------------------------------------------------------------------
+test sf.5 {stress: channel-based save and load} \
+    -constraints have_stress_script -body {
+
+    set tbcxPath [makeFile "" sf.5-out.tbcx]
+
+    # Save: read source from a channel, write to a channel
+    set inCh [open $stressScript r]
+    set outCh [open $tbcxPath w]
+    fconfigure $outCh -translation binary
+    tbcx::save $inCh $outCh
+    close $inCh
+    close $outCh
+
+    # Load from channel
+    set ch [open $tbcxPath r]
+    interp create STRESS5
+    interp eval STRESS5 [list package require tbcx]
+    interp eval STRESS5 {proc exit {args} {error "exit $args"}}
+    # Transfer the channel to the child interp
+    interp transfer {} $ch STRESS5
+    set rc [interp eval STRESS5 [list catch [list tbcx::load $ch] _r _o]]
+    set loadResult [interp eval STRESS5 {set _r}]
+    set loadInfo ""
+    catch {set loadInfo [interp eval STRESS5 {dict get $_o -errorinfo}]}
+    set pass 0
+    set fail 0
+    catch {set pass [interp eval STRESS5 {set ::_pass}]}
+    catch {set fail [interp eval STRESS5 {set ::_fail}]}
+    interp eval STRESS5 [list catch [list close $ch]]
+    interp delete STRESS5
+
+    if {$fail != 0} {
+        error "$fail assertion failures after channel load"
+    }
+    if {$rc != 0} {
+        error "channel load error after $pass assertions: $loadResult\n$loadInfo"
+    }
+    expr {$pass > 0}
+} -result 1
+
+# --------------------------------------------------------------------------
+# sf.6  Dump reports correct proc count (> 900 procs in stress script)
+# --------------------------------------------------------------------------
+test sf.6 {stress: dump reports hundreds of procs} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.6-out.tbcx]
+    tbcx::save $stressScript $out
+
+    set dump [tbcx::dump $out]
+
+    # Extract the "Procs: NNN" line
+    if {[regexp {Procs: (\d+)} $dump -> nProcs]} {
+        # The stress script defines 900+ procs
+        expr {$nProcs > 800}
+    } else {
+        error "Could not find Procs count in dump"
+    }
+} -result 1
+
+# --------------------------------------------------------------------------
+# sf.7  Dump reports OO classes and methods
+# --------------------------------------------------------------------------
+test sf.7 {stress: dump reports classes and methods} \
+    -constraints have_stress_script -body {
+
+    set out [makeFile "" sf.7-out.tbcx]
+    tbcx::save $stressScript $out
+
+    set dump [tbcx::dump $out]
+
+    set hasClasses 0
+    set hasMethods 0
+    if {[regexp {Classes: (\d+)} $dump -> nCls]} {
+        set hasClasses [expr {$nCls > 0}]
+    }
+    if {[regexp {Methods: (\d+)} $dump -> nMeth]} {
+        set hasMethods [expr {$nMeth > 0}]
+    }
+    list $hasClasses $hasMethods
+} -result {1 1}
+
+# --------------------------------------------------------------------------
+# sf.8  Verify source is not present in the .tbcx (obscurity goal)
+# --------------------------------------------------------------------------
+# Note: needle strings with unbalanced braces must be built in -setup,
+# not inside the braced -body, to avoid Tcl's brace-matching parser.
+test sf.8 {stress: proc/method source bodies not in .tbcx binary} \
+    -constraints have_stress_script \
+    -setup {
+        # Build search needles that contain braces (can't be literal in -body)
+        set needle_csrc "Tcl_Size"
+        set needle_factorial "return \[expr \{" ;# start of factorial body
+        set needle_assert "string match \$pattern \$got"
+    } \
+    -body {
+
+    set out [makeFile "" sf.8-out.tbcx]
+    tbcx::save $stressScript $out
+
+    # Read the raw binary
+    set f [open $out rb]
+    set raw [read $f]
+    close $f
+
+    # Verify that non-Tcl strings from the C source definitely don't
+    # appear in the binary, and that representative proc body fragments
+    # are absent (they should be compiled to bytecode, not stored as text).
+    #
+    # Note: command names like "string" or "lsort" WILL appear as string
+    # literals (they're referenced by invokeStk instructions), so we test
+    # for complete body-like patterns rather than individual words.
+    set problems {}
+    if {[string first $needle_csrc $raw] >= 0} {
+        lappend problems "Tcl_Size found (C code leaked)"
+    }
+    if {[string first $needle_factorial $raw] >= 0} {
+        lappend problems "factorial body source found"
+    }
+    if {[string first $needle_assert $raw] >= 0} {
+        lappend problems "assert_match body source found"
+    }
+    if {[llength $problems] > 0} {
+        error "source leak: $problems"
+    }
+    expr {1}
+} -result 1
+
+cleanupTests

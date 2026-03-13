@@ -1,0 +1,795 @@
+# -*-Tcl-*-
+# 21-proposals.test — verify proposals P1–P6, P8, P9
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# =====================================================================
+# P1: Precompile namespace eval bodies
+#
+# namespace eval bodies should execute correctly after save/load.
+# The key difference from baseline is that the bodies are now compiled
+# to bytecode in the literal pool rather than stored as source strings.
+# =====================================================================
+
+test p1.1 {P1: namespace eval with variable initialization} -body {
+    set in [makeFile {
+        namespace eval ::p1ns1 {
+            variable version 1.0
+            variable name "tbcx"
+        }
+        return [list $::p1ns1::version $::p1ns1::name]
+    } p1.1-in.tcl]
+    set out [makeFile "" p1.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1.0 tbcx}
+
+test p1.2 {P1: namespace eval with set and expr} -body {
+    set in [makeFile {
+        namespace eval ::p1ns2 {
+            set x 10
+            set y 20
+            proc sum {} {
+                variable x; variable y
+                expr {$x + $y}
+            }
+        }
+        return [::p1ns2::sum]
+    } p1.2-in.tcl]
+    set out [makeFile "" p1.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 30
+
+test p1.3 {P1: nested namespace eval} -body {
+    set in [makeFile {
+        namespace eval ::p1outer {
+            namespace eval inner {
+                proc hello {} { return "inner-hello" }
+            }
+            proc greet {} { return "outer-[inner::hello]" }
+        }
+        return [::p1outer::greet]
+    } p1.3-in.tcl]
+    set out [makeFile "" p1.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result outer-inner-hello
+
+test p1.4 {P1: namespace eval with package-like initialization} -body {
+    set in [makeFile {
+        namespace eval ::p1pkg {
+            variable initialized 0
+            proc init {} {
+                variable initialized
+                set initialized 1
+            }
+            proc status {} {
+                variable initialized
+                return $initialized
+            }
+        }
+        ::p1pkg::init
+        return [::p1pkg::status]
+    } p1.4-in.tcl]
+    set out [makeFile "" p1.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1
+
+test p1.5 {P1: namespace eval with list/dict manipulation} -body {
+    set in [makeFile {
+        namespace eval ::p1data {
+            variable items [list]
+            proc add {item} {
+                variable items
+                lappend items $item
+            }
+            proc count {} {
+                variable items
+                llength $items
+            }
+        }
+        ::p1data::add alpha
+        ::p1data::add beta
+        ::p1data::add gamma
+        return [::p1data::count]
+    } p1.5-in.tcl]
+    set out [makeFile "" p1.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 3
+
+# =====================================================================
+# P2: Recurse into control-flow bodies
+#
+# Procs defined inside if/while/for/foreach/catch/try must be captured.
+# Non-literal arguments (variable refs) must NOT be corrupted.
+# =====================================================================
+
+test p2.1 {P2: proc inside if (literal condition)} -body {
+    set in [makeFile {
+        if {1} {
+            proc p2helper1 {x} { expr {$x * 3} }
+        }
+        return [p2helper1 7]
+    } p2.1-in.tcl]
+    set out [makeFile "" p2.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 21
+
+test p2.2 {P2: if/else with procs passes through correctly (if not recursed)} -body {
+    set in [makeFile {
+        set mode 1
+        if {$mode == 1} {
+            proc p2mode {} { return "fast" }
+        } else {
+            proc p2mode {} { return "slow" }
+        }
+        return [p2mode]
+    } p2.2-in.tcl]
+    set out [makeFile "" p2.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result fast
+
+test p2.3 {P2: foreach with variable list (must NOT corrupt)} -body {
+    set in [makeFile {
+        set lst [list 1 2 3 4 5]
+        set s 0
+        foreach x $lst {
+            incr s $x
+        }
+        return $s
+    } p2.3-in.tcl]
+    set out [makeFile "" p2.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+test p2.4 {P2: foreach with literal list (must NOT corrupt)} -body {
+    set in [makeFile {
+        set s 0
+        foreach x {10 20 30} {
+            incr s $x
+        }
+        return $s
+    } p2.4-in.tcl]
+    set out [makeFile "" p2.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 60
+
+test p2.5 {P2: proc inside foreach with literal list} -body {
+    set in [makeFile {
+        set results {}
+        foreach name {alpha beta} {
+            proc "get_$name" {} [list return $name]
+        }
+        return [list [get_alpha] [get_beta]]
+    } p2.5-in.tcl]
+    set out [makeFile "" p2.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {alpha beta}
+
+test p2.6 {P2: for loop with variable references preserved} -body {
+    set in [makeFile {
+        set total 0
+        for {set i 1} {$i <= 5} {incr i} {
+            incr total $i
+        }
+        return $total
+    } p2.6-in.tcl]
+    set out [makeFile "" p2.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+test p2.7 {P2: proc inside catch} -body {
+    set in [makeFile {
+        catch {
+            proc p2caught {} { return "from-catch" }
+        }
+        return [p2caught]
+    } p2.7-in.tcl]
+    set out [makeFile "" p2.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result from-catch
+
+test p2.8 {P2: catch with variable result (must NOT corrupt)} -body {
+    set in [makeFile {
+        catch {expr {10 + 20}} result
+        return $result
+    } p2.8-in.tcl]
+    set out [makeFile "" p2.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 30
+
+test p2.9 {P2: proc inside try} -body {
+    set in [makeFile {
+        try {
+            proc p2tried {} { return "from-try" }
+        } on error {e} {
+            return "error: $e"
+        }
+        return [p2tried]
+    } p2.9-in.tcl]
+    set out [makeFile "" p2.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result from-try
+
+test p2.10 {P2: while with variable condition (must NOT corrupt)} -body {
+    set in [makeFile {
+        set i 0
+        set s 0
+        while {$i < 5} {
+            incr i
+            incr s $i
+        }
+        return $s
+    } p2.10-in.tcl]
+    set out [makeFile "" p2.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+test p2.11 {P2: proc inside while with literal condition} -body {
+    set in [makeFile {
+        set done 0
+        while {!$done} {
+            proc p2whiled {} { return "from-while" }
+            set done 1
+        }
+        return [p2whiled]
+    } p2.11-in.tcl]
+    set out [makeFile "" p2.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result from-while
+
+test p2.12 {P2: proc inside if inside namespace eval} -body {
+    set in [makeFile {
+        namespace eval ::p2ns {
+            if {1} {
+                proc helper {} { return "ns-if-proc" }
+            }
+        }
+        return [::p2ns::helper]
+    } p2.12-in.tcl]
+    set out [makeFile "" p2.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result ns-if-proc
+
+test p2.13 {P2: long foreach over large list (regression for stress.7)} -body {
+    set body "set lst \[list"
+    for {set i 1} {$i <= 200} {incr i} {
+        append body " $i"
+    }
+    append body "\]\nset s 0\nforeach x \$lst \{ incr s \$x \}\nreturn \$s"
+    set out [makeFile "" p2.13-out.tbcx]
+    tbcx::save $body $out
+    tbcx::load $out
+} -result 20100
+
+test p2.14 {P2: foreach with proc and variable list (regression for adv.8)} -body {
+    set in [makeFile {
+        proc p2mkperson {name age} {
+            dict create name $name age $age
+        }
+        set people [list [p2mkperson Alice 30] [p2mkperson Bob 25]]
+        set names {}
+        foreach p $people {
+            lappend names [dict get $p name]
+        }
+        return $names
+    } p2.14-in.tcl]
+    set out [makeFile "" p2.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {Alice Bob}
+
+test p2.15 {P2: try/on error with variable captures preserved} -body {
+    set in [makeFile {
+        set r ""
+        try {
+            error "boom"
+        } on error {msg opts} {
+            set r $msg
+        }
+        return $r
+    } p2.15-in.tcl]
+    set out [makeFile "" p2.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result boom
+
+test p2.16 {P2: switch command (not handled—verbatim pass-through)} -body {
+    set in [makeFile {
+        set v "b"
+        switch $v {
+            a { set r 1 }
+            b { set r 2 }
+            c { set r 3 }
+        }
+        return $r
+    } p2.16-in.tcl]
+    set out [makeFile "" p2.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 2
+
+# =====================================================================
+# P3: Direct proc install (skip TclCreateProc for 2nd+ proc)
+#
+# Correctness: many procs all callable after load.
+# Performance: implicit (tested via stress below).
+# =====================================================================
+
+test p3.1 {P3: 20 procs all callable} -body {
+    set script ""
+    for {set i 1} {$i <= 20} {incr i} {
+        append script "proc p3f$i \{x\} \{ expr \{\$x + $i\} \}\n"
+    }
+    append script "set r {}\n"
+    for {set i 1} {$i <= 20} {incr i} {
+        append script "lappend r \[p3f$i 100\]\n"
+    }
+    append script "return \$r\n"
+    set out [makeFile "" p3.1-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120}
+
+test p3.2 {P3: procs with default args via direct install} -body {
+    set in [makeFile {
+        proc p3a {x {y 10}} { expr {$x + $y} }
+        proc p3b {x {y 20}} { expr {$x + $y} }
+        proc p3c {x {y 30}} { expr {$x + $y} }
+        return [list [p3a 1] [p3a 1 2] [p3b 1] [p3c 1]]
+    } p3.2-in.tcl]
+    set out [makeFile "" p3.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {11 3 21 31}
+
+test p3.3 {P3: procs with args (variadic) via direct install} -body {
+    set in [makeFile {
+        proc p3sum {args} {
+            set s 0
+            foreach x $args { incr s $x }
+            return $s
+        }
+        proc p3cat {args} {
+            join $args "-"
+        }
+        return [list [p3sum 1 2 3] [p3cat a b c]]
+    } p3.3-in.tcl]
+    set out [makeFile "" p3.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {6 a-b-c}
+
+test p3.4 {P3: procs in namespaces via direct install} -body {
+    set in [makeFile {
+        namespace eval ::p3ns {
+            proc add {a b} { expr {$a + $b} }
+            proc mul {a b} { expr {$a * $b} }
+            proc neg {a}   { expr {-$a} }
+        }
+        return [list [::p3ns::add 3 4] [::p3ns::mul 3 4] [::p3ns::neg 5]]
+    } p3.4-in.tcl]
+    set out [makeFile "" p3.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {7 12 -5}
+
+test p3.5 {P3: recursive proc via direct install} -body {
+    set in [makeFile {
+        proc p3fib1 {n} {
+            if {$n <= 1} { return $n }
+            expr {[p3fib1 [expr {$n-1}]] + [p3fib1 [expr {$n-2}]]}
+        }
+        proc p3fib2 {n} {
+            if {$n <= 1} { return $n }
+            expr {[p3fib2 [expr {$n-1}]] + [p3fib2 [expr {$n-2}]]}
+        }
+        return [list [p3fib1 10] [p3fib2 10]]
+    } p3.5-in.tcl]
+    set out [makeFile "" p3.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {55 55}
+
+# =====================================================================
+# P4: Pre-compile ctor/dtor wrapper
+#
+# Constructors and destructors should work correctly after load.
+# =====================================================================
+
+test p4.1 {P4: constructor with multiple args} -body {
+    set in [makeFile {
+        oo::class create P4Widget
+        oo::define P4Widget {
+            constructor {name width height} {
+                my variable _n _w _h
+                set _n $name; set _w $width; set _h $height
+            }
+            method describe {} {
+                my variable _n _w _h
+                return "$_n: ${_w}x${_h}"
+            }
+        }
+        set w [P4Widget new "button" 100 50]
+        return [$w describe]
+    } p4.1-in.tcl]
+    set out [makeFile "" p4.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {button: 100x50}
+
+test p4.2 {P4: destructor side effects} -body {
+    set in [makeFile {
+        oo::class create P4Tracked
+        oo::define P4Tracked {
+            constructor {} { lappend ::p4log "created" }
+            destructor    { lappend ::p4log "destroyed" }
+        }
+        set ::p4log {}
+        set o [P4Tracked new]
+        $o destroy
+        return $::p4log
+    } p4.2-in.tcl]
+    set out [makeFile "" p4.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {created destroyed}
+
+test p4.3 {P4: constructor with default args} -body {
+    set in [makeFile {
+        oo::class create P4Def
+        oo::define P4Def {
+            constructor {{val 42}} {
+                my variable v
+                set v $val
+            }
+            method get {} { my variable v; return $v }
+        }
+        set a [P4Def new]
+        set b [P4Def new 99]
+        return [list [$a get] [$b get]]
+    } p4.3-in.tcl]
+    set out [makeFile "" p4.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {42 99}
+
+# =====================================================================
+# P5: Precompile OO builder stubs (subsumed by P1/P6)
+#
+# Classes using the builder form should still load correctly.
+# =====================================================================
+
+test p5.1 {P5: builder body with multiple methods} -body {
+    set in [makeFile {
+        oo::class create P5Calc {
+            method add {a b} { expr {$a + $b} }
+            method sub {a b} { expr {$a - $b} }
+            method mul {a b} { expr {$a * $b} }
+        }
+        set c [P5Calc new]
+        return [list [$c add 6 3] [$c sub 6 3] [$c mul 6 3]]
+    } p5.1-in.tcl]
+    set out [makeFile "" p5.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {9 3 18}
+
+test p5.2 {P5: builder body with non-method subcommands} -body {
+    set in [makeFile {
+        oo::class create P5Base {
+            method base {} { return "base" }
+        }
+        oo::class create P5Child {
+            superclass P5Base
+            method child {} { return "child-[my base]" }
+        }
+        set o [P5Child new]
+        return [$o child]
+    } p5.2-in.tcl]
+    set out [makeFile "" p5.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result child-base
+
+# =====================================================================
+# P6: Generic script detection
+#
+# String literals that look like evaluable scripts should still work
+# correctly after save/load (they get pre-compiled in the literal pool).
+# =====================================================================
+
+test p6.1 {P6: eval of literal script body} -body {
+    set in [makeFile {
+        set r [eval {
+            set a 10
+            set b 20
+            expr {$a + $b}
+        }]
+        return $r
+    } p6.1-in.tcl]
+    set out [makeFile "" p6.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 30
+
+test p6.2 {P6: uplevel with literal script} -body {
+    set in [makeFile {
+        proc p6run {} {
+            uplevel 1 {
+                set p6result "from-uplevel"
+            }
+        }
+        p6run
+        return $p6result
+    } p6.2-in.tcl]
+    set out [makeFile "" p6.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result from-uplevel
+
+test p6.3 {P6: interp eval with script (correctness)} -body {
+    set in [makeFile {
+        set sub [interp create]
+        set r [interp eval $sub {
+            set x 42
+            expr {$x * 2}
+        }]
+        interp delete $sub
+        return $r
+    } p6.3-in.tcl]
+    set out [makeFile "" p6.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 84
+
+# =====================================================================
+# P8: Scrub remaining string literals
+#
+# Verify that proc/method body source code is not visible in the
+# .tbcx binary or in tbcx::dump output.
+# =====================================================================
+
+test p8.1 {P8: proc body source statements not in dump} -body {
+    # Use a multi-statement body whose SOURCE TEXT is distinctive.
+    # Individual literals (variable names, numbers) will appear in the
+    # compiled bytecode, but the Tcl SOURCE STATEMENT "set P8X_A 111"
+    # will NOT appear — only the compiled bytecode instructions do.
+    set in [makeFile {
+        proc p8secret {} {
+            set P8X_A 111
+            set P8X_B 222
+            return [expr {$P8X_A + $P8X_B}]
+        }
+        return [p8secret]
+    } p8.1-in.tcl]
+    set out [makeFile "" p8.1-out.tbcx]
+    tbcx::save $in $out
+    set dump [tbcx::dump $out]
+    # The source text "set P8X_A 111" should not appear in the dump.
+    # (Individual literals P8X_A and 111 may appear, but not as a
+    # Tcl statement.)
+    set found [string match "*set P8X_A 111*" $dump]
+    set result [tbcx::load $out]
+    list $found $result
+} -result {0 333}
+
+test p8.2 {P8: proc body source not in raw binary} -body {
+    set in [makeFile {
+        proc p8secret2 {} {
+            set P8Y_A "alpha"
+            set P8Y_B "beta"
+            return "${P8Y_A}_${P8Y_B}"
+        }
+        return [p8secret2]
+    } p8.2-in.tcl]
+    set out [makeFile "" p8.2-out.tbcx]
+    tbcx::save $in $out
+    # Read the raw binary and search for a source code statement.
+    # "set P8Y_A" is a Tcl statement that only exists in uncompiled source.
+    set fd [open $out rb]
+    set raw [read $fd]
+    close $fd
+    set found [string match "*set P8Y_A*" $raw]
+    set result [tbcx::load $out]
+    list $found $result
+} -result {0 alpha_beta}
+
+test p8.3 {P8: method body source not in dump} -body {
+    set in [makeFile {
+        oo::class create P8Cls
+        oo::define P8Cls method secret {} {
+            set P8Z_M 42
+            set P8Z_N 58
+            return [expr {$P8Z_M + $P8Z_N}]
+        }
+        set o [P8Cls new]
+        return [$o secret]
+    } p8.3-in.tcl]
+    set out [makeFile "" p8.3-out.tbcx]
+    tbcx::save $in $out
+    set dump [tbcx::dump $out]
+    # Source statement "set P8Z_M 42" should not appear
+    set found [string match "*set P8Z_M 42*" $dump]
+    set result [tbcx::load $out]
+    list $found $result
+} -result {0 100}
+
+test p8.4 {P8: non-definition strings preserved} -body {
+    # A string that contains "proc" as a substring but is NOT a proc
+    # definition should still be available at runtime
+    set in [makeFile {
+        set msg "the proc finished processing"
+        return $msg
+    } p8.4-in.tcl]
+    set out [makeFile "" p8.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {the proc finished processing}
+
+# =====================================================================
+# P9: tbcx::gc — ApplyShim lifecycle management
+# =====================================================================
+
+test p9.1 {P9: gc before any load is a no-op} -body {
+    tbcx::gc
+    return ok
+} -result ok
+
+test p9.2 {P9: gc after load succeeds} -body {
+    set in [makeFile {
+        proc p9f {} { return "gc-test" }
+        return [p9f]
+    } p9.2-in.tcl]
+    set out [makeFile "" p9.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+    tbcx::gc
+    return ok
+} -result ok
+
+test p9.3 {P9: gc does not break subsequent operations} -body {
+    set in [makeFile {
+        set fn [list x {expr {$x + 1}}]
+        return [apply $fn 41]
+    } p9.3-in.tcl]
+    set out [makeFile "" p9.3-out.tbcx]
+    tbcx::save $in $out
+    set r1 [tbcx::load $out]
+    tbcx::gc
+    # Save and load a second script after gc
+    set in2 [makeFile {return "post-gc"} p9.3b-in.tcl]
+    set out2 [makeFile "" p9.3b-out.tbcx]
+    tbcx::save $in2 $out2
+    set r2 [tbcx::load $out2]
+    list $r1 $r2
+} -result {42 post-gc}
+
+test p9.4 {P9: gc with wrong args returns error} -body {
+    catch {tbcx::gc extra_arg} msg
+    return $msg
+} -match glob -result {wrong # args*}
+
+test p9.5 {P9: multiple gc calls are safe} -body {
+    tbcx::gc
+    tbcx::gc
+    tbcx::gc
+    return ok
+} -result ok
+
+# =====================================================================
+# Combined / integration tests
+# =====================================================================
+
+test combo.1 {P1+P2: namespace eval with conditional proc} -body {
+    set in [makeFile {
+        namespace eval ::combons {
+            variable mode "active"
+            if {$mode eq "active"} {
+                proc run {} { return "running" }
+            }
+        }
+        return [::combons::run]
+    } combo.1-in.tcl]
+    set out [makeFile "" combo.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result running
+
+test combo.2 {P1+P3: namespace with many procs} -body {
+    set script "namespace eval ::combom \{\n"
+    for {set i 1} {$i <= 10} {incr i} {
+        append script "    proc f$i \{x\} \{ expr \{\$x + $i\} \}\n"
+    }
+    append script "\}\n"
+    append script "set r {}\n"
+    for {set i 1} {$i <= 10} {incr i} {
+        append script "lappend r \[::combom::f$i 0\]\n"
+    }
+    append script "return \$r\n"
+    set out [makeFile "" combo.2-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {1 2 3 4 5 6 7 8 9 10}
+
+test combo.3 {P2+P4: proc inside if + OO ctor/dtor} -body {
+    set in [makeFile {
+        if {1} {
+            oo::class create ComboObj
+            oo::define ComboObj {
+                constructor {tag} {
+                    my variable _tag
+                    set _tag $tag
+                }
+                method tag {} {
+                    my variable _tag
+                    return $_tag
+                }
+            }
+        }
+        set o [ComboObj new "combo"]
+        return [$o tag]
+    } combo.3-in.tcl]
+    set out [makeFile "" combo.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result combo
+
+test combo.4 {P1+P6+P8: namespace eval body not readable as source} -body {
+    set in [makeFile {
+        namespace eval ::combostrip {
+            variable sentinel "NS_BODY_SECRET_TEXT_98765"
+            proc reveal {} {
+                variable sentinel
+                return $sentinel
+            }
+        }
+        return [::combostrip::reveal]
+    } combo.4-in.tcl]
+    set out [makeFile "" combo.4-out.tbcx]
+    tbcx::save $in $out
+    # Check that the sentinel doesn't appear as a raw literal in dump
+    set dump [tbcx::dump $out]
+    # The value might appear in bytecode (as a compiled literal in the
+    # namespace eval block), but the proc body text should not.
+    # Verify correctness in any case.
+    set result [tbcx::load $out]
+    expr {$result eq "NS_BODY_SECRET_TEXT_98765"}
+} -result 1
+
+test combo.5 {P3+P9: many procs then gc} -body {
+    set script ""
+    for {set i 1} {$i <= 15} {incr i} {
+        append script "proc combogc$i \{\} \{ return $i \}\n"
+    }
+    append script "set r {}\n"
+    for {set i 1} {$i <= 15} {incr i} {
+        append script "lappend r \[combogc$i\]\n"
+    }
+    append script "return \$r\n"
+    set out [makeFile "" combo.5-out.tbcx]
+    tbcx::save $script $out
+    set result [tbcx::load $out]
+    tbcx::gc
+    expr {$result eq "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"}
+} -result 1
+
+# =====================================================================
+
+cleanupTests

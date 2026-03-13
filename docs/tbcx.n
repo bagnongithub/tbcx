@@ -1,4 +1,4 @@
-.TH tbcx 3 "Oct 22, 2025" "tbcx 1.0" "Tcl Bytecode eXchange"
+.TH tbcx 3 "Mar 13, 2026" "tbcx 1.0" "Tcl Bytecode eXchange"
 .SH NAME
 tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas)
 .SH SYNOPSIS
@@ -6,17 +6,22 @@ tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO met
 \fBtbcx::save\fR \fIin out\fR
 \fBtbcx::load\fR \fIin\fR
 \fBtbcx::dump\fR \fIfilename\fR
+\fBtbcx::gc\fR
 .fi
 
 .SH DESCRIPTION
-The \fBtbcx\fR extension provides three subcommands that enable an efficient
+The \fBtbcx\fR extension provides four commands that enable an efficient
 \fIsave \[->] load \[->] eval\fR pipeline for Tcl 9.1 scripts. The goal is to pay the cost of
 parsing/compiling at save time so that loading is as fast as reading a compact binary, while
 remaining functionally equivalent to \fBsource\fR of the original script.
 .PP
 Artifacts store the compiled top\-level, precompiled \fBproc\fR bodies, TclOO method/ctor/dtor
 bodies, and \fBlambda\fR literals for use with \fBapply\fR. Loading installs these into the current
-interpreter and executes the top\-level block in the caller's current namespace.
+interpreter and executes the top\-level block with \fBTCL_EVAL_GLOBAL\fR.
+.PP
+In safe interpreters, only \fBtbcx::dump\fR (read-only) is exposed. The
+\fBtbcx::save\fR and \fBtbcx::load\fR commands perform file I/O and are not
+available unless explicitly exposed by the caller.
 
 .SH COMMANDS
 .SS "tbcx::save in out"
@@ -32,16 +37,16 @@ One of:
 .IP \(bu 2
 \fIString\fR \- a Tcl string value containing the script text.
 .IP \(bu 2
-\fIReadable channel\fR \- an open channel; the command enforces binary\-safe reads.
+\fIReadable channel\fR \- an open channel; the caller controls its encoding settings (the command does not alter them).
 .IP \(bu 2
-\fIReadable path\fR \- a filesystem path to a script file; it is opened, read, and closed by \fBtbcx::save\fR.
+\fIReadable path\fR \- a filesystem path to a script file; it is opened in text mode (default UTF\-8), read, and closed by \fBtbcx::save\fR.
 .RE
 .TP
 .I out
 One of:
 .RS
 .IP \(bu 2
-\fIWritable channel\fR \- an open channel; the command writes binary data and does \fInot\fR close the channel.
+\fIWritable channel\fR \- an open channel; the command enforces binary mode and does \fInot\fR close the channel.
 .IP \(bu 2
 \fIWritable path\fR \- a filesystem path for the new \fB.tbcx\fR file; it is created/truncated and closed on return.
 .RE
@@ -49,10 +54,17 @@ One of:
 .B Behavior
 .RS
 .IP \(bu 2
-Compiles the top\-level block, discovers and precompiles \fBproc\fR bodies and TclOO method/ctor/dtor bodies,
-and captures \fIlambda literals\fR as lambda\-bytecode literals (for \fBapply\fR).
+Performs a single\-pass capture and rewrite of the script, extracting \fBproc\fR, \fBnamespace eval\fR,
+\fBoo::class create\fR, and \fBoo::define\fR/\fBoo::objdefine\fR definitions while producing a
+rewritten script with method bodies replaced by stubs.
+.IP \(bu 2
+Pre\-compiles namespace eval body literals and other script\-body patterns (try, foreach, while, for, catch, if/elseif/else).
 .IP \(bu 2
 Serializes the header, top\-level block, Procs table, Classes catalog (advisory), and Methods table.
+.IP \(bu 2
+Lambda literals (\fBapply\fR forms) are compiled and serialized as lambda\-bytecode literals.
+.IP \(bu 2
+Conflicting proc definitions across if/else branches are handled via indexed markers, enabling position\-based matching at load time.
 .RE
 .PP
 .B Returns
@@ -63,16 +75,17 @@ The output object: either the normalized path written, or the writable channel h
 .B Errors
 .RS
 Typical errors include: unreadable input; unwritable output; version/format mismatch; unknown/unsupported AuxData;
-size limit exceeded (code, literals, AuxData, exception ranges, strings); short read/write.
+size limit exceeded (code, literals, AuxData, exception ranges, strings); runaway serialization
+(too many literals, blocks, excessive recursion depth, or output too large); short read/write.
 The interpreter result contains a descriptive message.
 .RE
 .PP
 .B Notes
 .RS
 .IP \(bu 2
-Channels are treated as binary for portability; encodings are not altered on the caller's behalf, and channels are not closed.
+Input channels retain their encoding settings; output channels are set to binary mode.
 .IP \(bu 2
-The produced artifact is intended for Tcl 9.1; other versions are rejected at load time.
+The produced artifact targets Tcl 9.1 (format version 91); other versions are rejected at load time.
 .RE
 .PP
 .B Examples
@@ -87,7 +100,6 @@ tbcx::save $script ./hello.tbcx
 # Save from channel \-> channel
 set in  [open ./lib/foo.tcl r]
 set out [open ./foo.tbcx w]
-fconfigure $in  -translation binary -eofchar {}
 fconfigure $out -translation binary -eofchar {}
 try {
     tbcx::save $in $out
@@ -116,18 +128,26 @@ One of:
 .B Behavior
 .RS
 .IP \(bu 2
-Validates header and producer version; deserializes sections.
+Validates header and producer version (exact major.minor match required); deserializes sections.
 .IP \(bu 2
-Materializes procs and TclOO methods (ctors/dtors) from precompiled bodies.
+Installs a temporary \fBProcShim\fR that intercepts the \fBproc\fR command to substitute
+precompiled bodies when the name and argument signature match.
 .IP \(bu 2
-Rehydrates lambda\-bytecode literals so the first \fBapply\fR incurs no compilation.
+Installs a temporary \fBOOShim\fR that intercepts \fBoo::define\fR and \fBoo::objdefine\fR
+to substitute precompiled method/constructor/destructor bodies.
 .IP \(bu 2
-Executes the precompiled top\-level block in the caller's current namespace.
+Registers precompiled lambdas in a persistent per\-interpreter \fBApplyShim\fR that
+recovers the compiled representation if type shimmer evicts it.
+.IP \(bu 2
+Executes the precompiled top\-level block with \fBTCL_EVAL_GLOBAL\fR.
+A top\-level \fBreturn\fR is handled identically to \fBsource\fR.
+.IP \(bu 2
+Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter's lifetime.
 .RE
 .PP
 .B Returns
 .RS
-Empty string on success.
+The result of the top\-level block evaluation.
 .RE
 .PP
 .B Errors
@@ -139,18 +159,15 @@ size limit exceeded; short read; class or namespace creation errors during top\-
 .B Notes
 .RS
 .IP \(bu 2
-Load in a specific namespace by wrapping the call: \fBnamespace eval ::pkg { tbcx::load ./app.tbcx }\fR
+The top\-level block executes with \fBTCL_EVAL_GLOBAL\fR; compiled locals for the global frame are linked to existing global variables.
 .IP \(bu 2
 Loading executes code; only load artifacts from trusted sources.
 .RE
 .PP
 .B Examples
 .nf
-# Load into current namespace
+# Load into current interp
 tbcx::load ./app.tbcx
-
-# Load into a dedicated namespace
-namespace eval ::app { tbcx::load ./app.tbcx }
 
 # Load from an open channel
 set ch [open ./app.tbcx r]
@@ -195,39 +212,49 @@ Unreadable file; bad header; malformed section; short read.
 % tbcx::dump out
 TBCX Header:
   magic = 0x58434254 ('T''B''C''X')
-  format = 9
+  format = 91
   tcl_version = 9.1.0 (type 0)
   top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
 
 Top-level block:
   Disassembly (top-level):
-ByteCode 0x7f9963089e10, refCt 1, epoch 20, interp 0x7f9963816a10 (epoch 20)
-  Source ""
-  Cmds 0, src 0, inst 11, litObjs 1, aux 0, stkDepth 1, code/src 0.00
-    (0) push 0 	# "1"
-    (5) storeScalar %v0
-    (10) done
-
-  code=11, stack=1, lits=1, aux=0, except=0
-  Locals (1):
-    [0] "a"
-  Literals:
-    [0] (bignum) 1
-
-Procs: 0
-
-Classes: 0
-
-Methods: 0
+...
 .fi
+
+.SS "tbcx::gc"
+.B Synopsis
+.PP
+Purge stale entries from the per\-interpreter lambda shimmer\-recovery registry.
+.PP
+.B Behavior
+.RS
+The \fBApplyShim\fR maintains a registry of precompiled lambda objects. Over time,
+entries for lambdas that are no longer referenced (except by the registry itself)
+accumulate. This command purges those stale entries immediately.
+.PP
+Stale entries are also purged lazily on each \fBtbcx::load\fR call, so explicit
+use of \fBtbcx::gc\fR is typically unnecessary except in long\-running interpreters
+that load many \fB.tbcx\fR files and want to reclaim memory sooner.
+.RE
+.PP
+.B Parameters
+.RS
+None.
+.RE
+.PP
+.B Returns
+.RS
+Empty string.
+.RE
 
 .SH FILE FORMAT (OVERVIEW)
 .PP
-This section summarizes the on\-disk structure.
+This section summarizes the on\-disk structure. Format version is 91 (Tcl 9.1).
+All integers are little\-endian.
 .TP
 .B Header
-Magic + format version + producing Tcl version; size/count metadata for the top\-level block
-(code length, literal count, AuxData count, exception ranges, locals, max stack).
+Magic (0x58434254) + format version (91) + producing Tcl version; size/count metadata for the top\-level block
+(code length, exception ranges, literal count, AuxData count, locals, max stack).
 .TP
 .B Sections (order)
 (1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue);
@@ -236,18 +263,21 @@ Magic + format version + producing Tcl version; size/count metadata for the top\
 (4) Methods (class, kind, name, args, compiled block).
 .TP
 .B Literal kinds
-boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict, embedded bytecode,
+boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict (insertion order preserved), embedded bytecode,
 and \fBlambda\-bytecode\fR literals for use with \fBapply\fR.
 .TP
 .B AuxData families
-jump tables (string or numeric), dictupdate, foreach (legacy/new).
+jump tables (string or numeric), dictupdate, and NewForeachInfo.
 
 .SH LAMBDA SUPPORT
 .PP
 Literals in the script that represent \fIlambdas\fR for \fBapply\fR (lists of the form
 \fC{args body ?ns?}\fR) are compiled and serialized as lambda\-bytecode literals at save time.
-On load, both the compiled body and the optional namespace element are rehydrated so that the
-first call to \fBapply\fR does not trigger compilation.
+On load, the compiled body, argument list, and optional namespace element are rehydrated
+into a \fBProc\fR and registered in the \fBApplyShim\fR so that the first call to
+\fBapply\fR does not trigger compilation. If type shimmer later evicts the lambdaExpr
+internal representation, the ApplyShim transparently re\-installs it on the next
+\fBapply\fR call.
 
 .SH SEMANTICS AND PERFORMANCE
 .PP
@@ -255,24 +285,28 @@ Artifacts are portable across little\- and big\-endian hosts. The loader detects
 once and applies a tight in\-place swap over bulk sections that require conversion, avoiding
 per\-field branching so cross\-endian loads remain close to native performance.
 .PP
-Loading executes the precompiled top\-level, then installs precompiled proc/method bodies and
-rehydrates lambda literals. The intent is to be functionally indistinguishable from \fBsource\fR
-of the original script, with the benefit of faster startup due to avoided parsing/compilation.
+Loading executes the precompiled top\-level (with \fBTCL_EVAL_GLOBAL\fR), then installs
+precompiled proc/method bodies and rehydrates lambda literals. The intent is to be
+functionally indistinguishable from \fBsource\fR of the original script, with the benefit
+of faster startup due to avoided parsing/compilation.
 
 .SH LIMITS
 .PP
-Sanity caps exist for code size, literal count (including lambdas), AuxData count, exception ranges,
-and string lengths. Exceeding limits produces an error.
+Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
+string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
+total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
+Exceeding any limit produces an error.
 
 .SH DIAGNOSTICS
 .PP
 Representative messages include: "bad header", "incompatible Tcl version", "short read/write",
-"unsupported AuxData kind", "input is neither an open channel nor a readable file", and
-"errors while evaluating top\-level".
+"unsupported AuxData kind", "input is neither an open channel nor a readable file",
+"runaway serialization detected", and Tcl errors from top\-level evaluation.
 
 .SH SECURITY
 .PP
 Loading executes code. Only load artifacts you trust.
+Safe interpreters receive only \fBtbcx::dump\fR (read-only).
 
 .SH SEE ALSO
 source(n), TclOO(n)

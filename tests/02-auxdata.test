@@ -73,8 +73,8 @@ test aux.5 {AUX: jumpTable (string)} -body {
             }
         }
         return [myproc]
-    } aux.1-in.tcl]
-    set out [makeFile "" aux.1-out.tbcx]
+    } aux.5-in.tcl]
+    set out [makeFile "" aux.5-out.tbcx]
     tbcx::save $in $out
     tbcx::load $out
 } -result 2
@@ -91,8 +91,8 @@ test aux.6 {AUX: jumpTableNum (integer)} -body {
             }
         }
         return [myproc]
-    } aux.2-in.tcl]
-    set out [makeFile "" aux.2-out.tbcx]
+    } aux.6-in.tcl]
+    set out [makeFile "" aux.6-out.tbcx]
     tbcx::save $in $out
     tbcx::load $out
 } -result 25
@@ -108,8 +108,8 @@ test aux.7 {AUX: dict update} -body {
             return $res
         }
         return [myproc]
-    } aux.3-in.tcl]
-    set out [makeFile "" aux.3-out.tbcx]
+    } aux.7-in.tcl]
+    set out [makeFile "" aux.7-out.tbcx]
     tbcx::save $in $out
     tbcx::load $out
 } -result 1|2
@@ -125,10 +125,240 @@ test aux.8 {AUX: foreach} -body {
             return $s
         }
         return [myproc]
-    } aux.4-in.tcl]
-    set out [makeFile "" aux.4-out.tbcx]
+    } aux.8-in.tcl]
+    set out [makeFile "" aux.8-out.tbcx]
     tbcx::save $in $out
     tbcx::load $out
 } -result 6
+
+# ---- NEW TESTS ----
+
+# Multi-variable foreach
+test aux.9 {AUX: foreach multi-var} -body {
+    set in  [makeFile {
+        set res {}
+        foreach {a b} {1 2 3 4 5 6} {
+            lappend res [expr {$a + $b}]
+        }
+        return $res
+    } aux.9-in.tcl]
+    set out [makeFile "" aux.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {3 7 11}
+
+# Multi-variable foreach in proc
+test aux.10 {AUX: foreach multi-var in proc} -body {
+    set in  [makeFile {
+        proc pairsum {lst} {
+            set res {}
+            foreach {a b} $lst {
+                lappend res [expr {$a + $b}]
+            }
+            return $res
+        }
+        return [pairsum {10 20 30 40}]
+    } aux.10-in.tcl]
+    set out [makeFile "" aux.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {30 70}
+
+# Nested foreach
+test aux.11 {AUX: nested foreach} -body {
+    set in  [makeFile {
+        set res {}
+        foreach x {a b} {
+            foreach y {1 2} {
+                lappend res "$x$y"
+            }
+        }
+        return $res
+    } aux.11-in.tcl]
+    set out [makeFile "" aux.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {a1 a2 b1 b2}
+
+# Nested foreach in proc
+test aux.12 {AUX: nested foreach in proc} -body {
+    set in  [makeFile {
+        proc cross {xs ys} {
+            set res {}
+            foreach x $xs {
+                foreach y $ys {
+                    lappend res "$x$y"
+                }
+            }
+            return $res
+        }
+        return [cross {a b} {1 2}]
+    } aux.12-in.tcl]
+    set out [makeFile "" aux.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {a1 a2 b1 b2}
+
+# Switch with many string keys
+test aux.13 {AUX: switch many string keys} -body {
+    set in  [makeFile {
+        proc day {x} {
+            switch -exact -- $x {
+                mon {return Monday}
+                tue {return Tuesday}
+                wed {return Wednesday}
+                thu {return Thursday}
+                fri {return Friday}
+                sat {return Saturday}
+                sun {return Sunday}
+                default {return unknown}
+            }
+        }
+        return [list [day wed] [day sun] [day xxx]]
+    } aux.13-in.tcl]
+    set out [makeFile "" aux.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {Wednesday Sunday unknown}
+
+# Switch with many integer keys
+test aux.14 {AUX: switch many integer keys} -body {
+    set in  [makeFile {
+        proc grade {n} {
+            switch -exact -- $n {
+                1 {return F}
+                2 {return D}
+                3 {return C}
+                4 {return B}
+                5 {return A}
+                default {return ?}
+            }
+        }
+        return [list [grade 1] [grade 3] [grade 5] [grade 9]]
+    } aux.14-in.tcl]
+    set out [makeFile "" aux.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {F C A ?}
+
+# Dict update with many variables
+test aux.15 {AUX: dict update many vars} -body {
+    set in  [makeFile {
+        proc fmt {d} {
+            dict update d first F last L age A {
+                return "$F $L age $A"
+            }
+        }
+        return [fmt [dict create first John last Doe age 30]]
+    } aux.15-in.tcl]
+    set out [makeFile "" aux.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {John Doe age 30}
+
+# Dict update modifying value
+test aux.16 {AUX: dict update modify} -body {
+    set in  [makeFile {
+        set d [dict create x 10 y 20]
+        dict update d x X y Y {
+            set X [expr {$X * 2}]
+            set Y [expr {$Y + 5}]
+        }
+        return [list [dict get $d x] [dict get $d y]]
+    } aux.16-in.tcl]
+    set out [makeFile "" aux.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {20 25}
+
+# lmap (compiled foreach variant)
+test aux.17 {AUX: lmap basic} -body {
+    set in  [makeFile {
+        return [lmap x {1 2 3 4 5} {expr {$x * $x}}]
+    } aux.17-in.tcl]
+    set out [makeFile "" aux.17-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 4 9 16 25}
+
+# lmap in proc
+test aux.18 {AUX: lmap in proc} -body {
+    set in  [makeFile {
+        proc squares {lst} {
+            return [lmap x $lst {expr {$x * $x}}]
+        }
+        return [squares {2 3 4}]
+    } aux.18-in.tcl]
+    set out [makeFile "" aux.18-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {4 9 16}
+
+# lmap multi-var
+test aux.19 {AUX: lmap multi-var} -body {
+    set in  [makeFile {
+        return [lmap {k v} {a 1 b 2 c 3} {list $k $v}]
+    } aux.19-in.tcl]
+    set out [makeFile "" aux.19-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{a 1} {b 2} {c 3}}
+
+# Multiple AuxData types in one script (top-level, no proc shim interaction)
+test aux.20 {AUX: mixed auxdata types} -body {
+    set in  [makeFile {
+        # foreach => NewForeachInfo AuxData
+        set s 0
+        foreach x {10 20 30} { incr s $x }
+        # switch => JumptableInfo AuxData
+        switch -exact -- "b" {
+            a {set tag A}
+            b {set tag B}
+        }
+        # dict update => DictUpdateInfo AuxData
+        set d [dict create k val]
+        dict update d k K { set dv $K }
+        return [list $s $tag $dv]
+    } aux.20-in.tcl]
+    set out [makeFile "" aux.20-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {60 B val}
+
+# Foreach with break
+test aux.21 {AUX: foreach with break} -body {
+    set in  [makeFile {
+        proc find_first_neg {lst} {
+            foreach x $lst {
+                if {$x < 0} { return $x }
+            }
+            return none
+        }
+        return [list [find_first_neg {1 2 -3 4}] [find_first_neg {1 2 3}]]
+    } aux.21-in.tcl]
+    set out [makeFile "" aux.21-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {-3 none}
+
+# Foreach with continue
+test aux.22 {AUX: foreach with continue} -body {
+    set in  [makeFile {
+        proc skip_neg {lst} {
+            set res {}
+            foreach x $lst {
+                if {$x < 0} continue
+                lappend res $x
+            }
+            return $res
+        }
+        return [skip_neg {1 -2 3 -4 5}]
+    } aux.22-in.tcl]
+    set out [makeFile "" aux.22-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {1 3 5}
+
+
 
 cleanupTests

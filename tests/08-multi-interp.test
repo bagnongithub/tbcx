@@ -14,4 +14,83 @@ test interp.1 {multi-interpreter: load & eval in child interp} -body {
     set res
 } -result child-ok
 
+# ---- NEW TESTS ----
+
+# Load same file in two child interps
+test interp.2 {load in two child interps} -body {
+    set out [makeFile "" interp.2-out.tbcx]
+    tbcx::save {return "shared"} $out
+    interp create I1
+    interp create I2
+    interp eval I1 [list package require tbcx]
+    interp eval I2 [list package require tbcx]
+    set r1 [interp eval I1 [list tbcx::load $out]]
+    set r2 [interp eval I2 [list tbcx::load $out]]
+    interp delete I1
+    interp delete I2
+    list $r1 $r2
+} -result {shared shared}
+
+# Load file with procs in child interp
+test interp.3 {child interp: proc execution} -body {
+    set in  [makeFile {
+        proc triple {x} {expr {$x * 3}}
+        return [triple 7]
+    } interp.3-in.tcl]
+    set out [makeFile "" interp.3-out.tbcx]
+    tbcx::save $in $out
+    interp create C
+    interp eval C [list package require tbcx]
+    set res [interp eval C [list tbcx::load $out]]
+    interp delete C
+    set res
+} -result 21
+
+# Child interp with OO
+test interp.4 {child interp: OO class} -body {
+    set in  [makeFile {
+        oo::class create Greeter
+        oo::define Greeter method greet {name} {return "hi $name"}
+        set g [Greeter new]
+        return [$g greet World]
+    } interp.4-in.tcl]
+    set out [makeFile "" interp.4-out.tbcx]
+    tbcx::save $in $out
+    interp create C
+    interp eval C [list package require tbcx]
+    set res [interp eval C [list tbcx::load $out]]
+    interp delete C
+    set res
+} -result {hi World}
+
+# Load and save both in child interp
+test interp.5 {child interp: save and load} -body {
+    set out [makeFile "" interp.5-out.tbcx]
+    interp create C
+    interp eval C [list package require tbcx]
+    interp eval C [list tbcx::save {return "created-in-child"} $out]
+    set res [interp eval C [list tbcx::load $out]]
+    interp delete C
+    set res
+} -result created-in-child
+
+# Interp isolation: different results
+test interp.6 {child interps isolated} -body {
+    set out1 [makeFile "" interp.6a-out.tbcx]
+    set out2 [makeFile "" interp.6b-out.tbcx]
+    tbcx::save {return "alpha"} $out1
+    tbcx::save {return "beta"} $out2
+    interp create I1
+    interp create I2
+    interp eval I1 [list package require tbcx]
+    interp eval I2 [list package require tbcx]
+    set r1 [interp eval I1 [list tbcx::load $out1]]
+    set r2 [interp eval I2 [list tbcx::load $out2]]
+    interp delete I1
+    interp delete I2
+    list $r1 $r2
+} -result {alpha beta}
+
+
+
 cleanupTests

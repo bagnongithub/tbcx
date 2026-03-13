@@ -2,7 +2,7 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Oct 22, 2025'>
+  <meta name='date' content='Mar 13, 2026'>
   <meta name='generator' content='tbcx 1.0'>
   <style>
     :root{
@@ -57,7 +57,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Oct 22, 2025</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Mar 13, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -83,6 +83,7 @@
             <li><a href='#tbcx-save-in-out'>tbcx::save in out</a></li>
             <li><a href='#tbcx-load-in'>tbcx::load in</a></li>
             <li><a href='#tbcx-dump-filename'>tbcx::dump filename</a></li>
+            <li><a href='#tbcx-gc'>tbcx::gc</a></li>
           </ul>
         </nav>
       </section>
@@ -91,332 +92,244 @@
         <code>
           tbcx::save in out
           tbcx::load in
-          tbcx::dump filename</code>
+          tbcx::dump filename
+          tbcx::gc</code>
       </pre>
       <h2 id='description'>DESCRIPTION</h2>
       <p>
-        The <b>tbcx</b> extension provides three subcommands that enable an efficient
-        <i>save → load → eval</i> pipeline for Tcl 9.1 scripts.</p>
+        The <b>tbcx</b> extension provides four commands that enable an efficient
+        <i>save &rarr; load &rarr; eval</i> pipeline for Tcl 9.1 scripts.</p>
       <p>
-        The goal is to pay the cost of parsing/compiling at save time so that loading is as fast as
-        reading a compact binary, while remaining functionally equivalent to <b>source</b> of the
-        original script.
-      </p>
+        The goal is to pay the cost of parsing/compiling at save time so that loading is
+        as fast as reading a compact binary, while remaining functionally equivalent to
+        <b>source</b> of the original script.</p>
       <p>
-        Artifacts store the compiled top-level, precompiled <b>proc</b> bodies, TclOO method/ctor/dtor
-        bodies, and <b>lambda</b> literals for use with <b>apply</b>. Loading installs these into the current
-        interpreter and executes the top-level block in the caller's current namespace.
-      </p>
+        Artifacts store the compiled top-level, precompiled <b>proc</b> bodies, TclOO
+        method/ctor/dtor bodies, and <b>lambda</b> literals for use with <b>apply</b>.
+        Loading installs these into the current interpreter and executes the top-level
+        block with <b>TCL_EVAL_GLOBAL</b>.</p>
+      <p>
+        In safe interpreters, only <b>tbcx::dump</b> (read-only) is exposed. The
+        <b>tbcx::save</b> and <b>tbcx::load</b> commands perform file I/O and are
+        not available unless explicitly exposed by the caller.</p>
+
       <h2 id='commands'>COMMANDS</h2>
-      <h3 id='tbcx-save-in-out'>tbcx::save in out</h3>
-      <p>
-        <b>Synopsis</b>
-      </p>
-      <p>Compile a script and write a <b>.tbcx</b> artifact.</p>
-      <p>
-        <b>Parameters</b>
-      </p>
+
+      <h3 id='tbcx-save-in-out'>tbcx::save <i>in out</i></h3>
+      <p><b>Synopsis</b> &mdash; Compile a script and write a <code>.tbcx</code> artifact.</p>
       <dl class='deflist'>
-        <dt id='section'/>
+        <dt>Parameters</dt>
         <dd>
-          <p><i>in</i> One of:</p>
-        </dd>
-        <div class='indent'>
+          <p><i>in</i> &mdash; One of:</p>
           <ul>
-            <li>
-              <i>String</i> - a Tcl string value containing the script text.</li>
-            <li>
-              <i>Readable channel</i> - an open channel; the command enforces binary-safe reads.</li>
-            <li>
-              <i>Readable path</i> - a filesystem path to a script file; it is opened, read, and closed by <b>tbcx::save</b>.</li>
+            <li><i>String</i> &mdash; a Tcl string value containing the script text.</li>
+            <li><i>Readable channel</i> &mdash; an open channel; the caller controls its encoding settings (the command does not alter them).</li>
+            <li><i>Readable path</i> &mdash; a filesystem path to a script file; it is opened in text mode (default UTF-8), read, and closed by <b>tbcx::save</b>.</li>
           </ul>
-        </div>
+          <p><i>out</i> &mdash; One of:</p>
+          <ul>
+            <li><i>Writable channel</i> &mdash; an open channel; binary mode is enforced. The channel is <i>not</i> closed.</li>
+            <li><i>Writable path</i> &mdash; a filesystem path for the new <code>.tbcx</code> file; it is created/truncated and closed on return.</li>
+          </ul>
+        </dd>
+        <dt>Behavior</dt>
+        <dd>
+          <ul>
+            <li>Performs a single-pass capture and rewrite of the script, extracting <b>proc</b>,
+                <b>namespace eval</b>, <b>oo::class create</b>, and <b>oo::define</b>/<b>oo::objdefine</b>
+                definitions while producing a rewritten script with method bodies replaced by stubs.</li>
+            <li>Pre-compiles namespace eval body literals and other script-body patterns
+                (try, foreach, while, for, catch, if/elseif/else).</li>
+            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and Methods table.</li>
+            <li>Lambda literals (<b>apply</b> forms) are compiled and serialized as lambda-bytecode literals.</li>
+            <li>Conflicting proc definitions across if/else branches are handled via indexed markers,
+                enabling position-based matching at load time.</li>
+          </ul>
+        </dd>
+        <dt>Returns</dt>
+        <dd>The output object: either the normalized path written, or the writable channel handle.</dd>
+        <dt>Errors</dt>
+        <dd>Typical errors include: unreadable input; unwritable output; version/format mismatch;
+            unknown/unsupported AuxData; size limit exceeded; runaway serialization
+            (too many literals, blocks, excessive recursion depth, or output too large);
+            short read/write.</dd>
+        <dt>Notes</dt>
+        <dd>
+          <ul>
+            <li>Input channels retain their encoding settings; output channels are set to binary mode.</li>
+            <li>The produced artifact targets Tcl 9.1 (format version 91); other versions are rejected at load time.</li>
+          </ul>
+        </dd>
       </dl>
+      <p><b>Examples</b></p>
+      <pre><code># Save from path -> path
+set path [tbcx::save ./app.tcl ./app.tbcx]
+
+# Save from string value -> path
+set script {proc hi {} {puts Hello}; hi}
+tbcx::save $script ./hello.tbcx
+
+# Save from channel -> channel
+set in  [open ./lib/foo.tcl r]
+set out [open ./foo.tbcx w]
+fconfigure $out -translation binary -eofchar {}
+try {
+    tbcx::save $in $out
+} finally {
+    close $in
+    close $out
+}</code></pre>
+
+      <h3 id='tbcx-load-in'>tbcx::load <i>in</i></h3>
+      <p><b>Synopsis</b> &mdash; Load a <code>.tbcx</code> artifact, install precompiled entities, and execute the top-level block.</p>
       <dl class='deflist'>
-        <dt id='section'/>
+        <dt>Parameters</dt>
         <dd>
-          <p>
-            <i>out</i> One of:</p>
+          <p><i>in</i> &mdash; One of:</p>
+          <ul>
+            <li><i>Readable channel</i> &mdash; an open channel positioned at the beginning of a <code>.tbcx</code> stream (binary).</li>
+            <li><i>Readable path</i> &mdash; a filesystem path to a <code>.tbcx</code> file.</li>
+          </ul>
         </dd>
-        <div class='indent'>
-          <ul>
-            <li>
-              <i>Writable channel</i> - an open channel; the command writes binary data and does <i>not</i> close the channel.</li>
-            <li>
-              <i>Writable path</i> - a filesystem path for the new <b>.tbcx</b> file; it is created/truncated and closed on return.</li>
-          </ul>
-        </div>
-        <p>
-          <b>Behavior</b>
-        </p>
-        <div class='indent'>
-          <ul>
-            <li>Compiles the top-level block, discovers and precompiles <b>proc</b> bodies and TclOO
-            method/ctor/dtor bodies, and captures <i>lambda literals</i> as lambda-bytecode literals
-            (for <b>apply</b>).</li>
-            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and
-            Methods table.</li>
-          </ul>
-        </div>
-        <p>
-          <b>Returns</b>
-        </p>
-        <div class='indent'>
-          <p>The output object: either the normalized path written, or the writable channel
-          handle.</p>
-        </div>
-        <p>
-          <b>Errors</b>
-        </p>
-        <div class='indent'>
-          <p>Typical errors include: unreadable input; unwritable output; version/format mismatch; unknown/unsupported AuxData;
-            size limit exceeded (code, literals, AuxData, exception ranges, strings); short read/write.</p>
-          <p>The interpreter result contains a descriptive message.</p>
-        </div>
-        <p>
-          <b>Notes</b>
-        </p>
-        <div class='indent'>
-          <ul>
-            <li>Channels are treated as binary for portability; encodings are not altered on the caller's behalf, and channels are not closed.</li>
-            <li>The produced artifact is intended for Tcl 9.1; other versions are rejected at load time.</li>
-          </ul>
-        </div>
-        <p>
-          <b>Examples</b>
-        </p>
-        <pre>
-          <code># Save from path \-&gt; path
-            set path [tbcx::save ./app.tcl ./app.tbcx]
-            # Save from string value \-&gt; path
-            set script {proc hi {} {puts Hello}; hi}
-            tbcx::save $script ./hello.tbcx
-            # Save from channel \-&gt; channel
-            set in  [open ./lib/foo.tcl r]
-            set out [open ./foo.tbcx w]
-            fconfigure $in  -translation binary -eofchar {}
-            fconfigure $out -translation binary -eofchar {}
-            try {
-              tbcx::save $in $out
-            } finally {
-              close $in
-              close $out
-            }
-          </code>
-        </pre>
-      </dl>
-      <h3 id='tbcx-load-in'>tbcx::load in</h3>
-      <p>
-        <b>Synopsis</b>
-      </p>
-      <p>Load a <b>.tbcx</b> artifact, install precompiled entities, and execute the top-level block.</p>
-      <p>
-        <b>Parameters</b>
-      </p>
-      <dl class='deflist'>
-        <dt id='section'/>
+        <dt>Behavior</dt>
         <dd>
-          <p>
-          <i>in</i> One of:</p>
+          <ul>
+            <li>Validates header and producer version (exact major.minor match required); deserializes sections.</li>
+            <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command to substitute
+                precompiled bodies when the name and argument signature match.</li>
+            <li>Installs a temporary <b>OOShim</b> that intercepts <b>oo::define</b> and <b>oo::objdefine</b>
+                to substitute precompiled method/constructor/destructor bodies.</li>
+            <li>Registers precompiled lambdas in a persistent per-interpreter <b>ApplyShim</b> that
+                recovers the compiled representation if type shimmer evicts it.</li>
+            <li>Executes the precompiled top-level block with <b>TCL_EVAL_GLOBAL</b>.
+                A top-level <b>return</b> is handled identically to <b>source</b>.</li>
+            <li>Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter's lifetime.</li>
+          </ul>
         </dd>
-        <div class='indent'>
+        <dt>Returns</dt>
+        <dd>The result of the top-level block evaluation.</dd>
+        <dt>Errors</dt>
+        <dd>Typical errors include: unreadable input; bad header; incompatible Tcl version; malformed/unknown section;
+            size limit exceeded; short read; class or namespace creation errors during top-level evaluation.</dd>
+        <dt>Notes</dt>
+        <dd>
           <ul>
-            <li>
-            <i>Readable channel</i> - an open channel positioned at the beginning of a <b>.tbcx</b> stream (binary).</li>
-            <li>
-            <i>Readable path</i> - a filesystem path to a <b>.tbcx</b> file.</li>
-          </ul>
-        </div>
-        <p>
-          <b>Behavior</b>
-        </p>
-        <div class='indent'>
-          <ul>
-            <li>Validates header and producer version; deserializes sections.</li>
-            <li>Materializes procs and TclOO methods (ctors/dtors) from precompiled bodies.</li>
-            <li>Rehydrates lambda-bytecode literals so the first <b>apply</b> incurs no compilation.</li>
-            <li>Executes the precompiled top-level block in the caller's current namespace.</li>
-          </ul>
-        </div>
-        <p>
-          <b>Returns</b>
-        </p>
-        <div class='indent'>
-          <p>Empty string on success.</p>
-        </div>
-        <p>
-          <b>Errors</b>
-        </p>
-        <div class='indent'>
-          <p>Typical errors include: unreadable input; bad header; incompatible Tcl version; malformed/unknown section;
-          size limit exceeded; short read; class or namespace creation errors during top-level evaluation.</p>
-        </div>
-        <p>
-          <b>Notes</b>
-        </p>
-        <div class='indent'>
-          <ul>
-            <li>Load in a specific namespace by wrapping the call: <b>namespace eval ::pkg { tbcx::load ./app.tbcx }</b>
-            </li>
+            <li>The top-level block executes with <b>TCL_EVAL_GLOBAL</b>; compiled locals for the global frame are linked to existing global variables.</li>
             <li>Loading executes code; only load artifacts from trusted sources.</li>
           </ul>
-        </div>
-        <p>
-          <b>Examples</b>
-        </p>
-        <pre>
-          <code># Load into current namespace
-          tbcx::load ./app.tbcx
-          # Load into a dedicated namespace
-          namespace eval ::app { tbcx::load ./app.tbcx }
-          # Load from an open channel
-          set ch [open ./app.tbcx r]
-          fconfigure $ch -translation binary -eofchar {}
-          try {
-          tbcx::load $ch
-          } finally {
-          close $ch
-          }
-          </code>
-        </pre>
-      </dl>
-      <h3 id='tbcx-dump-filename'>tbcx::dump filename</h3>
-      <p>
-        <b>Synopsis</b>
-      </p>
-      <p>Disassemble and describe a <b>.tbcx</b> artifact in human-readable form.</p>
-      <p>
-        <b>Parameters</b>
-      </p>
-      <dl class='deflist'>
-        <dt id='section'>
-        </dt>
-        <dd>
-          <p>
-          <i>filename</i> A readable path to a <b>.tbcx</b> file.</p>
         </dd>
-        <p>
-          <b>Behavior</b>
-        </p>
-        <div class='indent'>
-          <p>Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;</p>
-          <p>and a disassembly of the top-level, proc, method, and lambda bodies.</p>
-        </div>
-        <p>
-          <b>Returns</b>
-        </p>
-        <div class='indent'>
-          <p>A string containing the formatted dump.</p>
-        </div>
-        <p>
-          <b>Errors</b>
-        </p>
-        <div class='indent'>
-          <p>Unreadable file; bad header; malformed section; short read.</p>
-        </div>
-        <p>
-          <b>Examples</b>
-        </p>
-        <pre>
-          <code>% package require tbcx
-          % tbcx::save {set a 1} out
-          % tbcx::dump out
-          TBCX Header:
-          magic = 0x58434254 (&#x27;T&#x27;&#x27;B&#x27;&#x27;C&#x27;&#x27;X&#x27;)
-          format = 9
-          tcl_version = 9.1.0 (type 0)
-          top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
-          Top-level block:
-          Disassembly (top-level):
-          ByteCode 0x7f9963089e10, refCt 1, epoch 20, interp 0x7f9963816a10 (epoch 20)
-          Source &quot;&quot;
-          Cmds 0, src 0, inst 11, litObjs 1, aux 0, stkDepth 1, code/src 0.00
-          (0) push 0 	# &quot;1&quot;
-          (5) storeScalar %v0
-          (10) done
-          code=11, stack=1, lits=1, aux=0, except=0
-          Locals (1):
-          [0] &quot;a&quot;
-          Literals:
-          [0] (bignum) 1
-          Procs: 0
-          Classes: 0
-          Methods: 0
-          </code>
-        </pre>
       </dl>
+      <p><b>Examples</b></p>
+      <pre><code># Load into current interp
+tbcx::load ./app.tbcx
+
+# Load from an open channel
+set ch [open ./app.tbcx r]
+fconfigure $ch -translation binary -eofchar {}
+try {
+    tbcx::load $ch
+} finally {
+    close $ch
+}</code></pre>
+
+      <h3 id='tbcx-dump-filename'>tbcx::dump <i>filename</i></h3>
+      <p><b>Synopsis</b> &mdash; Disassemble and describe a <code>.tbcx</code> artifact in human-readable form.</p>
+      <dl class='deflist'>
+        <dt>Parameters</dt>
+        <dd><i>filename</i> &mdash; A readable path to a <code>.tbcx</code> file.</dd>
+        <dt>Behavior</dt>
+        <dd>Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;
+            and a disassembly of the top-level, proc, method, and lambda bodies.</dd>
+        <dt>Returns</dt>
+        <dd>A string containing the formatted dump.</dd>
+        <dt>Errors</dt>
+        <dd>Unreadable file; bad header; malformed section; short read.</dd>
+      </dl>
+
+      <h3 id='tbcx-gc'>tbcx::gc</h3>
+      <p><b>Synopsis</b> &mdash; Purge stale entries from the per-interpreter lambda shimmer-recovery registry.</p>
+      <dl class='deflist'>
+        <dt>Behavior</dt>
+        <dd>The <b>ApplyShim</b> maintains a registry of precompiled lambda objects. Over time,
+            entries for lambdas that are no longer referenced (except by the registry itself)
+            accumulate. This command purges those stale entries immediately.
+            Stale entries are also purged lazily on each <b>tbcx::load</b> call, so explicit
+            use of <b>tbcx::gc</b> is typically unnecessary except in long-running interpreters.</dd>
+        <dt>Parameters</dt>
+        <dd>None.</dd>
+        <dt>Returns</dt>
+        <dd>Empty string.</dd>
+      </dl>
+
       <h2 id='file-format-overview'>FILE FORMAT (OVERVIEW)</h2>
-      <p>This section summarizes the on-disk structure.</p>
+      <p>This section summarizes the on-disk structure. Format version is <b>91</b> (Tcl 9.1).
+         All integers are little-endian.</p>
       <dl class='deflist'>
-        <dt id='section'>
-        </dt>
-        <dd>
-          <p>
-            <b>Header</b> Magic + format version + producing Tcl version; size/count metadata
-            for the top-level block (code length, literal count, AuxData count, exception
-          ranges, locals, max stack).</p>
-        </dd>
-        <dt id='section'>
-        </dt>
-        <dd>
-          <p>
-            <b>Sections (order)</b> (1) Top-level block (code, literals, AuxData, exceptions,
-            locals epilogue); (2) Procs (FQN, ns, arg spec, compiled block); (3) Classes
-            (advisory catalog; actual creation occurs at load time); (4) Methods (class, kind,
-          name, args, compiled block).</p>
-        </dd>
-        <dt id='section'>
-        </dt>
-        <dd>
-          <p>
-            <b>Literal kinds</b> boolean, (wide)int/uint, double, bignum, string, bytearray,
-            list, dict, embedded bytecode, and <b>lambda-bytecode</b> literals for use with
-          <b>apply</b>.</p>
-        </dd>
-        <dt id='section'>
-        </dt>
-        <dd>
-          <p>
-            <b>AuxData families</b> jump tables (string or numeric), dictupdate, foreach
-          (legacy/new). </p>
-        </dd>
+        <dt>Header</dt>
+        <dd>Magic (<code>0x58434254</code>) + format version (91) + producing Tcl version;
+            size/count metadata for the top-level block (code length, exception ranges,
+            literal count, AuxData count, locals, max stack).</dd>
+        <dt>Sections (order)</dt>
+        <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue);
+            (2) Procs (FQN, ns, arg spec, compiled block);
+            (3) Classes (advisory catalog; actual creation occurs at load time);
+            (4) Methods (class, kind, name, args, compiled block).</dd>
+        <dt>Literal kinds</dt>
+        <dd>boolean, (wide)int/uint, double, bignum, string, bytearray, list,
+            dict (insertion order preserved), embedded bytecode,
+            and <b>lambda-bytecode</b> literals for use with <b>apply</b>.</dd>
+        <dt>AuxData families</dt>
+        <dd>jump tables (string or numeric), dictupdate, and NewForeachInfo.</dd>
       </dl>
+
       <h2 id='lambda-support'>LAMBDA SUPPORT</h2>
-      <p>Literals in the script that represent <i>lambdas</i> for <b>apply</b> (lists of the form
-      {args body ns?}) are compiled and serialized as lambda-bytecode literals at save time.</p>
-      <p>On load, both the compiled body and the optional namespace element are rehydrated so that the
-      first call to <b>apply</b> does not trigger compilation.</p>
+      <p>
+        Literals in the script that represent <i>lambdas</i> for <b>apply</b> (lists of the form
+        <code>{args body ?ns?}</code>) are compiled and serialized as lambda-bytecode literals at
+        save time. On load, the compiled body, argument list, and optional namespace element are
+        rehydrated into a <b>Proc</b> and registered in the <b>ApplyShim</b> so that the first
+        call to <b>apply</b> does not trigger compilation. If type shimmer later evicts the
+        lambdaExpr internal representation, the ApplyShim transparently re-installs it on the
+        next <b>apply</b> call.</p>
+
       <h2 id='semantics-and-performance'>SEMANTICS AND PERFORMANCE</h2>
       <p>
-        Artifacts are portable across little- and big-endian hosts. The loader detects host byte order
-        once and applies a tight in-place swap over bulk sections that require conversion, avoiding
-        per-field branching so cross-endian loads remain close to native performance.
-      </p>
+        Artifacts are portable across little- and big-endian hosts. The loader detects host byte
+        order once and applies a tight in-place swap over bulk sections that require conversion,
+        avoiding per-field branching so cross-endian loads remain close to native performance.</p>
       <p>
-        Loading executes the precompiled top-level, then installs precompiled proc/method bodies
-        and rehydrates lambda literals. The intent is to be functionally indistinguishable from
-        <b>source</b> of the original script, with the benefit of faster startup due to avoided
-        parsing/compilation.
-      </p>
+        Loading executes the precompiled top-level (with <b>TCL_EVAL_GLOBAL</b>), then installs
+        precompiled proc/method bodies and rehydrates lambda literals. The intent is to be
+        functionally indistinguishable from <b>source</b> of the original script, with the
+        benefit of faster startup due to avoided parsing/compilation.</p>
+
       <h2 id='limits'>LIMITS</h2>
       <p>
-        Sanity caps exist for code size, literal count (including lambdas), AuxData count, exception ranges,
-        and string lengths. Exceeding limits produces an error.
-      </p>
+        Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
+        string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
+        total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
+        Exceeding any limit produces an error.</p>
+
       <h2 id='diagnostics'>DIAGNOSTICS</h2>
       <p>
-        Representative messages include: "bad header", "incompatible Tcl version", "short
-        read/write", "unsupported AuxData kind", "input is neither an open channel nor a
-        readable file", and "errors while evaluating top-level".
-      </p>
+        Representative messages include: &ldquo;bad header&rdquo;, &ldquo;incompatible Tcl version&rdquo;,
+        &ldquo;short read/write&rdquo;, &ldquo;unsupported AuxData kind&rdquo;,
+        &ldquo;input is neither an open channel nor a readable file&rdquo;,
+        &ldquo;runaway serialization detected&rdquo;, and Tcl errors from top-level evaluation.</p>
+
       <h2 id='security'>SECURITY</h2>
-      <p>Loading executes code. Only load artifacts you trust.</p>
+      <p>Loading executes code. Only load artifacts you trust.
+         Safe interpreters receive only <b>tbcx::dump</b> (read-only).</p>
+
       <h2 id='see-also'>SEE ALSO</h2>
       <p>source(n), TclOO(n)</p>
+
       <h2 id='copyright'>COPYRIGHT</h2>
-      <p>© 2025 Miguel Banon</p>
+      <p>&copy; 2025 Miguel Banon</p>
       <p>MIT License.</p>
-      <a class='back-to-top' href='#top' title='Back to top'>↑ Top</a>
+
+      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.0</div>
     </div>
+    <a href='#top' class='back-to-top'>&uarr; Top</a>
   </body>
 </html>
