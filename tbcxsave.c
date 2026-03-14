@@ -4,6 +4,12 @@
 
 #include "tbcx.h"
 
+/* Monotonic counter for unique temp-file naming (Finding #8).
+ * Two concurrent tbcx::save calls to the same target no longer
+ * clobber each other's staging file. */
+static unsigned int tbcxSaveTmpId = 0;
+TCL_DECLARE_MUTEX(tbcxSaveTmpMutex);
+
 /* ==========================================================================
  * Type definitions
  * ========================================================================== */
@@ -105,8 +111,8 @@ static void CaptureClassBody(Tcl_Interp* ip,
                              ClsSet* classes,
                              int flags,
                              int depth);
-static Tcl_Obj*
-CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
+static Tcl_Obj* CaptureAndRewriteScript(
+    Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
 static inline const char* CmdCore(const char* s);
 static int CmpJTEntryUtf8_qsort(const void* pa, const void* pb);
 static int CmpJTNumEntry_qsort(const void* pa, const void* pb);
@@ -130,7 +136,8 @@ static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top);
 static void ScanForNsEvalBodies(TbcxCtx* ctx, const char* script, Tcl_Size len);
 static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, Tcl_Obj* curNs, int depth);
 static void RegisterBodyAndRecurse(TbcxCtx* ctx, const Tcl_Token* tok, Tcl_Obj* curNs, int depth);
-static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
+static Tcl_Obj*
+RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth);
 static void DV_Free(DefVec* dv);
 static void DV_Init(DefVec* dv);
 static void DV_Push(DefVec* dv, DefRec r);
@@ -207,7 +214,9 @@ static inline void W_Error(TbcxOut* w, const char* msg)
     }
 }
 
-/* Buffered write I/O — collapses thousands of syscalls into a handful */
+/* Buffered write I/O — collapses thousands of syscalls into a handful.
+ * LIMITATION (Finding #10): synchronous blocking I/O on the interpreter
+ * thread; see tbcxload.c for the full note. */
 void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch)
 {
     w->interp = ip;
@@ -221,17 +230,17 @@ int Tbcx_W_Flush(TbcxOut* w)
 {
     if (w->err || w->bufPos == 0)
         return w->err;
-    size_t off = 0;
+    Tcl_Size off = 0;
     while (off < w->bufPos)
     {
-        Tcl_Size toWrite = (Tcl_Size)(w->bufPos - off);
+        Tcl_Size toWrite = w->bufPos - off;
         Tcl_Size got = Tcl_WriteRaw(w->chan, (const char*)w->buf + off, toWrite);
         if (got <= 0)
         {
             W_Error(w, "tbcx: short write");
             return w->err;
         }
-        off += (size_t)got;
+        off += got;
     }
     w->totalBytes += w->bufPos;
     w->bufPos = 0;
@@ -412,7 +421,7 @@ static void CtxFreeCompiled(TbcxCtx* ctx)
 /* ==========================================================================
  * Namespace eval body -> namespace FQN mapping.
  * Value is NULL (sentinel) when the same body text maps to multiple
- * namespaces - such bodies are NOT pre-compiled 
+ * namespaces - such bodies are NOT pre-compiled
  * ========================================================================== */
 
 static void CtxInitNsEval(TbcxCtx* ctx)
@@ -1200,6 +1209,14 @@ static void Lit_Bignum(TbcxOut* w, Tcl_Obj* o)
     }
     else
     {
+        if (magLen > (size_t)UINT32_MAX)
+        {
+            W_Error(w, "tbcx: bignum magnitude exceeds uint32_t");
+            Tcl_Free((char*)be);
+            TclBN_mp_clear(&mag);
+            TclBN_mp_clear(&z);
+            return;
+        }
         int sign = mp_isneg(&z) ? 2 : 1;
         W_U8(w, (uint8_t)sign);
         W_U32(w, (uint32_t)magLen);
@@ -1631,7 +1648,6 @@ static void WriteLocalNames(TbcxOut* w, ByteCode* bc, uint32_t numLocals)
         W_LPString(w, "", 0);
     }
 }
-
 
 /* WriteLit_Untyped — handles literals with no internal rep or with an
  * unrecognized type pointer.  Performs lambda detection, side-table
@@ -2153,7 +2169,6 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
     }
 }
 
-
 static void WriteAux_JTStr(TbcxOut* w, AuxData* ad)
 {
     JumptableInfo* info = (JumptableInfo*)ad->clientData;
@@ -2552,7 +2567,7 @@ static void WriteHeaderTop(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* topObj)
     TbcxHeader H;
     H.magic = TBCX_MAGIC;
     H.format = TBCX_FORMAT;
-    H.tcl_version = PackTclVersion();
+    H.tcl_version = Tbcx_PackTclVersion();
     H.codeLenTop = (uint64_t)top->numCodeBytes;
     H.numExceptTop = (uint32_t)top->numExceptRanges;
     H.numLitsTop = (uint32_t)top->numLitObjects;
@@ -3370,7 +3385,8 @@ static Tcl_Obj* CanonTrivia(Tcl_Obj* in)
  * and return the rewritten text.  Returns NULL if the token is not a
  * literal OR if the body text is unchanged (no definitions found).
  * ========================================================================== */
-static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
+static Tcl_Obj*
+RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
 {
     if (depth > TBCX_MAX_BLOCK_DEPTH)
         return NULL;
@@ -3402,13 +3418,13 @@ static Tcl_Obj* RecurseScriptBody(Tcl_Interp* ip, const Tcl_Token* bodyTok, Tcl_
     return rewritten;
 }
 
-
 /* ==========================================================================
  * RewriteCtx — bundles shared state for CaptureAndRewriteScript handlers.
  * Avoids passing 6+ parameters to each extracted handler function.
  * ========================================================================== */
 
-typedef struct {
+typedef struct
+{
     Tcl_Interp* ip;
     Tcl_DString* out;
     Tcl_Obj* curNs;
@@ -3420,8 +3436,7 @@ typedef struct {
 /* Handle all oo::define, oo::class, oo::objdefine, and metaclass commands.
  * Returns 1 if the command was handled, 0 otherwise.
  * The DString ctx->out is appended with the rewritten command text. */
-static int
-RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0, int* handled)
+static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0, int* handled)
 {
     /* Recover the command-word literal (needed by the metaclass handler).
        The caller guarantees w0 is a valid literal token. */
@@ -3726,9 +3741,8 @@ RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0,
                                 const char* pk = CmdCore(Tcl_GetString(pcmd));
                                 if (strcmp(pk, "method") == 0 || strcmp(pk, "classmethod") == 0 ||
                                     strcmp(pk, "constructor") == 0 || strcmp(pk, "destructor") == 0 ||
-                                    strcmp(pk, "variable") == 0 || strcmp(pk, "superclass") == 0 ||
-                                    strcmp(pk, "mixin") == 0 || strcmp(pk, "filter") == 0 ||
-                                    strcmp(pk, "forward") == 0 || strcmp(pk, "private") == 0)
+                                    strcmp(pk, "variable") == 0 || strcmp(pk, "superclass") == 0 || strcmp(pk, "mixin") == 0 ||
+                                    strcmp(pk, "filter") == 0 || strcmp(pk, "forward") == 0 || strcmp(pk, "private") == 0)
                                 {
                                     isMetaCreate = 1;
                                 }
@@ -4088,8 +4102,7 @@ RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0,
 
 /* Handle control-flow commands (while, for, foreach, catch, if, try, switch).
  * Returns 1 if the command was handled, 0 otherwise. */
-static int
-RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0, int* handled)
+static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const char* c0, int* handled)
 {
     if (!*handled && strcmp(c0, "while") == 0 && p->numWords == 3)
     {
@@ -4306,7 +4319,8 @@ RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const cha
                     fi++; /* skip "else" */
                     if (fi < p->numWords)
                     {
-                        Tcl_Obj* elRew = RecurseScriptBody(ctx->ip, twords[fi], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
+                        Tcl_Obj* elRew =
+                            RecurseScriptBody(ctx->ip, twords[fi], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
                         if (elRew)
                         {
                             Tcl_DecrRefCount(rw[fi]);
@@ -4392,7 +4406,8 @@ RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const cha
                 {
                     /* on/trap code varList body */
                     int bodyIdx = fi + 3;
-                    Tcl_Obj* hRew = RecurseScriptBody(ctx->ip, twords[bodyIdx], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
+                    Tcl_Obj* hRew =
+                        RecurseScriptBody(ctx->ip, twords[bodyIdx], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
                     if (hRew)
                     {
                         Tcl_DecrRefCount(rw[bodyIdx]);
@@ -4405,7 +4420,8 @@ RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const cha
                 else if (strcmp(ks, "finally") == 0 && fi + 1 < p->numWords)
                 {
                     int bodyIdx = fi + 1;
-                    Tcl_Obj* fRew = RecurseScriptBody(ctx->ip, twords[bodyIdx], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
+                    Tcl_Obj* fRew =
+                        RecurseScriptBody(ctx->ip, twords[bodyIdx], ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
                     if (fRew)
                     {
                         Tcl_DecrRefCount(rw[bodyIdx]);
@@ -4447,8 +4463,8 @@ RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, const cha
     return *handled;
 }
 
-static Tcl_Obj*
-CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
+static Tcl_Obj* CaptureAndRewriteScript(
+    Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Obj* curNs, DefVec* defs, ClsSet* classes, int depth)
 {
     /* Guard against unbounded recursion from nested namespace eval / control flow */
     if (depth > TBCX_MAX_BLOCK_DEPTH)
@@ -4604,21 +4620,19 @@ CaptureAndRewriteScript(Tcl_Interp* ip, const char* script, Tcl_Size len, Tcl_Ob
                         Tcl_DecrRefCount(sub);
                 }
 
-
                 /* ---- OO commands (oo::define, oo::class, oo::objdefine, metaclass) ---- */
                 if (!handled)
                 {
-                    RewriteCtx rctx = { ip, &out, curNs, defs, classes, depth };
+                    RewriteCtx rctx = {ip, &out, curNs, defs, classes, depth};
                     RewriteOoCmd(&rctx, &p, w0, c0, &handled);
                 }
 
                 /* ---- Control flow (while, for, foreach, catch, if, try, switch) ---- */
                 if (!handled)
                 {
-                    RewriteCtx rctx = { ip, &out, curNs, defs, classes, depth };
+                    RewriteCtx rctx = {ip, &out, curNs, defs, classes, depth};
                     RewriteControlFlow(&rctx, &p, w0, c0, &handled);
                 }
-
 
                 Tcl_DecrRefCount(cmd);
             }
@@ -5066,7 +5080,17 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
             return TCL_ERROR;
         }
         tmpPath = Tcl_DuplicateObj(outNorm);
-        Tcl_AppendToObj(tmpPath, ".tbcx.tmp", -1);
+        /* Generate a unique temp name to prevent races between concurrent
+           tbcx::save calls targeting the same destination. */
+        {
+            Tcl_MutexLock(&tbcxSaveTmpMutex);
+            unsigned int myTmpId = tbcxSaveTmpId++;
+            Tcl_MutexUnlock(&tbcxSaveTmpMutex);
+            Tcl_Obj* suffix = Tcl_ObjPrintf(".tbcx.%u.tmp", myTmpId);
+            Tcl_IncrRefCount(suffix);
+            Tcl_AppendObjToObj(tmpPath, suffix);
+            Tcl_DecrRefCount(suffix);
+        }
         Tcl_IncrRefCount(tmpPath);
         outCh = Tcl_FSOpenFileChannel(interp, tmpPath, "w", 0666);
         if (!outCh)

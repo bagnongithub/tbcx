@@ -56,7 +56,7 @@ EXTERN int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, T
  * ========================================================================== */
 
 static const Tcl_ObjType* NeedObjType(const char* name);
-uint32_t PackTclVersion(void);
+uint32_t Tbcx_PackTclVersion(void);
 static int TbcxComputeEndian(Tcl_Interp* interp);
 static const Tcl_ObjType* TbcxProbeLambdaType(Tcl_Interp* interp);
 static int TbcxInitTypes(Tcl_Interp* interp);
@@ -88,7 +88,7 @@ int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj*
  * Utility Functions
  * ========================================================================== */
 
-uint32_t PackTclVersion(void)
+uint32_t Tbcx_PackTclVersion(void)
 {
     int maj, min, pat, typ;
     Tcl_GetVersion(&maj, &min, &pat, &typ);
@@ -236,7 +236,7 @@ static int TbcxInitTypes(Tcl_Interp* interp)
     {
         if (interp)
         {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: required Tcl_ObjType not available", -1));
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: required Tcl_ObjType not available"));
         }
         return TCL_ERROR;
     }
@@ -284,13 +284,13 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
 
     if (Tcl_TomMath_InitStubs(interp, TCL_VERSION) == NULL)
     {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: libtommath stubs not available", -1));
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: libtommath stubs not available"));
         return TCL_ERROR;
     }
 
     if (TclOOInitializeStubs(interp, "1.0") == NULL)
     {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: TclOO stubs not available", -1));
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: TclOO stubs not available"));
         return TCL_ERROR;
     }
 
@@ -304,7 +304,7 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
         !Tcl_CreateObjCommand2(interp, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL) ||
         !Tcl_CreateObjCommand2(interp, "tbcx::gc", Tbcx_GcObjCmd, NULL, NULL))
     {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: failed to register commands", -1));
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: failed to register commands"));
         return TCL_ERROR;
     }
 
@@ -316,31 +316,31 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
     return TCL_OK;
 }
 
-/* SafeInit should only expose dump (read-only), not save/load which do
-   arbitrary file I/O.  Callers who need save/load in safe interps must
-   explicitly expose them. */
+/* SafeInit: do NOT expose any commands that perform filesystem I/O.
+   The original code exposed tbcx::dump here, but dump opens arbitrary
+   filesystem paths via Tcl_FSOpenFileChannel, reintroducing file-read
+   capability into safe interpreters.  Parent interpreters that need
+   controlled dump access can use [interp alias] or [interp expose]. */
 DLLEXPORT int tbcx_SafeInit(Tcl_Interp* ip)
 {
     if (Tcl_InitStubs(ip, TCL_VERSION, 1) == NULL)
         return TCL_ERROR;
     if (Tcl_TomMath_InitStubs(ip, TCL_VERSION) == NULL)
     {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: libtommath stubs not available", -1));
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: libtommath stubs not available"));
         return TCL_ERROR;
     }
     if (TclOOInitializeStubs(ip, "1.0") == NULL)
     {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: TclOO stubs not available", -1));
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: TclOO stubs not available"));
         return TCL_ERROR;
     }
     if (TbcxInitTypes(ip) != TCL_OK)
         return TCL_ERROR;
 
-    if (!Tcl_CreateObjCommand2(ip, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL))
-    {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to register dump command", -1));
-        return TCL_ERROR;
-    }
+    /* No commands registered — safe interps get the package type
+       infrastructure only.  Use [interp expose] from the parent
+       to selectively grant access to tbcx subcommands. */
 
     if (Tcl_PkgProvide(ip, PKG_TBCX, PKG_TBCX_VER) != TCL_OK)
     {

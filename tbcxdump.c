@@ -34,7 +34,6 @@ static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n)
         unsigned char c = (unsigned char)s[i];
         if (c < 0x20 || c == '\\' || c == '"')
         {
-            /* Use Tcl_DString formatting instead of raw sprintf */
             char esc[5];
             esc[0] = '\\';
             esc[1] = 'x';
@@ -48,7 +47,7 @@ static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n)
             Tcl_DStringAppend(&ds, (const char*)&s[i], 1);
         }
     }
-    Tcl_AppendPrintfToObj(dst, "%s", Tcl_DStringValue(&ds));
+    Tcl_AppendToObj(dst, Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
     Tcl_DStringFree(&ds);
 }
 

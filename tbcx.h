@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -73,7 +74,7 @@ typedef struct TbcxHeader
 
 extern _Atomic int tbcxHostIsLE;
 
-uint32_t PackTclVersion(void);
+uint32_t Tbcx_PackTclVersion(void);
 
 #define TBCX_MAX_CODE (1024u * 1024u * 1024u)
 #define TBCX_MAX_LITERALS (64u * 1024u * 1024u)
@@ -114,8 +115,8 @@ typedef struct TbcxIn
     Tcl_Channel chan;
     int err;
     unsigned char buf[TBCX_BUFSIZE];
-    size_t bufPos;  /* next byte to consume */
-    size_t bufFill; /* valid bytes in buf */
+    Tcl_Size bufPos;  /* next byte to consume */
+    Tcl_Size bufFill; /* valid bytes in buf */
 } TbcxIn;
 
 typedef struct
@@ -124,7 +125,7 @@ typedef struct
     Tcl_Channel chan;
     int err;
     unsigned char buf[TBCX_BUFSIZE];
-    size_t bufPos;       /* next free position in buf */
+    Tcl_Size bufPos;     /* next free position in buf */
     uint64_t totalBytes; /* total bytes written (buf flushes + current bufPos) */
 } TbcxOut;
 
@@ -140,7 +141,7 @@ int Tbcx_ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
 int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
 
 void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
-int Tbcx_R_Bytes(TbcxIn* r, void* p, size_t n);
+int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n);
 int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
 int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
 int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
