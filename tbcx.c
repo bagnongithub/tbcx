@@ -28,8 +28,18 @@ const AuxDataType* tbcxAuxDictUpdate = NULL;
 const AuxDataType* tbcxAuxNewForeach = NULL;
 
 static int tbcxTypesLoaded = 0;
-int tbcxHostIsLE = 1;
 
+/* tbcxHostIsLE: host byte-order flag (1 = little-endian, 0 = big-endian).
+ * Written once during TbcxInitTypes, thereafter read from hot paths
+ * (W_U32, W_U64, R_U32, R_U64) without locking.
+ * Declared _Atomic (C11) to guarantee visibility across threads on
+ * weakly-ordered architectures (ARM, POWER). */
+_Atomic int tbcxHostIsLE = 1;
+
+/* tbcxTypeMutex: protects the one-time initialization of all tbcxTy* /
+ * tbcxAux* globals and the tbcxTypesLoaded flag.  Lock-order position:
+ * leaf — no other TBCX mutex may be held while this is held.
+ * After tbcxTypesLoaded is set to 1, the protected data is immutable. */
 TCL_DECLARE_MUTEX(tbcxTypeMutex);
 
 /* ==========================================================================
@@ -47,7 +57,8 @@ EXTERN int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, T
 
 static const Tcl_ObjType* NeedObjType(const char* name);
 uint32_t PackTclVersion(void);
-static void TbcxInitEndian(Tcl_Interp* interp);
+static int TbcxComputeEndian(Tcl_Interp* interp);
+static const Tcl_ObjType* TbcxProbeLambdaType(Tcl_Interp* interp);
 static int TbcxInitTypes(Tcl_Interp* interp);
 
 DLLEXPORT int tbcx_SafeInit(Tcl_Interp* ip);
@@ -55,6 +66,11 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp);
 
 /* ==========================================================================
  * Explicit ApplyShim purge
+ *
+ * Synopsis:   tbcx::gc
+ * Arguments:  none
+ * Returns:    TCL_OK always.
+ * Thread:     must be called on the interp-owning thread.
  * ========================================================================== */
 
 int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[])
@@ -79,7 +95,10 @@ uint32_t PackTclVersion(void)
     return ((uint32_t)maj << 24) | ((uint32_t)min << 16) | ((uint32_t)pat << 8) | (uint32_t)typ;
 }
 
-static void TbcxInitEndian(Tcl_Interp* interp)
+/* Determine host byte order.  Returns 1 for LE, 0 for BE.
+ * Tries Tcl's tcl_platform(byteOrder) first, falls back to union probe.
+ * Called OUTSIDE the mutex so Tcl API calls are safe. */
+static int TbcxComputeEndian(Tcl_Interp* interp)
 {
     int isLE = -1;
 
@@ -106,7 +125,7 @@ static void TbcxInitEndian(Tcl_Interp* interp)
         isLE = (u.c[0] == 0x04);
     }
 
-    tbcxHostIsLE = isLE ? 1 : 0;
+    return isLE ? 1 : 0;
 }
 
 static const Tcl_ObjType* NeedObjType(const char* name)
@@ -148,57 +167,73 @@ static const Tcl_ObjType* NeedObjType(const char* name)
     return t; /* may be NULL — caller must check */
 }
 
+/* Probe for the lambdaExpr type pointer by evaluating a trivial [apply].
+ * Called OUTSIDE the mutex so Tcl_EvalObjv is safe. */
+static const Tcl_ObjType* TbcxProbeLambdaType(Tcl_Interp* interp)
+{
+    const Tcl_ObjType* ty = Tcl_GetObjType("lambdaExpr");
+    if (ty || !interp)
+        return ty;
+
+    /* Tcl 9.1 does not publicly register the lambdaExpr type.
+       Force its creation by evaluating a trivial [apply] — this
+       makes Tcl install a lambdaExpr internal rep on the probe
+       object, from which we can extract the type pointer. */
+    Tcl_Obj* applyWord = Tcl_NewStringObj("apply", -1);
+    Tcl_Obj* probe = Tcl_NewStringObj("{} {}", -1);
+    Tcl_IncrRefCount(applyWord);
+    Tcl_IncrRefCount(probe);
+    Tcl_Obj* evalv[2] = {applyWord, probe};
+    if (Tcl_EvalObjv(interp, 2, evalv, 0) == TCL_OK)
+    {
+        ty = probe->typePtr;
+    }
+    Tcl_ResetResult(interp);
+    Tcl_DecrRefCount(probe);
+    Tcl_DecrRefCount(applyWord);
+    return ty;
+}
+
 static int TbcxInitTypes(Tcl_Interp* interp)
 {
-    /* Always acquire the mutex before reading tbcxTypesLoaded.
-       A plain C int lacks the memory ordering guarantees needed for
-       safe double-checked locking on weakly-ordered architectures
-       (ARM, POWER).  Since this runs once per interpreter lifetime,
-       the cost of always locking is negligible. */
-    Tcl_MutexLock(&tbcxTypeMutex);
+    /* ---- Phase 1: Do ALL Tcl API work OUTSIDE the mutex ----
+     * NeedObjType calls Tcl_GetObjType, object constructors, etc.
+     * TbcxComputeEndian calls Tcl_GetVar2Ex.
+     * TbcxProbeLambdaType calls Tcl_EvalObjv.
+     *
+     * None of these may be called under tbcxTypeMutex because:
+     *  (a) Tcl_EvalObjv can re-enter the Tcl event loop / call
+     *      other package inits, risking deadlock.
+     *  (b) The other Tcl APIs may acquire internal Tcl mutexes,
+     *      creating lock-order hazards.
+     *  (c) Holding a global mutex during arbitrary interpreter work
+     *      serializes unrelated interpreter startup.
+     *
+     * Since the values are host-constant and Tcl-version-constant,
+     * computing them redundantly from two racing threads is harmless;
+     * only the final assignment is serialized by the mutex. */
 
-    if (tbcxTypesLoaded)
+    int hostLE = TbcxComputeEndian(interp);
+
+    const Tcl_ObjType* tyBignum = NeedObjType("bignum");
+    const Tcl_ObjType* tyBoolean = NeedObjType("boolean");
+    const Tcl_ObjType* tyByteArray = NeedObjType("bytearray");
+    const Tcl_ObjType* tyBytecode = NeedObjType("bytecode");
+    const Tcl_ObjType* tyDict = NeedObjType("dict");
+    const Tcl_ObjType* tyDouble = NeedObjType("double");
+    const Tcl_ObjType* tyInt = NeedObjType("int");
+    const Tcl_ObjType* tyLambda = TbcxProbeLambdaType(interp);
+    const Tcl_ObjType* tyList = NeedObjType("list");
+    const Tcl_ObjType* tyProcBody = NeedObjType("procbody");
+
+    const AuxDataType* auxJTStr = TclGetAuxDataType("JumptableInfo");
+    const AuxDataType* auxJTNum = TclGetAuxDataType("JumptableNumInfo");
+    const AuxDataType* auxDictUpdate = TclGetAuxDataType("DictUpdateInfo");
+    const AuxDataType* auxNewForeach = TclGetAuxDataType("NewForeachInfo");
+
+    /* Verify critical types before acquiring the mutex */
+    if (!tyBytecode || !tyInt || !tyList || !tyProcBody || !tyDouble || !tyByteArray)
     {
-        Tcl_MutexUnlock(&tbcxTypeMutex);
-        return TCL_OK;
-    }
-
-    TbcxInitEndian(interp);
-
-    tbcxTyBignum = NeedObjType("bignum");
-    tbcxTyBoolean = NeedObjType("boolean");
-    tbcxTyByteArray = NeedObjType("bytearray");
-    tbcxTyBytecode = NeedObjType("bytecode");
-    tbcxTyDict = NeedObjType("dict");
-    tbcxTyDouble = NeedObjType("double");
-    tbcxTyInt = NeedObjType("int");
-    tbcxTyLambda = Tcl_GetObjType("lambdaExpr");
-    if (!tbcxTyLambda && interp)
-    {
-        /* Tcl 9.1 does not publicly register the lambdaExpr type.
-           Force its creation by evaluating a trivial [apply] — this
-           makes Tcl install a lambdaExpr internal rep on the probe
-           object, from which we can extract the type pointer. */
-        Tcl_Obj* applyWord = Tcl_NewStringObj("apply", -1);
-        Tcl_Obj* probe = Tcl_NewStringObj("{} {}", -1);
-        Tcl_IncrRefCount(applyWord);
-        Tcl_IncrRefCount(probe);
-        Tcl_Obj* evalv[2] = {applyWord, probe};
-        if (Tcl_EvalObjv(interp, 2, evalv, 0) == TCL_OK)
-        {
-            tbcxTyLambda = probe->typePtr;
-        }
-        Tcl_ResetResult(interp);
-        Tcl_DecrRefCount(probe);
-        Tcl_DecrRefCount(applyWord);
-    }
-    tbcxTyList = NeedObjType("list");
-    tbcxTyProcBody = NeedObjType("procbody");
-
-    /* Verify critical types are available */
-    if (!tbcxTyBytecode || !tbcxTyInt || !tbcxTyList || !tbcxTyProcBody || !tbcxTyDouble || !tbcxTyByteArray)
-    {
-        Tcl_MutexUnlock(&tbcxTypeMutex);
         if (interp)
         {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: required Tcl_ObjType not available", -1));
@@ -206,10 +241,33 @@ static int TbcxInitTypes(Tcl_Interp* interp)
         return TCL_ERROR;
     }
 
-    tbcxAuxJTStr = TclGetAuxDataType("JumptableInfo");
-    tbcxAuxJTNum = TclGetAuxDataType("JumptableNumInfo");
-    tbcxAuxDictUpdate = TclGetAuxDataType("DictUpdateInfo");
-    tbcxAuxNewForeach = TclGetAuxDataType("NewForeachInfo");
+    /* ---- Phase 2: Assign globals under the mutex ---- */
+    Tcl_MutexLock(&tbcxTypeMutex);
+
+    if (tbcxTypesLoaded)
+    {
+        /* Another thread beat us — our local probes are redundant but harmless */
+        Tcl_MutexUnlock(&tbcxTypeMutex);
+        return TCL_OK;
+    }
+
+    atomic_store(&tbcxHostIsLE, hostLE);
+
+    tbcxTyBignum = tyBignum;
+    tbcxTyBoolean = tyBoolean;
+    tbcxTyByteArray = tyByteArray;
+    tbcxTyBytecode = tyBytecode;
+    tbcxTyDict = tyDict;
+    tbcxTyDouble = tyDouble;
+    tbcxTyInt = tyInt;
+    tbcxTyLambda = tyLambda;
+    tbcxTyList = tyList;
+    tbcxTyProcBody = tyProcBody;
+
+    tbcxAuxJTStr = auxJTStr;
+    tbcxAuxJTNum = auxJTNum;
+    tbcxAuxDictUpdate = auxDictUpdate;
+    tbcxAuxNewForeach = auxNewForeach;
 
     tbcxTypesLoaded = 1;
 
@@ -241,12 +299,19 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
         return TCL_ERROR;
     }
 
-    Tcl_CreateObjCommand2(interp, "tbcx::save", Tbcx_SaveObjCmd, NULL, NULL);
-    Tcl_CreateObjCommand2(interp, "tbcx::load", Tbcx_LoadObjCmd, NULL, NULL);
-    Tcl_CreateObjCommand2(interp, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL);
-    Tcl_CreateObjCommand2(interp, "tbcx::gc", Tbcx_GcObjCmd, NULL, NULL);
+    if (!Tcl_CreateObjCommand2(interp, "tbcx::save", Tbcx_SaveObjCmd, NULL, NULL) ||
+        !Tcl_CreateObjCommand2(interp, "tbcx::load", Tbcx_LoadObjCmd, NULL, NULL) ||
+        !Tcl_CreateObjCommand2(interp, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL) ||
+        !Tcl_CreateObjCommand2(interp, "tbcx::gc", Tbcx_GcObjCmd, NULL, NULL))
+    {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: failed to register commands", -1));
+        return TCL_ERROR;
+    }
 
-    Tcl_PkgProvide(interp, PKG_TBCX, PKG_TBCX_VER);
+    if (Tcl_PkgProvide(interp, PKG_TBCX, PKG_TBCX_VER) != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
 
     return TCL_OK;
 }
@@ -271,8 +336,15 @@ DLLEXPORT int tbcx_SafeInit(Tcl_Interp* ip)
     if (TbcxInitTypes(ip) != TCL_OK)
         return TCL_ERROR;
 
-    Tcl_CreateObjCommand2(ip, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL);
+    if (!Tcl_CreateObjCommand2(ip, "tbcx::dump", Tbcx_DumpObjCmd, NULL, NULL))
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: failed to register dump command", -1));
+        return TCL_ERROR;
+    }
 
-    Tcl_PkgProvide(ip, PKG_TBCX, PKG_TBCX_VER);
+    if (Tcl_PkgProvide(ip, PKG_TBCX, PKG_TBCX_VER) != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
     return TCL_OK;
 }

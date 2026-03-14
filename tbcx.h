@@ -7,9 +7,14 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+#ifndef USE_TCL_STUBS
+#define USE_TCL_STUBS
+#endif
 
 #include "tcl.h"
 #include "tclCompile.h"
@@ -66,7 +71,7 @@ typedef struct TbcxHeader
     uint32_t maxStackTop;
 } TbcxHeader;
 
-extern int tbcxHostIsLE;
+extern _Atomic int tbcxHostIsLE;
 
 uint32_t PackTclVersion(void);
 
@@ -75,6 +80,11 @@ uint32_t PackTclVersion(void);
 #define TBCX_MAX_AUX (64u * 1024u * 1024u)
 #define TBCX_MAX_EXCEPT (64u * 1024u * 1024u)
 #define TBCX_MAX_STR (16u * 1024u * 1024u)
+#define TBCX_MAX_LOCALS 65536u
+#define TBCX_MAX_STACK 65536u
+#define TBCX_MAX_PROCS (1u * 1024u * 1024u)
+#define TBCX_MAX_CLASSES (1u * 1024u * 1024u)
+#define TBCX_MAX_METHODS (1u * 1024u * 1024u)
 
 #define TBCX_BUFSIZE (64u * 1024u)
 
@@ -122,25 +132,26 @@ typedef struct
  * Forward Declarations
  * ========================================================================== */
 
-int BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, int* numArgsOut);
-int CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch);
-Tcl_Namespace* EnsureNamespace(Tcl_Interp* ip, const char* fqn);
-void FreeLocals(CompiledLocal* first);
-int ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
-int ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
+int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, int* numArgsOut);
+int Tbcx_CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch);
+Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
+void Tbcx_FreeLocals(CompiledLocal* first);
+int Tbcx_ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
+int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
 
-void R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
-int R_Bytes(TbcxIn* r, void* p, size_t n);
-int R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
-int R_U32(TbcxIn* r, uint32_t* vp);
-int R_U64(TbcxIn* r, uint64_t* vp);
-int R_U8(TbcxIn* r, uint8_t* v);
+void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
+int Tbcx_R_Bytes(TbcxIn* r, void* p, size_t n);
+int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
+int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
+int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
+int Tbcx_R_U8(TbcxIn* r, uint8_t* v);
 
-void W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
-int W_Flush(TbcxOut* w);
+void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
+int Tbcx_W_Flush(TbcxOut* w);
 
-Tcl_Obj* ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
-int ReadHeader(TbcxIn* r, TbcxHeader* H);
+Tcl_Obj*
+Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
+int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
 
 void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
 
