@@ -6,8 +6,9 @@
 
 /* Monotonic counter for unique temp-file naming (Finding #8).
  * Two concurrent tbcx::save calls to the same target no longer
- * clobber each other's staging file. */
-static unsigned int tbcxSaveTmpId = 0;
+ * clobber each other's staging file.
+ * uint64_t to prevent wrap-around in long-running processes. */
+static uint64_t tbcxSaveTmpId = 0;
 TCL_DECLARE_MUTEX(tbcxSaveTmpMutex);
 
 /* ==========================================================================
@@ -215,7 +216,7 @@ static inline void W_Error(TbcxOut* w, const char* msg)
 }
 
 /* Buffered write I/O — collapses thousands of syscalls into a handful.
- * LIMITATION (Finding #10): synchronous blocking I/O on the interpreter
+ * LIMITATION (TODO TBCX-10): synchronous blocking I/O on the interpreter
  * thread; see tbcxload.c for the full note. */
 void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch)
 {
@@ -290,7 +291,7 @@ static inline void W_U8(TbcxOut* w, uint8_t v)
 
 static inline void W_U32(TbcxOut* w, uint32_t v)
 {
-    if (!tbcxHostIsLE)
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
     {
         v = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24);
     }
@@ -298,7 +299,7 @@ static inline void W_U32(TbcxOut* w, uint32_t v)
 }
 static inline void W_U64(TbcxOut* w, uint64_t v)
 {
-    if (!tbcxHostIsLE)
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
     {
         v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) | ((v & 0x0000000000FF0000ull) << 24) |
             ((v & 0x00000000FF000000ull) << 8) | ((v & 0x000000FF00000000ull) >> 8) | ((v & 0x0000FF0000000000ull) >> 24) |
@@ -1179,14 +1180,8 @@ static void Lit_Bignum(TbcxOut* w, Tcl_Obj* o)
     unsigned char* be = NULL;
     if (be_bytes > 0)
     {
+        /* Tcl 9.1's Tcl_Alloc panics on OOM; no NULL check needed. */
         be = (unsigned char*)Tcl_Alloc(be_bytes);
-        if (!be)
-        {
-            W_Error(w, "tbcx: oom");
-            TclBN_mp_clear(&mag);
-            TclBN_mp_clear(&z);
-            return;
-        }
         mrc = TclBN_mp_to_ubin(&mag, be, be_bytes, NULL);
         if (mrc != MP_OKAY)
         {
@@ -1395,7 +1390,16 @@ static void Lit_LambdaBC(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* lambda)
     if (TclProcCompileProc(ctx->interp, procPtr, bodyObj, (Namespace*)nsPtr, "body of lambda term", "lambdaExpr") != TCL_OK)
     {
         Tcl_DecrRefCount(bodyObj);
-        W_Error(w, "tbcx: lambda compile");
+        /* Preserve the detailed compiler error from TclProcCompileProc
+         * instead of overwriting with a generic message. */
+        if (w->err == TCL_OK)
+        {
+            Tcl_Obj* detail = Tcl_GetObjResult(ctx->interp);
+            Tcl_Size detLen = 0;
+            const char* detStr = Tcl_GetStringFromObj(detail, &detLen);
+            Tcl_SetObjResult(w->interp, Tcl_ObjPrintf("tbcx: lambda compile: %.*s", (int)(detLen > 200 ? 200 : detLen), detStr));
+            w->err = TCL_ERROR;
+        }
         goto lambda_cleanup;
     }
     compiled_ok = 1;
@@ -1427,14 +1431,22 @@ static void Lit_LambdaBC(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* lambda)
 lambda_cleanup:
     if (!compiled_ok)
     {
+        /* Compilation failed: procPtr was never attached to a ByteCode.
+         * We own procPtr and its locals — free them here. */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
         Tcl_Free((char*)procPtr);
     }
-    /* When compiled_ok is true, the Tcl compiler has attached procPtr to
-       the ByteCode (bc->procPtr = procPtr).  TclCleanupByteCode owns the
-       Proc and will free it when the ByteCode is destroyed.  Even if a
-       subsequent write error occurred (w->err), the ByteCode's Tcl_Obj
-       is still alive on the call stack and will be cleaned up normally. */
+    /* OWNERSHIP (compiled_ok == true):
+     *   procPtr → owned by ByteCode via bc->procPtr = procPtr
+     *   ByteCode → owned by bodyObj (or procPtr->bodyPtr) via internal rep
+     *   bodyObj  → on the Tcl stack, refcount held by caller (Tcl_IncrRefCount
+     *              at line above), will be freed when that refcount drops.
+     *   TclCleanupByteCode frees both the ByteCode and the attached Proc.
+     *
+     *   If w->err was set after compiled_ok (e.g. by WriteCompiledBlock or
+     *   W_LPString), the ByteCode Tcl_Obj is still alive — the write error
+     *   does not affect object lifetimes.  The caller (WriteLiteral) will
+     *   propagate the error and eventually the Tcl_Obj will be freed normally. */
 
     Tcl_DecrRefCount(nsFQN);
 }
@@ -1655,6 +1667,11 @@ static void WriteLocalNames(TbcxOut* w, ByteCode* bc, uint32_t numLocals)
  * falls back to plain string emission. */
 static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
 {
+    /* Get the string rep once and reuse throughout — the pointer remains
+     * valid as long as we don't modify the object (which we never do). */
+    Tcl_Size n = 0;
+    const char* s = Tcl_GetStringFromObj(obj, &n);
+
     /* Lambda detection for string-typed literals.
        Tcl's compiler stores [apply] operands as plain string literals,
        not list-typed.  Try to parse as a list; if it has lambda shape
@@ -1665,9 +1682,7 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
        See comment above: runs regardless of stripActive. */
     if (ctx)
     {
-        Tcl_Size sn = 0;
-        (void)Tcl_GetStringFromObj(obj, &sn);
-        if (sn >= 4)
+        if (n >= 4)
         {
             Tcl_Obj* lcopy = Tcl_DuplicateObj(obj);
             Tcl_IncrRefCount(lcopy);
@@ -1742,17 +1757,12 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
         if (ctx->emittedInit)
         {
             int isNew;
-            Tcl_Size sLen = 0;
-            const char* ss = Tcl_GetStringFromObj(obj, &sLen);
-            Tcl_CreateHashEntry(&ctx->emittedBodies, ss, &isNew);
+            Tcl_CreateHashEntry(&ctx->emittedBodies, s, &isNew);
         }
         W_U32(w, TBCX_LIT_BYTECODE);
         Lit_Bytecode(w, ctx, compiled);
         return;
     }
-
-    Tcl_Size n;
-    const char* s = Tcl_GetStringFromObj(obj, &n);
 
     if (ShouldStripBody(ctx, obj))
     {
@@ -1951,17 +1961,19 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
            from int (pre-9.1 or future Tcl builds).  When they
            share a typePtr, integers are handled above via wideint. */
         int b = 0;
-        Tcl_GetBooleanFromObj(NULL, obj, &b);
+        if (Tcl_GetBooleanFromObj(NULL, obj, &b) != TCL_OK)
+            b = 0; /* defensive: should not happen given type check above */
         W_U32(w, TBCX_LIT_BOOLEAN);
         W_U8(w, (uint8_t)(b != 0));
     }
     else if (ty == tbcxTyByteArray)
     {
-        Tcl_Size n;
+        Tcl_Size n = 0;
         unsigned char* p = Tcl_GetByteArrayFromObj(obj, &n);
         W_U32(w, TBCX_LIT_BYTEARR);
         W_U32(w, (uint32_t)n);
-        W_Bytes(w, p, (size_t)n);
+        if (n > 0 && p)
+            W_Bytes(w, p, (size_t)n);
     }
     else if (ty == tbcxTyDict)
     {
@@ -2183,6 +2195,11 @@ static void WriteAux_JTStr(TbcxOut* w, AuxData* ad)
 
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
         cnt++;
+    if (cnt == 0)
+    {
+        W_U32(w, 0);
+        return;
+    }
     JTEntry* arr = (JTEntry*)Tcl_Alloc(sizeof(JTEntry) * cnt);
     uint32_t i = 0;
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
@@ -2218,6 +2235,11 @@ static void WriteAux_JTNum(TbcxOut* w, AuxData* ad)
     uint32_t cnt = 0;
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
         cnt++;
+    if (cnt == 0)
+    {
+        W_U32(w, 0);
+        return;
+    }
     JTNumEntry* arr = (JTNumEntry*)Tcl_Alloc(sizeof(JTNumEntry) * cnt);
     uint32_t i = 0;
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
@@ -2611,9 +2633,12 @@ static void DV_Push(DefVec* dv, DefRec r)
     if (dv->n == dv->cap)
     {
         size_t newCap = dv->cap ? dv->cap * 2 : 16;
-        /* Guard against pathological overflow */
+        /* Guard against pathological overflow.  Instead of Tcl_Panic
+         * (which kills the process), silently refuse — the caller's
+         * definition will be lost but the process survives.  In practice
+         * this limit is unreachable for legitimate scripts. */
         if (newCap < dv->cap || newCap > (SIZE_MAX / sizeof(DefRec)))
-            Tcl_Panic("tbcx: DefVec overflow");
+            return;
         dv->cap = newCap;
         dv->v = (DefRec*)Tcl_Realloc(dv->v, dv->cap * sizeof(DefRec));
     }
@@ -4933,7 +4958,14 @@ static int ReadAllFromChannel(Tcl_Interp* interp, Tcl_Channel ch, Tcl_Obj** outO
         if (endPos >= 0)
         {
             Tcl_WideInt remaining = endPos - curPos;
-            Tcl_Seek(ch, curPos, SEEK_SET); /* restore position */
+            if (Tcl_Seek(ch, curPos, SEEK_SET) < 0)
+            {
+                /* Seek-back failed — fall back to default chunked I/O.
+                 * The read loop below will start from wherever the channel
+                 * is now, which may produce partial/corrupt data, but at
+                 * least we won't silently read from the wrong offset. */
+                goto chunked_fallback;
+            }
             if (remaining > 0 && remaining < (Tcl_WideInt)(64 * 1024 * 1024))
             {
                 /* Read entire file in one call.  Add slack for encoding
@@ -4947,6 +4979,7 @@ static int ReadAllFromChannel(Tcl_Interp* interp, Tcl_Channel ch, Tcl_Obj** outO
         }
     }
 
+chunked_fallback:
     while (1)
     {
         Tcl_Size nread = Tcl_ReadChars(ch, dst, chunkSize, /*appendFlag*/ 1);
@@ -5001,7 +5034,18 @@ int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj)
 }
 
 /* ==========================================================================
- * Tcl commands
+ * Tcl command: tbcx::save
+ *
+ * Synopsis:   tbcx::save in out
+ * Arguments:  in  — Tcl script source: an open channel name, a filesystem
+ *                    path to a .tcl file, or a literal script string.
+ *             out — output destination: an open binary channel name, or a
+ *                    filesystem path (written atomically via temp+rename).
+ * Returns:    On success, the output path or channel name.
+ * Errors:     TCL_ERROR on read/write failure, compilation failure, or
+ *             unsupported AuxData types.  Sets interp result with details.
+ * Thread:     Must be called on the interp-owning thread.  Uses
+ *             tbcxSaveTmpMutex for unique temp-file naming (leaf lock).
  * ========================================================================== */
 
 int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[])
@@ -5084,9 +5128,9 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
            tbcx::save calls targeting the same destination. */
         {
             Tcl_MutexLock(&tbcxSaveTmpMutex);
-            unsigned int myTmpId = tbcxSaveTmpId++;
+            uint64_t myTmpId = tbcxSaveTmpId++;
             Tcl_MutexUnlock(&tbcxSaveTmpMutex);
-            Tcl_Obj* suffix = Tcl_ObjPrintf(".tbcx.%u.tmp", myTmpId);
+            Tcl_Obj* suffix = Tcl_ObjPrintf(".tbcx.%" PRIu64 ".tmp", myTmpId);
             Tcl_IncrRefCount(suffix);
             Tcl_AppendObjToObj(tmpPath, suffix);
             Tcl_DecrRefCount(suffix);
@@ -5127,7 +5171,15 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Ob
         {
             /* Atomic rename: temp -> final destination */
             Tcl_Obj* outNorm = Tcl_FSGetNormalizedPath(interp, outObj);
-            if (outNorm && Tcl_FSRenameFile(tmpPath, outNorm) == TCL_OK)
+            if (!outNorm)
+            {
+                /* Normalization failed — e.g. parent directory was deleted
+                 * between write and rename.  Clean up temp and report. */
+                Tcl_FSDeleteFile(tmpPath);
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: cannot normalize output path \"%s\"", Tcl_GetString(outObj)));
+                rc = TCL_ERROR;
+            }
+            else if (Tcl_FSRenameFile(tmpPath, outNorm) == TCL_OK)
             {
                 Tcl_SetObjResult(interp, outNorm);
             }

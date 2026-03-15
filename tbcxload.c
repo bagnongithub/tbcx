@@ -56,10 +56,10 @@ typedef struct
 
 typedef struct
 {
-    Tcl_HashTable methodsByKey; /* key: STRING "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
-    char origName[80];          /* unique rename target for oo::define (reentrancy-safe) */
-    char origNameObjDef[80];    /* unique rename target for oo::objdefine */
-    int hasObjDefine;           /* 1 if oo::objdefine was successfully shimmed */
+    Tcl_HashTable methodsByKey;               /* key: STRING "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
+    char origName[TBCX_OSHIM_NAME_MAX];       /* unique rename target for oo::define (reentrancy-safe) */
+    char origNameObjDef[TBCX_OSHIM_NAME_MAX]; /* unique rename target for oo::objdefine */
+    int hasObjDefine;                         /* 1 if oo::objdefine was successfully shimmed */
 } OOShim;
 
 /* ApplyShim — persistent interceptor on the [apply] command.
@@ -190,11 +190,14 @@ static void TopLocals_End(Tcl_Interp* ip, TbcxTopFrameSave* sv);
 /* ==========================================================================
  * Buffered Read I/O & Utilities
  *
- * LIMITATION (Finding #10): All I/O in the load, save, and dump paths is
+ * LIMITATION (TODO TBCX-10): All I/O in the load, save, and dump paths is
  * synchronous and blocking on the interpreter thread.  This violates
  * low-latency requirements for event-loop-driven deployments.  Fixing
- * this requires an async/coroutine-based I/O architecture — tracked as
- * a future enhancement.
+ * this requires an async/coroutine-based I/O architecture.
+ * Safe temporary invariant: all current callers (tbcx::save, tbcx::load,
+ * tbcx::dump) are Tcl_ObjCmdProc2 implementations invoked synchronously
+ * by the event loop, so blocking does not starve other file handlers —
+ * it simply extends the command's wall-clock time.
  * ========================================================================== */
 
 static inline void R_Error(TbcxIn* r, const char* msg)
@@ -264,7 +267,7 @@ inline int Tbcx_R_U32(TbcxIn* r, uint32_t* vp)
     uint32_t v = 0;
     if (!Tbcx_R_Bytes(r, &v, 4))
         return 0;
-    if (!tbcxHostIsLE)
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
     {
         v = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24);
     }
@@ -277,7 +280,7 @@ inline int Tbcx_R_U64(TbcxIn* r, uint64_t* vp)
     uint64_t v = 0;
     if (!Tbcx_R_Bytes(r, &v, 8))
         return 0;
-    if (!tbcxHostIsLE)
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
     {
         v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) | ((v & 0x0000000000FF0000ull) << 24) |
             ((v & 0x00000000FF000000ull) << 8) | ((v & 0x000000FF00000000ull) >> 8) | ((v & 0x0000FF0000000000ull) >> 24) |
@@ -1169,6 +1172,13 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
     return rc;
 }
 
+/* AddOOShim — intercept [oo::define] and [oo::objdefine] to substitute
+ * precompiled method/constructor/destructor bodies.
+ *
+ * Thread safety / lock ordering:
+ *   Calls TclRenameCommand and Tcl_CreateObjCommand2, both of which may
+ *   acquire Tcl-internal mutexes.  No TBCX mutex is held during this call.
+ *   Must be called from the interp-owning thread only. */
 static int AddOOShim(Tcl_Interp* ip, OOShim* os)
 {
     memset(os, 0, sizeof(*os));
@@ -3147,6 +3157,13 @@ static void ProcCmdDeleteTrace(void* cd, Tcl_Interp* interp, const char* oldName
     }
 }
 
+/* AddProcShim — intercept the [proc] command to substitute precompiled bodies.
+ *
+ * Thread safety / lock ordering:
+ *   This function accesses Tcl internal Command structs and calls
+ *   Tcl_TraceCommand, both of which may acquire Tcl-internal mutexes.
+ *   No TBCX mutex is held during this call.  Callers must ensure this
+ *   function is only called from the interp-owning thread. */
 static int AddProcShim(Tcl_Interp* ip, ProcShim* ps)
 {
     memset(ps, 0, sizeof(*ps));
@@ -4002,7 +4019,18 @@ cleanup:
 }
 
 /* ==========================================================================
- * Tcl commands
+ * Tcl command: tbcx::load
+ *
+ * Synopsis:   tbcx::load in
+ * Arguments:  in — input source: an open binary channel name, or a
+ *                   filesystem path to a .tbcx file.
+ * Returns:    The result of evaluating the deserialized top-level bytecode.
+ * Errors:     TCL_ERROR on read/parse failure, malformed .tbcx stream,
+ *             or runtime error during top-level evaluation.
+ * Thread:     Must be called on the interp-owning thread.  Temporarily
+ *             shims the [proc] and [oo::define] commands during load to
+ *             intercept and substitute precompiled bodies; restores them
+ *             on all exit paths (success or error).
  * ========================================================================== */
 
 int Tbcx_LoadObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[])

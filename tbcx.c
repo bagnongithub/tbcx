@@ -27,7 +27,12 @@ const AuxDataType* tbcxAuxJTNum = NULL;
 const AuxDataType* tbcxAuxDictUpdate = NULL;
 const AuxDataType* tbcxAuxNewForeach = NULL;
 
-static int tbcxTypesLoaded = 0;
+/* tbcxTypesLoaded: publication gate for the one-time type initialization.
+ * Written to 1 with memory_order_release under tbcxTypeMutex, read with
+ * memory_order_acquire on the fast path.  This guarantees that any thread
+ * observing tbcxTypesLoaded == 1 also sees all preceding stores to the
+ * tbcxTy and tbcxAux pointer globals, even on weakly-ordered architectures. */
+static _Atomic int tbcxTypesLoaded = 0;
 
 /* tbcxHostIsLE: host byte-order flag (1 = little-endian, 0 = big-endian).
  * Written once during TbcxInitTypes, thereafter read from hot paths
@@ -244,9 +249,10 @@ static int TbcxInitTypes(Tcl_Interp* interp)
     /* ---- Phase 2: Assign globals under the mutex ---- */
     Tcl_MutexLock(&tbcxTypeMutex);
 
-    if (tbcxTypesLoaded)
+    if (atomic_load_explicit(&tbcxTypesLoaded, memory_order_acquire))
     {
-        /* Another thread beat us — our local probes are redundant but harmless */
+        /* Another thread beat us — our local probes are redundant but harmless.
+         * The acquire fence ensures we see all type pointer stores. */
         Tcl_MutexUnlock(&tbcxTypeMutex);
         return TCL_OK;
     }
@@ -269,20 +275,35 @@ static int TbcxInitTypes(Tcl_Interp* interp)
     tbcxAuxDictUpdate = auxDictUpdate;
     tbcxAuxNewForeach = auxNewForeach;
 
-    tbcxTypesLoaded = 1;
+    /* Publish: all type pointer stores above must be visible to any
+     * thread that subsequently observes tbcxTypesLoaded == 1. */
+    atomic_store_explicit(&tbcxTypesLoaded, 1, memory_order_release);
 
     Tcl_MutexUnlock(&tbcxTypeMutex);
     return TCL_OK;
 }
 
+/* ==========================================================================
+ * Extension initialization entry point.
+ *
+ * Synopsis:   package require tbcx
+ * Arguments:  interp — the interpreter to initialize in.
+ * Returns:    TCL_OK on success, TCL_ERROR on failure.
+ * Side effects: Registers tbcx::save, tbcx::load, tbcx::dump, tbcx::gc
+ *               commands and provides package tbcx 1.0.
+ * Thread:     must be called on the interp-owning thread.  Performs
+ *             one-time global type initialization under tbcxTypeMutex;
+ *             may call Tcl_EvalObjv for lambda type probing.
+ * ========================================================================== */
+
 DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
 {
-    if (Tcl_InitStubs(interp, TCL_VERSION, 1) == NULL)
+    if (Tcl_InitStubs(interp, "9.1", 0) == NULL)
     {
         return TCL_ERROR;
     }
 
-    if (Tcl_TomMath_InitStubs(interp, TCL_VERSION) == NULL)
+    if (Tcl_TomMath_InitStubs(interp, "9.1") == NULL)
     {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: libtommath stubs not available"));
         return TCL_ERROR;
@@ -316,6 +337,21 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
     return TCL_OK;
 }
 
+/* ==========================================================================
+ * Safe interpreter initialization entry point.
+ *
+ * Synopsis:   (internal — called by Tcl's package loader for safe interps)
+ * Arguments:  ip — the safe interpreter to initialize in.
+ * Returns:    TCL_OK on success, TCL_ERROR on failure.
+ * Side effects: Initializes type infrastructure and provides package tbcx 1.0.
+ *               Does NOT register any commands — safe interps get no
+ *               filesystem or bytecode access.  Parent interpreters that need
+ *               controlled access can use [interp alias] or [interp expose].
+ *               Note: lambda type probing executes a trivial [apply {{} {}]
+ *               in the safe interpreter, which is a benign side effect.
+ * Thread:     must be called on the interp-owning thread.
+ * ========================================================================== */
+
 /* SafeInit: do NOT expose any commands that perform filesystem I/O.
    The original code exposed tbcx::dump here, but dump opens arbitrary
    filesystem paths via Tcl_FSOpenFileChannel, reintroducing file-read
@@ -323,9 +359,9 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
    controlled dump access can use [interp alias] or [interp expose]. */
 DLLEXPORT int tbcx_SafeInit(Tcl_Interp* ip)
 {
-    if (Tcl_InitStubs(ip, TCL_VERSION, 1) == NULL)
+    if (Tcl_InitStubs(ip, "9.1", 0) == NULL)
         return TCL_ERROR;
-    if (Tcl_TomMath_InitStubs(ip, TCL_VERSION) == NULL)
+    if (Tcl_TomMath_InitStubs(ip, "9.1") == NULL)
     {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: libtommath stubs not available"));
         return TCL_ERROR;

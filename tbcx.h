@@ -89,6 +89,10 @@ uint32_t Tbcx_PackTclVersion(void);
 
 #define TBCX_BUFSIZE (64u * 1024u)
 
+/* Maximum length of generated shim command names (oo::define rename targets).
+ * Must accommodate "::tbcx::__oo_objdef_orig_NNNN__" with generous room. */
+#define TBCX_OSHIM_NAME_MAX 80
+
 extern const Tcl_ObjType* tbcxTyBignum;
 extern const Tcl_ObjType* tbcxTyBoolean;
 extern const Tcl_ObjType* tbcxTyByteArray;
