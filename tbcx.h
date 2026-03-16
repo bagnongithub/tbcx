@@ -76,16 +76,20 @@ extern _Atomic int tbcxHostIsLE;
 
 uint32_t Tbcx_PackTclVersion(void);
 
-#define TBCX_MAX_CODE (1024u * 1024u * 1024u)
-#define TBCX_MAX_LITERALS (64u * 1024u * 1024u)
-#define TBCX_MAX_AUX (64u * 1024u * 1024u)
-#define TBCX_MAX_EXCEPT (64u * 1024u * 1024u)
-#define TBCX_MAX_STR (16u * 1024u * 1024u)
+/* Wire-format caps — production-safe defaults for untrusted input.
+ * These limit the maximum values the deserializer will accept from a
+ * .tbcx stream.  Combined with Tcl_AttemptAlloc for wire-derived sizes,
+ * hostile files cannot crash the process via OOM/panic. */
+#define TBCX_MAX_CODE (64u * 1024u * 1024u)
+#define TBCX_MAX_LITERALS (1u * 1024u * 1024u)
+#define TBCX_MAX_AUX (1u * 1024u * 1024u)
+#define TBCX_MAX_EXCEPT (1u * 1024u * 1024u)
+#define TBCX_MAX_STR (4u * 1024u * 1024u)
 #define TBCX_MAX_LOCALS 65536u
 #define TBCX_MAX_STACK 65536u
-#define TBCX_MAX_PROCS (1u * 1024u * 1024u)
-#define TBCX_MAX_CLASSES (1u * 1024u * 1024u)
-#define TBCX_MAX_METHODS (1u * 1024u * 1024u)
+#define TBCX_MAX_PROCS (256u * 1024u)
+#define TBCX_MAX_CLASSES (256u * 1024u)
+#define TBCX_MAX_METHODS (256u * 1024u)
 
 #define TBCX_BUFSIZE (64u * 1024u)
 

@@ -257,7 +257,7 @@ static int TbcxInitTypes(Tcl_Interp* interp)
         return TCL_OK;
     }
 
-    atomic_store(&tbcxHostIsLE, hostLE);
+    atomic_store_explicit(&tbcxHostIsLE, hostLE, memory_order_release);
 
     tbcxTyBignum = tyBignum;
     tbcxTyBoolean = tyBoolean;

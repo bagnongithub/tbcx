@@ -1546,6 +1546,11 @@ static int CompileProcLike(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* nsFQN, Tcl_Obj* ar
     Tcl_Namespace* ns = Tcl_FindNamespace(ip, nsNm, NULL, 0);
     if (!ns)
         ns = Tcl_CreateNamespace(ip, nsNm, NULL, NULL);
+    if (!ns)
+    {
+        W_Error(w, "tbcx: failed to create namespace for proc-like compilation");
+        return TCL_ERROR;
+    }
     Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
     procPtr->iPtr = (Interp*)ip;
@@ -1566,8 +1571,17 @@ static int CompileProcLike(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* nsFQN, Tcl_Obj* ar
     Tcl_IncrRefCount(bodyObj);
     if (TclProcCompileProc(ip, procPtr, bodyObj, (Namespace*)ns, whereTag, "proc") != TCL_OK)
     {
+        /* Preserve the detailed compiler diagnostic left in interp result
+           by TclProcCompileProc, wrapping it with our context prefix. */
+        Tcl_Obj* detail = Tcl_GetObjResult(ip);
+        Tcl_IncrRefCount(detail);
         Tcl_DecrRefCount(bodyObj);
-        W_Error(w, "tbcx: proc-like compile failed");
+        if (w->err == TCL_OK)
+        {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: proc-like compile failed: %s", Tcl_GetString(detail)));
+            w->err = TCL_ERROR;
+        }
+        Tcl_DecrRefCount(detail);
         goto cple_fail;
     }
     /* Compiler may leave bytecode in procPtr->bodyPtr and/or convert bodyObj to 'procbody'. */
@@ -1970,9 +1984,14 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
     {
         Tcl_Size n = 0;
         unsigned char* p = Tcl_GetByteArrayFromObj(obj, &n);
+        if (n > 0 && !p)
+        {
+            W_Error(w, "tbcx: bytearray conversion returned NULL");
+            return;
+        }
         W_U32(w, TBCX_LIT_BYTEARR);
         W_U32(w, (uint32_t)n);
-        if (n > 0 && p)
+        if (n > 0)
             W_Bytes(w, p, (size_t)n);
     }
     else if (ty == tbcxTyDict)
@@ -2908,6 +2927,7 @@ static void CaptureClassBody(Tcl_Interp* ip,
                     if (args)
                     {
                         Tcl_Size _tbcx_dummy;
+                        /* Force list-shimmer for canonical string rep. */
                         (void)Tcl_ListObjLength(ip, args, &_tbcx_dummy);
                     }
                     if (args && body)
@@ -2959,6 +2979,7 @@ static void CaptureClassBody(Tcl_Interp* ip,
                     if (args)
                     {
                         Tcl_Size _tbcx_dummy;
+                        /* Force list-shimmer for canonical string rep. */
                         (void)Tcl_ListObjLength(ip, args, &_tbcx_dummy);
                     }
                     if (args && body)
@@ -3489,6 +3510,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                 if (args)
                 {
                     Tcl_Size _d;
+                    /* Force list-shimmer for canonical string rep. */
                     (void)Tcl_ListObjLength(ctx->ip, args, &_d);
                 }
                 if (mname && args && body)
@@ -3551,6 +3573,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                 if (args)
                 {
                     Tcl_Size _d;
+                    /* Force list-shimmer for canonical string rep. */
                     (void)Tcl_ListObjLength(ctx->ip, args, &_d);
                 }
                 if (args && body)
@@ -3995,6 +4018,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                 if (args)
                 {
                     Tcl_Size _d;
+                    /* Force list-shimmer for canonical string rep. */
                     (void)Tcl_ListObjLength(ctx->ip, args, &_d);
                 }
                 if (mname && args && body)
@@ -4056,6 +4080,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                 if (args)
                 {
                     Tcl_Size _d;
+                    /* Force list-shimmer for canonical string rep. */
                     (void)Tcl_ListObjLength(ctx->ip, args, &_d);
                 }
                 if (args && body)
@@ -4545,6 +4570,7 @@ static Tcl_Obj* CaptureAndRewriteScript(
                     if (args)
                     {
                         Tcl_Size _d;
+                        /* Force list-shimmer for canonical string rep. */
                         (void)Tcl_ListObjLength(ip, args, &_d);
                     }
                     if (name && args && body)
@@ -4960,11 +4986,14 @@ static int ReadAllFromChannel(Tcl_Interp* interp, Tcl_Channel ch, Tcl_Obj** outO
             Tcl_WideInt remaining = endPos - curPos;
             if (Tcl_Seek(ch, curPos, SEEK_SET) < 0)
             {
-                /* Seek-back failed — fall back to default chunked I/O.
-                 * The read loop below will start from wherever the channel
-                 * is now, which may produce partial/corrupt data, but at
-                 * least we won't silently read from the wrong offset. */
-                goto chunked_fallback;
+                /* Seek-back failed after a successful seek-to-end.
+                 * The channel is now positioned at EOF; falling through
+                 * to chunked I/O would read 0 bytes and silently compile
+                 * an empty script.  Treat as a hard error. */
+                Tcl_DecrRefCount(dst);
+                if (interp)
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: seek-back failed after seek-to-end", -1));
+                return TCL_ERROR;
             }
             if (remaining > 0 && remaining < (Tcl_WideInt)(64 * 1024 * 1024))
             {
@@ -4979,7 +5008,6 @@ static int ReadAllFromChannel(Tcl_Interp* interp, Tcl_Channel ch, Tcl_Obj** outO
         }
     }
 
-chunked_fallback:
     while (1)
     {
         Tcl_Size nread = Tcl_ReadChars(ch, dst, chunkSize, /*appendFlag*/ 1);

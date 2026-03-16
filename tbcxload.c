@@ -9,8 +9,9 @@
  * ========================================================================== */
 
 /* tbcxHiddenId: monotonically increasing counter used to generate unique
- * rename targets for OO shim commands.  Protected by tbcxHiddenIdMutex. */
-static unsigned int tbcxHiddenId = 0;
+ * rename targets for OO shim commands.  Protected by tbcxHiddenIdMutex.
+ * 64-bit to eliminate exhaustion risk in long-lived processes. */
+static uint64_t tbcxHiddenId = 0;
 
 /* tbcxHiddenIdMutex: protects tbcxHiddenId.  Lock-order position: leaf —
  * no other TBCX mutex may be held while this is held. */
@@ -101,7 +102,7 @@ typedef struct
 
 /* Runaway detection limits */
 #define TBCX_MAX_LITERAL_DEPTH 64
-#define TBCX_MAX_CONTAINER_ELEMS (16u * 1024u * 1024u)
+#define TBCX_MAX_CONTAINER_ELEMS (1u * 1024u * 1024u)
 
 /* ==========================================================================
  * Forward Declarations
@@ -143,7 +144,7 @@ static void OOShim_IdentifyMethod(const char* subc,
                                   Tcl_Obj* clsFqn,
                                   Tcl_DString* keyDs,
                                   uint8_t* kindOut,
-                                  int* bodyIdxOut,
+                                  Tcl_Size* bodyIdxOut,
                                   Tcl_Obj** runtimeArgsOut,
                                   Tcl_Obj** nameOOut,
                                   Tcl_Obj** tmpEmptyArgsOut,
@@ -152,7 +153,7 @@ static void OOShim_LookupPair(Tcl_Interp* ip,
                               OOShim* os,
                               Tcl_DString* keyDs,
                               int hasKey,
-                              int bodyIdx,
+                              Tcl_Size bodyIdx,
                               Tcl_Obj* runtimeArgs,
                               Tcl_Obj** savedArgsOut,
                               Tcl_Obj** preBodyOut);
@@ -300,7 +301,12 @@ inline int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp)
         R_Error(r, "tbcx: LPString too large");
         return 0;
     }
-    char* buf = (char*)Tcl_Alloc(n + 1u);
+    char* buf = (char*)Tcl_AttemptAlloc(n + 1u);
+    if (!buf)
+    {
+        R_Error(r, "tbcx: allocation failed (LPString)");
+        return 0;
+    }
     if (n && !Tbcx_R_Bytes(r, buf, n))
     {
         Tcl_Free(buf);
@@ -683,7 +689,7 @@ static void OOShim_IdentifyMethod(const char* subc,
                                   Tcl_Obj* clsFqn,
                                   Tcl_DString* keyDs,
                                   uint8_t* kindOut,
-                                  int* bodyIdxOut,
+                                  Tcl_Size* bodyIdxOut,
                                   Tcl_Obj** runtimeArgsOut,
                                   Tcl_Obj** nameOOut,
                                   Tcl_Obj** tmpEmptyArgsOut,
@@ -702,7 +708,7 @@ static void OOShim_IdentifyMethod(const char* subc,
         {
             *kindOut = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
             Tcl_Size nameIdx = objc - 3, argsIdx = objc - 2;
-            *bodyIdxOut = (int)(objc - 1);
+            *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
             MethodKeyBuf(keyDs, clsFqn, *kindOut, objv[nameIdx]);
             *hasKeyOut = 1;
@@ -715,7 +721,7 @@ static void OOShim_IdentifyMethod(const char* subc,
         {
             *kindOut = TBCX_METH_CTOR;
             Tcl_Size argsIdx = objc - 2;
-            *bodyIdxOut = (int)(objc - 1);
+            *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
             MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL);
             *hasKeyOut = 1;
@@ -727,7 +733,7 @@ static void OOShim_IdentifyMethod(const char* subc,
         if (objc >= 5)
         {
             Tcl_Size argsIdx = objc - 2;
-            *bodyIdxOut = (int)(objc - 1);
+            *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
             MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL);
             *hasKeyOut = 1;
@@ -750,7 +756,7 @@ static void OOShim_LookupPair(Tcl_Interp* ip,
                               OOShim* os,
                               Tcl_DString* keyDs,
                               int hasKey,
-                              int bodyIdx,
+                              Tcl_Size bodyIdx,
                               Tcl_Obj* runtimeArgs,
                               Tcl_Obj** savedArgsOut,
                               Tcl_Obj** preBodyOut)
@@ -845,7 +851,7 @@ static int CmdOOShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const obj
     Tcl_Obj* preBody = NULL;      /* precompiled procbody to substitute */
     Tcl_Obj* runtimeArgs = NULL;  /* args provided by the user at runtime */
     Tcl_Obj* tmpEmptyArgs = NULL; /* temp "" for destructor short form */
-    int bodyIdx = -1;             /* index of body word in argv */
+    Tcl_Size bodyIdx = -1;        /* index of body word in argv */
     uint8_t kind = 0xFF;          /* TBCX_METH_* */
 
     /* Identify the OO subcommand and look up a precompiled pair. */
@@ -862,6 +868,9 @@ static int CmdOOShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const obj
             goto cleanup;
         }
         Tcl_Size _dummyLen = 0;
+        /* Force list-shimmering so the string rep is canonical before
+           byte-wise comparison.  Failure is harmless: comparison still
+           works on the existing string rep. */
         (void)Tcl_ListObjLength(ip, runtimeArgs, &_dummyLen);
         (void)Tcl_ListObjLength(ip, savedArgs, &_dummyLen);
         Tcl_Size aLen = 0, bLen = 0;
@@ -1091,13 +1100,13 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
         Tcl_DString keyDs;
         int hasKey = 0;
         Tcl_Obj* nameO = NULL;
-        int bodyIdx = -1;
+        Tcl_Size bodyIdx = -1;
         uint8_t kind = 0xFF;
 
         if ((strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) && objc >= 6)
         {
             kind = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
-            bodyIdx = (int)(objc - 1);
+            bodyIdx = objc - 1;
             nameO = objv[objc - 3];
             MethodKeyBuf(&keyDs, objFqn, kind, nameO);
             hasKey = 1;
@@ -1105,14 +1114,14 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
         else if (strcmp(subc, "constructor") == 0 && objc >= 5)
         {
             kind = TBCX_METH_CTOR;
-            bodyIdx = (int)(objc - 1);
+            bodyIdx = objc - 1;
             MethodKeyBuf(&keyDs, objFqn, kind, NULL);
             hasKey = 1;
         }
         else if (strcmp(subc, "destructor") == 0 && objc >= 4)
         {
             kind = TBCX_METH_DTOR;
-            bodyIdx = (int)(objc - 1);
+            bodyIdx = objc - 1;
             MethodKeyBuf(&keyDs, objFqn, kind, NULL);
             hasKey = 1;
         }
@@ -1187,18 +1196,18 @@ static int AddOOShim(Tcl_Interp* ip, OOShim* os)
     /* Generate a unique rename target so nested tbcx::load calls don't
        collide.  Each nesting level gets its own orig command name. */
     Tcl_MutexLock(&tbcxHiddenIdMutex);
-    if (tbcxHiddenId == UINT_MAX)
+    if (tbcxHiddenId == UINT64_MAX)
     {
         Tcl_MutexUnlock(&tbcxHiddenIdMutex);
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: OO shim ID counter exhausted"));
         return TCL_ERROR;
     }
-    unsigned int myId = tbcxHiddenId++;
+    uint64_t myId = tbcxHiddenId++;
     Tcl_MutexUnlock(&tbcxHiddenIdMutex);
 
     /* Build unique rename targets using Tcl_ObjPrintf instead of raw snprintf */
     {
-        Tcl_Obj* tmp = Tcl_ObjPrintf("::tbcx::__oo_define_orig_%u__", myId);
+        Tcl_Obj* tmp = Tcl_ObjPrintf("::tbcx::__oo_define_orig_%" PRIu64 "__", myId);
         Tcl_IncrRefCount(tmp);
         Tcl_Size len = 0;
         const char* s = Tcl_GetStringFromObj(tmp, &len);
@@ -1208,7 +1217,7 @@ static int AddOOShim(Tcl_Interp* ip, OOShim* os)
         os->origName[len] = '\0';
         Tcl_DecrRefCount(tmp);
 
-        tmp = Tcl_ObjPrintf("::tbcx::__oo_objdef_orig_%u__", myId);
+        tmp = Tcl_ObjPrintf("::tbcx::__oo_objdef_orig_%" PRIu64 "__", myId);
         Tcl_IncrRefCount(tmp);
         s = Tcl_GetStringFromObj(tmp, &len);
         if (len >= (Tcl_Size)sizeof(os->origNameObjDef))
@@ -1366,7 +1375,12 @@ static ByteCode* TbcxByteCode(Tcl_Obj* objPtr, const Tcl_ObjType* typePtr, const
 #undef TBCX_CHECKED_ADD
     }
 
-    unsigned char* base = (unsigned char*)Tcl_Alloc(structureSize);
+    unsigned char* base = (unsigned char*)Tcl_AttemptAlloc(structureSize);
+    if (!base)
+    {
+        Tcl_SetObjResult(env->interp, Tcl_NewStringObj("tbcx: allocation failed (ByteCode structure)", -1));
+        return NULL;
+    }
     ByteCode* codePtr = (ByteCode*)base;
 
     /* ----- Header & environment capture (same fields as core) ----- */
@@ -1502,7 +1516,12 @@ static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
     env.maxStackDepth = maxStackDepth;
     env.procPtr = NULL;
 
-    env.codeStart = (unsigned char*)Tcl_Alloc(codeLen ? codeLen : 1u);
+    env.codeStart = (unsigned char*)Tcl_AttemptAlloc(codeLen ? codeLen : 1u);
+    if (!env.codeStart)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (code buffer)", -1));
+        goto read_fail;
+    }
     if (codeLen)
         memcpy(env.codeStart, code, codeLen);
     env.codeNext = env.codeStart + codeLen;
@@ -1510,7 +1529,12 @@ static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
     env.numLitObjects = (Tcl_Size)numLits;
     if (numLits)
     {
-        env.objArrayPtr = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * numLits);
+        env.objArrayPtr = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * numLits);
+        if (!env.objArrayPtr)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (literal array)", -1));
+            goto read_fail;
+        }
         for (uint32_t i = 0; i < numLits; i++)
         {
             env.objArrayPtr[i] = lits[i];
@@ -1523,7 +1547,12 @@ static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
     env.numAuxDataItems = (Tcl_Size)numAux;
     if (numAux)
     {
-        env.auxDataArrayPtr = (AuxData*)Tcl_Alloc(sizeof(AuxData) * numAux);
+        env.auxDataArrayPtr = (AuxData*)Tcl_AttemptAlloc(sizeof(AuxData) * numAux);
+        if (!env.auxDataArrayPtr)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (aux data array)", -1));
+            goto read_fail;
+        }
         for (uint32_t i = 0; i < numAux; i++)
             env.auxDataArrayPtr[i] = auxArr[i];
     }
@@ -1532,7 +1561,12 @@ static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
     env.numExceptRanges = (Tcl_Size)numEx;
     if (numEx)
     {
-        env.exceptArrayPtr = (ExceptionRange*)Tcl_Alloc(sizeof(ExceptionRange) * numEx);
+        env.exceptArrayPtr = (ExceptionRange*)Tcl_AttemptAlloc(sizeof(ExceptionRange) * numEx);
+        if (!env.exceptArrayPtr)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (exception range array)", -1));
+            goto read_fail;
+        }
         for (uint32_t i = 0; i < numEx; i++)
             env.exceptArrayPtr[i] = exArr[i];
     }
@@ -1548,6 +1582,7 @@ static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
         bcObj = NULL;
     }
 
+read_fail:
     /* Drop the temporary holds on literals and free the temporary array.       */
     /* TbcxByteCode() has already incref'd the same objects into the ByteCode. */
     if (env.objArrayPtr)
@@ -1838,7 +1873,12 @@ static Tcl_Obj* ReadLit_Bignum(TbcxIn* r)
     }
     else
     {
-        unsigned char* le = (unsigned char*)Tcl_Alloc(magLen);
+        unsigned char* le = (unsigned char*)Tcl_AttemptAlloc(magLen);
+        if (!le)
+        {
+            R_Error(r, "tbcx: allocation failed (bignum)");
+            return NULL;
+        }
         if (!Tbcx_R_Bytes(r, le, magLen))
         {
             Tcl_Free((char*)le);
@@ -1853,13 +1893,23 @@ static Tcl_Obj* ReadLit_Bignum(TbcxIn* r)
             return NULL;
         }
 #if defined(MP_HAS_FROM_UBIN)
-        unsigned char* be = (unsigned char*)Tcl_Alloc(magLen);
+        unsigned char* be = (unsigned char*)Tcl_AttemptAlloc(magLen);
+        if (!be)
+        {
+            R_Error(r, "tbcx: allocation failed (bignum)");
+            return NULL;
+        }
         for (uint32_t i = 0; i < magLen; i++)
             be[i] = le[magLen - 1 - i];
         mrc = TclBN_mp_from_ubin(&z, be, magLen);
         Tcl_Free((char*)be);
 #elif defined(MP_HAS_READ_UNSIGNED_BIN)
-        unsigned char* be = (unsigned char*)Tcl_Alloc(magLen);
+        unsigned char* be = (unsigned char*)Tcl_AttemptAlloc(magLen);
+        if (!be)
+        {
+            R_Error(r, "tbcx: allocation failed (bignum)");
+            return NULL;
+        }
         for (uint32_t i = 0; i < magLen; i++)
             be[i] = le[magLen - 1 - i];
         mrc = TclBN_mp_read_unsigned_bin(&z, be, magLen);
@@ -2110,7 +2160,12 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                 R_Error(r, "tbcx: bytearray too large");
                 return NULL;
             }
-            unsigned char* buf = (unsigned char*)Tcl_Alloc(n ? n : 1u);
+            unsigned char* buf = (unsigned char*)Tcl_AttemptAlloc(n ? n : 1u);
+            if (!buf)
+            {
+                R_Error(r, "tbcx: allocation failed (bytearray literal)");
+                return NULL;
+            }
             if (n && !Tbcx_R_Bytes(r, buf, n))
             {
                 Tcl_Free((char*)buf);
@@ -2197,6 +2252,9 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                 }
                 if (Tcl_ListObjAppendElement(ip, lst, e) != TCL_OK)
                 {
+                    /* e has refCount 0 — free it before freeing lst. */
+                    Tcl_IncrRefCount(e);
+                    Tcl_DecrRefCount(e);
                     Tcl_IncrRefCount(lst);
                     Tcl_DecrRefCount(lst);
                     return NULL;
@@ -2317,7 +2375,14 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
     }
     AuxData* arr = NULL;
     if (n)
-        arr = (AuxData*)Tcl_Alloc(sizeof(AuxData) * n);
+    {
+        arr = (AuxData*)Tcl_AttemptAlloc(sizeof(AuxData) * n);
+        if (!arr)
+        {
+            R_Error(r, "tbcx: allocation failed (aux array)");
+            return TCL_ERROR;
+        }
+    }
 
     uint32_t i = 0; /* declared here so fail_aux can reference it */
     for (i = 0; i < n; i++)
@@ -2337,7 +2402,12 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                 R_Error(r, "tbcx: jump table too large");
                 goto fail_aux;
             }
-            JumptableInfo* info = (JumptableInfo*)Tcl_Alloc(sizeof(*info));
+            JumptableInfo* info = (JumptableInfo*)Tcl_AttemptAlloc(sizeof(*info));
+            if (!info)
+            {
+                R_Error(r, "tbcx: allocation failed (jumptable)");
+                return TCL_ERROR;
+            }
             Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
             for (uint32_t k = 0; k < cnt; k++)
             {
@@ -2376,7 +2446,12 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                 R_Error(r, "tbcx: numeric jump table too large");
                 goto fail_aux;
             }
-            JumptableNumInfo* info = (JumptableNumInfo*)Tcl_Alloc(sizeof(*info));
+            JumptableNumInfo* info = (JumptableNumInfo*)Tcl_AttemptAlloc(sizeof(*info));
+            if (!info)
+            {
+                R_Error(r, "tbcx: allocation failed (jumptable_num)");
+                return TCL_ERROR;
+            }
 #if UINTPTR_MAX < 0xFFFFFFFFFFFFFFFFull
             Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
 #else
@@ -2429,7 +2504,12 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                 goto fail_aux;
             }
             size_t bytes = offsetof(DictUpdateInfo, varIndices) + elemBytes;
-            DictUpdateInfo* info = (DictUpdateInfo*)Tcl_Alloc(bytes);
+            DictUpdateInfo* info = (DictUpdateInfo*)Tcl_AttemptAlloc(bytes);
+            if (!info)
+            {
+                R_Error(r, "tbcx: allocation failed (dictupdate)");
+                return TCL_ERROR;
+            }
             memset(info, 0, bytes);
             info->length = (Tcl_Size)L;
             for (uint32_t k = 0; k < L; k++)
@@ -2474,7 +2554,12 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                 goto fail_aux;
             }
             size_t bytes = offsetof(ForeachInfo, varLists) + listBytes;
-            ForeachInfo* info = (ForeachInfo*)Tcl_Alloc(bytes);
+            ForeachInfo* info = (ForeachInfo*)Tcl_AttemptAlloc(bytes);
+            if (!info)
+            {
+                R_Error(r, "tbcx: allocation failed (foreach)");
+                return TCL_ERROR;
+            }
             memset(info, 0, bytes);
             info->numLists = (Tcl_Size)numLists;
             info->firstValueTemp = (Tcl_LVTIndex)(int32_t)firstValU;
@@ -2507,7 +2592,12 @@ static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
                     goto fail_aux;
                 }
                 size_t vlBytes = offsetof(ForeachVarList, varIndexes) + varIdxBytes;
-                ForeachVarList* vl = (ForeachVarList*)Tcl_Alloc(vlBytes);
+                ForeachVarList* vl = (ForeachVarList*)Tcl_AttemptAlloc(vlBytes);
+                if (!vl)
+                {
+                    R_Error(r, "tbcx: allocation failed (foreach varlist)");
+                    return TCL_ERROR;
+                }
                 memset(vl, 0, vlBytes);
                 vl->numVars = (Tcl_Size)nv;
                 for (uint32_t j = 0; j < nv; j++)
@@ -2562,7 +2652,14 @@ static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut)
     }
     ExceptionRange* arr = NULL;
     if (n)
-        arr = (ExceptionRange*)Tcl_Alloc(sizeof(ExceptionRange) * n);
+    {
+        arr = (ExceptionRange*)Tcl_AttemptAlloc(sizeof(ExceptionRange) * n);
+        if (!arr)
+        {
+            R_Error(r, "tbcx: allocation failed (exception array)");
+            return TCL_ERROR;
+        }
+    }
     for (uint32_t i = 0; i < n; i++)
     {
         uint8_t type8 = 0;
@@ -2600,7 +2697,12 @@ Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* num
         R_Error(r, "tbcx: code too large");
         return NULL;
     }
-    unsigned char* code = (unsigned char*)Tcl_Alloc(codeLen ? codeLen : 1u);
+    unsigned char* code = (unsigned char*)Tcl_AttemptAlloc(codeLen ? codeLen : 1u);
+    if (!code)
+    {
+        R_Error(r, "tbcx: allocation failed (code)");
+        return NULL;
+    }
     if (codeLen && !Tbcx_R_Bytes(r, code, codeLen))
     {
         Tcl_Free((char*)code);
@@ -2632,7 +2734,12 @@ Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* num
         }
         else
         {
-            lits = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * numLits);
+            lits = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * numLits);
+            if (!lits)
+            {
+                R_Error(r, "tbcx: allocation failed (literals)");
+                return NULL;
+            }
             litsOnHeap = 1;
         }
     }
@@ -2746,7 +2853,12 @@ Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* num
         }
         else
         {
-            nameObjs = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * (size_t)numLocals);
+            nameObjs = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * (size_t)numLocals);
+            if (!nameObjs)
+            {
+                R_Error(r, "tbcx: allocation failed (local names)");
+                return NULL;
+            }
             nameOnHeap = 1;
         }
         for (uint32_t i = 0; i < numLocals; i++)
@@ -2804,7 +2916,12 @@ Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* num
         if (bcPtr)
         {
             size_t bytes = offsetof(LocalCache, varName0) + (size_t)numLocals * sizeof(Tcl_Obj*);
-            LocalCache* lc = (LocalCache*)Tcl_Alloc(bytes);
+            LocalCache* lc = (LocalCache*)Tcl_AttemptAlloc(bytes);
+            if (!lc)
+            {
+                R_Error(r, "tbcx: allocation failed (local cache)");
+                return NULL;
+            }
             lc->refCount = 1;
             lc->numVars = (Tcl_Size)numLocals;
             Tcl_Obj** dst = (Tcl_Obj**)&lc->varName0;
@@ -3028,6 +3145,8 @@ static int CmdProcShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const o
         if (savedArgs && procBody)
         {
             Tcl_Size _d = 0;
+            /* Force list-shimmering for canonical string rep before
+               byte-wise comparison; failure is harmless. */
             (void)Tcl_ListObjLength(ip, argsObj, &_d);
             (void)Tcl_ListObjLength(ip, savedArgs, &_d);
             Tcl_Size aLen = 0, bLen = 0;
@@ -3183,8 +3302,14 @@ static int AddProcShim(Tcl_Interp* ip, ProcShim* ps)
     ps->savedClientData2 = ps->procCmdPtr->objClientData2;
 
     /* Install a command trace so we know if "proc" is renamed or deleted
-       while the loaded script is executing. */
-    Tcl_TraceCommand(ip, "proc", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps);
+       while the loaded script is executing.
+       Defensive: FindCommand above guarantees "proc" exists, so this
+       cannot fail in single-threaded use, but check anyway. */
+    if (Tcl_TraceCommand(ip, "proc", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps) != TCL_OK)
+    {
+        Tcl_DeleteHashTable(&ps->procsByFqn);
+        return TCL_ERROR;
+    }
     ps->traceInstalled = 1;
 
     /* Intercept BOTH objProc2 AND nreProc2.
@@ -3426,6 +3551,10 @@ static void ApplyShimPurgeStale(ApplyShim* as)
     for (e = Tcl_FirstHashEntry(&as->lambdaRegistry, &s); e; e = Tcl_NextHashEntry(&s))
     {
         Tcl_Obj* lambda = (Tcl_Obj*)Tcl_GetHashKey(&as->lambdaRegistry, e);
+        /* Direct refCount access: depends on Tcl internal struct layout.
+         * Safe because the interpreter is single-threaded and we intentionally
+         * use Tcl internal headers.  refCount <= 1 means only our registry
+         * holds a reference — the lambda is no longer live in user code. */
         if (lambda && lambda->refCount <= 1)
         {
             /* Only our registry holds a reference — this lambda is stale */
@@ -3518,8 +3647,15 @@ static ApplyShim* EnsureApplyShim(Tcl_Interp* ip)
 
     /* Install a command trace so we know if "apply" is renamed or deleted
        before cleanup runs.  Without this, ApplyShimCleanup would write
-       through a stale Command* — a crash-class UAF bug. */
-    Tcl_TraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as);
+       through a stale Command* — a crash-class UAF bug.
+       Defensive: FindCommand above guarantees "apply" exists, so this
+       cannot fail in single-threaded use, but check anyway. */
+    if (Tcl_TraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as) != TCL_OK)
+    {
+        Tcl_DeleteHashTable(&as->lambdaRegistry);
+        Tcl_Free((char*)as);
+        return NULL;
+    }
     as->traceInstalled = 1;
 
     /* Intercept BOTH objProc2 AND nreProc2, matching the ProcShim pattern.
@@ -3918,7 +4054,12 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
         if (AddProcShim(ip, &shim) != TCL_OK)
             goto cleanup;
         shimInited = 1;
-        shim.procsByIdx = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * numProcs);
+        shim.procsByIdx = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * numProcs);
+        if (!shim.procsByIdx)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (proc index)", -1));
+            goto cleanup;
+        }
         memset(shim.procsByIdx, 0, sizeof(Tcl_Obj*) * numProcs);
         shim.numProcsIdx = numProcs;
     }
