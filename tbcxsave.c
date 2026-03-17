@@ -1496,7 +1496,24 @@ int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut
             return TCL_ERROR;
         }
         const char* nm = Tcl_GetStringFromObj(fv[0], &nmLen);
-        size_t allocSize = offsetof(CompiledLocal, name) + 1u + (size_t)nmLen;
+        /* Guard Tcl_Size → int overflow (CompiledLocal::nameLength is int) */
+        if (nmLen < 0 || nmLen > INT_MAX)
+        {
+            Tbcx_FreeLocals(first);
+            if (ip)
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument name too long", -1));
+            return TCL_ERROR;
+        }
+        /* Checked allocation size: offsetof(CompiledLocal, name) + 1 + nmLen */
+        size_t baseSize = offsetof(CompiledLocal, name) + 1u;
+        size_t allocSize = baseSize + (size_t)nmLen;
+        if (allocSize < baseSize) /* overflow wrap */
+        {
+            Tbcx_FreeLocals(first);
+            if (ip)
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument name alloc overflow", -1));
+            return TCL_ERROR;
+        }
         if (allocSize < sizeof(CompiledLocal))
             allocSize = sizeof(CompiledLocal);
         CompiledLocal* cl = (CompiledLocal*)Tcl_Alloc(allocSize);
@@ -2657,7 +2674,20 @@ static void DV_Push(DefVec* dv, DefRec r)
          * definition will be lost but the process survives.  In practice
          * this limit is unreachable for legitimate scripts. */
         if (newCap < dv->cap || newCap > (SIZE_MAX / sizeof(DefRec)))
+        {
+            /* Release the caller's incref'd fields to avoid leaks */
+            if (r.name)
+                Tcl_DecrRefCount(r.name);
+            if (r.ns)
+                Tcl_DecrRefCount(r.ns);
+            if (r.args)
+                Tcl_DecrRefCount(r.args);
+            if (r.body)
+                Tcl_DecrRefCount(r.body);
+            if (r.cls)
+                Tcl_DecrRefCount(r.cls);
             return;
+        }
         dv->cap = newCap;
         dv->v = (DefRec*)Tcl_Realloc(dv->v, dv->cap * sizeof(DefRec));
     }
