@@ -2,5 +2,4 @@
 # Tcl package index file, version 1.1
 #
 package ifneeded @PACKAGE_NAME@ @PACKAGE_VERSION@ \
-    [list load [file join $dir @PKG_LIB_FILE@] @PACKAGE_NAME@]
-package provide @PACKAGE_NAME@ @PACKAGE_VERSION@
+    "[list load [file join $dir @PKG_LIB_FILE@] @PACKAGE_NAME@]\npackage provide @PACKAGE_NAME@ @PACKAGE_VERSION@"
