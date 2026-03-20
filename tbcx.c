@@ -112,7 +112,7 @@ static int TbcxComputeEndian(Tcl_Interp* interp)
         Tcl_Obj* val = Tcl_GetVar2Ex(interp, "tcl_platform", "byteOrder", TCL_GLOBAL_ONLY);
         if (val)
         {
-            const char* s = Tcl_GetString(val);
+            const char* s = Tbcx_GetStringSafe(val);
             if (s && s[0])
             {
                 isLE = (s[0] == 'l' || s[0] == 'L') ? 1 : (s[0] == 'b' || s[0] == 'B') ? 0 : -1;

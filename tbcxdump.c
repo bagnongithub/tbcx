@@ -69,12 +69,22 @@ static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, int maxChars)
     if (ty == tbcxTyByteArray)
     {
         Tcl_Size n = 0;
-        (void)Tcl_GetByteArrayFromObj(lit, &n);
+        unsigned char* bp = Tbcx_GetByteArrayFromObjSafe(lit, &n);
+        if (!bp)
+        {
+            Tcl_AppendToObj(dst, "(bytes:?)", -1);
+            return;
+        }
         Tcl_AppendPrintfToObj(dst, "(bytes:%ld)", (long)n);
         return;
     }
     Tcl_Size sLen = 0;
-    const char* s = Tcl_GetStringFromObj(lit, &sLen);
+    const char* s = Tbcx_GetStringFromObjSafe(lit, &sLen);
+    if (!s)
+    {
+        Tcl_AppendToObj(dst, "(null)", -1);
+        return;
+    }
     if (sLen <= maxChars)
     {
         Tcl_AppendToObj(dst, "\"", 1);
@@ -102,7 +112,7 @@ static const char* LocalName(ByteCode* bc, int idx, Tcl_Size* outLen)
     {
         Tcl_Obj** names = (Tcl_Obj**)&bc->localCachePtr->varName0;
         if (names[idx])
-            return Tcl_GetStringFromObj(names[idx], outLen);
+            return Tbcx_GetStringFromObjSafe(names[idx], outLen);
     }
     /* Fallback: walk Proc compiled locals */
     if (bc->procPtr)
@@ -331,7 +341,7 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
         {
             /* True bignum — doesn't fit in 64 bits */
             Tcl_Size n = 0;
-            const char* s = Tcl_GetStringFromObj(lit, &n);
+            const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
             Tcl_AppendToObj(dst, "(bignum) ", -1);
             AppendEscaped(dst, s, n);
         }
@@ -347,7 +357,7 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
     else if (ty == tbcxTyByteArray)
     {
         Tcl_Size n = 0;
-        unsigned char* p = Tcl_GetByteArrayFromObj(lit, &n);
+        unsigned char* p = Tbcx_GetByteArrayFromObjSafe(lit, &n);
         Tcl_AppendPrintfToObj(dst, "(bytearray) %ld bytes", (long)n);
         if (n)
             Tcl_AppendToObj(dst, " (hex:", -1);
@@ -362,7 +372,7 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
     else if (ty == tbcxTyDict)
     {
         Tcl_Size n = 0;
-        const char* s = Tcl_GetStringFromObj(lit, &n);
+        const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
         Tcl_AppendToObj(dst, "(dict) ", -1);
         AppendEscaped(dst, s, n);
         return TCL_OK;
@@ -388,7 +398,7 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
     else
     {
         Tcl_Size n = 0;
-        const char* s = Tcl_GetStringFromObj(lit, &n);
+        const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
         Tcl_AppendToObj(dst, "(string) \"", -1);
         AppendEscaped(dst, s, n);
         Tcl_AppendToObj(dst, "\"", 1);
@@ -566,7 +576,7 @@ static void DumpLocals(ByteCode* bc, Tcl_Obj* dst)
         for (Tcl_Size i = 0; i < n; i++)
         {
             Tcl_Size ln = 0;
-            const char* s = namev[i] ? Tcl_GetStringFromObj(namev[i], &ln) : "";
+            const char* s = namev[i] ? Tbcx_GetStringFromObjSafe(namev[i], &ln) : "";
             Tcl_AppendPrintfToObj(dst, "    [%" TCL_Z_MODIFIER "d] \"", i);
             AppendEscaped(dst, s, ln);
             Tcl_AppendToObj(dst, "\"\n", 2);
@@ -696,7 +706,7 @@ static int DumpProcsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
-        Namespace* nsPtr = (Namespace*)Tcl_FindNamespace(interp, Tcl_GetString(nsObj), NULL, 0);
+        Namespace* nsPtr = (Namespace*)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(nsObj), NULL, 0);
         if (!nsPtr)
             nsPtr = (Namespace*)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc = 0;
@@ -710,7 +720,7 @@ static int DumpProcsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
         }
         Tcl_IncrRefCount(bodyBC);
 
-        DisassembleBCObj(bodyBC, out, Tcl_GetString(nameFqn));
+        DisassembleBCObj(bodyBC, out, Tbcx_GetStringSafe(nameFqn));
         DumpBCDetails(bodyBC, out);
 
         Tcl_DecrRefCount(bodyBC);
@@ -825,7 +835,7 @@ static int DumpMethodsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
-        Namespace* clsNs = (Namespace*)Tcl_FindNamespace(interp, Tcl_GetString(clsFqn), NULL, 0);
+        Namespace* clsNs = (Namespace*)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(clsFqn), NULL, 0);
         if (!clsNs)
             clsNs = (Namespace*)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc = 0;
@@ -839,7 +849,7 @@ static int DumpMethodsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
         }
 
         Tcl_IncrRefCount(bodyBC);
-        DisassembleBCObj(bodyBC, out, Tcl_GetString(nameObj));
+        DisassembleBCObj(bodyBC, out, Tbcx_GetStringSafe(nameObj));
         DumpBCDetails(bodyBC, out);
 
         Tcl_DecrRefCount(bodyBC);

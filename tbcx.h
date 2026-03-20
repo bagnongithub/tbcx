@@ -93,6 +93,60 @@ uint32_t Tbcx_PackTclVersion(void);
 
 #define TBCX_BUFSIZE (64u * 1024u)
 
+/* Hardened Tcl object accessors.
+ *
+ * The project review spec treats Tcl string/bytearray accessors as fallible.
+ * These helpers guarantee a non-NULL pointer and zero length on failure so
+ * callers can safely treat the value as an empty string/byte-array in
+ * non-fatal scanning/rewrite paths.
+ */
+static inline const char* Tbcx_GetStringFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
+{
+    const char* s;
+
+    if (lenPtr)
+        *lenPtr = 0;
+    if (!objPtr)
+        return "";
+    s = Tcl_GetStringFromObj(objPtr, lenPtr);
+    if (!s)
+    {
+        if (lenPtr)
+            *lenPtr = 0;
+        return "";
+    }
+    return s;
+}
+
+static inline const char* Tbcx_GetStringSafe(Tcl_Obj* objPtr)
+{
+    const char* s;
+
+    if (!objPtr)
+        return "";
+    s = Tcl_GetString(objPtr);
+    return s ? s : "";
+}
+
+static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
+{
+    static unsigned char emptyByte = 0;
+    unsigned char* p;
+
+    if (lenPtr)
+        *lenPtr = 0;
+    if (!objPtr)
+        return &emptyByte;
+    p = Tcl_GetByteArrayFromObj(objPtr, lenPtr);
+    if (!p)
+    {
+        if (lenPtr)
+            *lenPtr = 0;
+        return &emptyByte;
+    }
+    return p;
+}
+
 /* Maximum length of generated shim command names (oo::define rename targets).
  * Must accommodate "::tbcx::__oo_objdef_orig_NNNN__" with generous room. */
 #define TBCX_OSHIM_NAME_MAX 80
