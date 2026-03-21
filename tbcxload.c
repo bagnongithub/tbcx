@@ -151,7 +151,7 @@ static void DelProcShim(Tcl_Interp* ip, ProcShim* ps);
 static ApplyShim* EnsureApplyShim(Tcl_Interp* ip);
 static void FixCompiledLocalNames(Proc* procPtr, LocalCache* lc);
 static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch);
-static void MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* name);
+static int MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* name);
 static void OOShim_IdentifyMethod(const char* subc,
                                   Tcl_Size objc,
                                   Tcl_Obj* const objv[],
@@ -407,27 +407,36 @@ static void TbcxFixLocalCacheExtras(ByteCode* bcPtr, Proc* procPtr)
 /* MethodKeyBuf — Build a hash key string "classFqn\x1Fkind\x1Fname" into a
  * caller-provided Tcl_DString.  This avoids allocating a Tcl_Obj + refcount
  * management for what is purely a transient lookup key.  Caller must call
- * Tcl_DStringFree(ds) when done. */
-static void MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* name)
+ * Tcl_DStringFree(ds) when done.
+ * Returns 1 on success, 0 if a required string object is invalid. */
+static int MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* name)
 {
     Tcl_DStringInit(ds);
     Tcl_Size fqnLen = 0;
-    const char* fqn = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
+    const char* fqn = Tbcx_GetStringFromObjStrict(NULL, clsFqn, &fqnLen);
+    if (!fqn)
+        return 0;
     Tcl_DStringAppend(ds, fqn, fqnLen);
     Tcl_DStringAppend(ds, "\x1F", 1);
     {
-        Tcl_Obj* kindObj = Tcl_ObjPrintf("%u", (unsigned)kind);
-        Tcl_IncrRefCount(kindObj);
-        Tcl_DStringAppend(ds, Tbcx_GetStringSafe(kindObj), -1);
-        Tcl_DecrRefCount(kindObj);
+        /* Format kind as decimal on the stack — avoids Tcl_Obj allocation churn. */
+        char kindBuf[4]; /* uint8_t max "255" + NUL */
+        snprintf(kindBuf, sizeof(kindBuf), "%u", (unsigned)kind);
+        Tcl_DStringAppend(ds, kindBuf, -1);
     }
     Tcl_DStringAppend(ds, "\x1F", 1);
     if (name)
     {
         Tcl_Size nLen = 0;
-        const char* n = Tbcx_GetStringFromObjSafe(name, &nLen);
+        const char* n = Tbcx_GetStringFromObjStrict(NULL, name, &nLen);
+        if (!n)
+        {
+            Tcl_DStringFree(ds);
+            return 0;
+        }
         Tcl_DStringAppend(ds, n, nLen);
     }
+    return 1;
 }
 
 static int DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* nameOpt, Tcl_Obj* argsOpt, Tcl_Obj* bodyOpt)
@@ -725,8 +734,8 @@ static void OOShim_IdentifyMethod(const char* subc,
             Tcl_Size nameIdx = objc - 3, argsIdx = objc - 2;
             *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
-            MethodKeyBuf(keyDs, clsFqn, *kindOut, objv[nameIdx]);
-            *hasKeyOut = 1;
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, objv[nameIdx]))
+                *hasKeyOut = 1;
             *nameOOut = objv[nameIdx];
         }
     }
@@ -738,8 +747,8 @@ static void OOShim_IdentifyMethod(const char* subc,
             Tcl_Size argsIdx = objc - 2;
             *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
-            MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL);
-            *hasKeyOut = 1;
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+                *hasKeyOut = 1;
         }
     }
     else if (strcmp(subc, "destructor") == 0)
@@ -750,8 +759,8 @@ static void OOShim_IdentifyMethod(const char* subc,
             Tcl_Size argsIdx = objc - 2;
             *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
-            MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL);
-            *hasKeyOut = 1;
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+                *hasKeyOut = 1;
         }
         else if (objc == 4)
         {
@@ -759,8 +768,8 @@ static void OOShim_IdentifyMethod(const char* subc,
             *runtimeArgsOut = Tcl_NewStringObj("", 0);
             Tcl_IncrRefCount(*runtimeArgsOut);
             *tmpEmptyArgsOut = *runtimeArgsOut;
-            MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL);
-            *hasKeyOut = 1;
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+                *hasKeyOut = 1;
         }
     }
 }
@@ -1164,22 +1173,22 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
             kind = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
             bodyIdx = objc - 1;
             nameO = objv[objc - 3];
-            MethodKeyBuf(&keyDs, objFqn, kind, nameO);
-            hasKey = 1;
+            if (MethodKeyBuf(&keyDs, objFqn, kind, nameO))
+                hasKey = 1;
         }
         else if (strcmp(subc, "constructor") == 0 && objc >= 5)
         {
             kind = TBCX_METH_CTOR;
             bodyIdx = objc - 1;
-            MethodKeyBuf(&keyDs, objFqn, kind, NULL);
-            hasKey = 1;
+            if (MethodKeyBuf(&keyDs, objFqn, kind, NULL))
+                hasKey = 1;
         }
         else if (strcmp(subc, "destructor") == 0 && objc >= 4)
         {
             kind = TBCX_METH_DTOR;
             bodyIdx = objc - 1;
-            MethodKeyBuf(&keyDs, objFqn, kind, NULL);
-            hasKey = 1;
+            if (MethodKeyBuf(&keyDs, objFqn, kind, NULL))
+                hasKey = 1;
         }
 
         if (hasKey && bodyIdx >= 0)
@@ -1408,6 +1417,25 @@ static ByteCode* TbcxByteCode(Tcl_Obj* objPtr, const Tcl_ObjType* typePtr, const
                                  Tcl_ObjPrintf("tbcx: exception range %td catchOffset (%u) exceeds code size (%lu)",
                                                vi,
                                                (unsigned)er->catchOffset,
+                                               (unsigned long)codeBytes));
+                return NULL;
+            }
+            /* Validate continue/break handler offsets (same pattern as catchOffset). */
+            if (er->continueOffset >= 0 && (size_t)er->continueOffset >= codeBytes)
+            {
+                Tcl_SetObjResult(env->interp,
+                                 Tcl_ObjPrintf("tbcx: exception range %td continueOffset (%u) exceeds code size (%lu)",
+                                               vi,
+                                               (unsigned)er->continueOffset,
+                                               (unsigned long)codeBytes));
+                return NULL;
+            }
+            if (er->breakOffset >= 0 && (size_t)er->breakOffset >= codeBytes)
+            {
+                Tcl_SetObjResult(env->interp,
+                                 Tcl_ObjPrintf("tbcx: exception range %td breakOffset (%u) exceeds code size (%lu)",
+                                               vi,
+                                               (unsigned)er->breakOffset,
                                                (unsigned long)codeBytes));
                 return NULL;
             }
@@ -1889,7 +1917,15 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     procPtr->refCount++;
 
     Tcl_DString keyDs;
-    MethodKeyBuf(&keyDs, clsFqn, kind, (mnL ? nameObj : NULL));
+    if (!MethodKeyBuf(&keyDs, clsFqn, kind, (mnL ? nameObj : NULL)))
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
+        Tcl_DecrRefCount(procBodyObj);
+        Tcl_DecrRefCount(nameObj);
+        Tcl_DecrRefCount(clsFqn);
+        Tcl_DecrRefCount(argsObj);
+        return TCL_ERROR;
+    }
     int isNew = 0;
     Tcl_HashEntry* he = Tcl_CreateHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs), &isNew);
     Tcl_DStringFree(&keyDs);
@@ -2073,6 +2109,9 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
                 Tcl_DecrRefCount(argList);
                 return NULL;
             }
+            /* Own a reference so all error paths can release safely.
+             * ReadLiteral returns refcount-0; incref → 1 (owned by this scope). */
+            Tcl_IncrRefCount(defVal);
             Tcl_Obj* argPair = Tcl_NewListObj(0, NULL);
             Tcl_IncrRefCount(argPair);
             if (Tcl_ListObjAppendElement(ip, argPair, argNameObj) != TCL_OK ||
@@ -2080,12 +2119,14 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
                 Tcl_ListObjAppendElement(ip, argList, argPair) != TCL_OK)
             {
                 Tcl_DecrRefCount(argPair);
+                Tcl_DecrRefCount(defVal);
                 Tcl_DecrRefCount(argNameObj);
                 Tcl_DecrRefCount(nsObj);
                 Tcl_DecrRefCount(argList);
                 return NULL;
             }
             Tcl_DecrRefCount(argPair);
+            Tcl_DecrRefCount(defVal); /* list now owns its reference */
             Tcl_DecrRefCount(argNameObj);
         }
         else
@@ -2777,12 +2818,14 @@ static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut)
             return 0;
         }
         arr[i].type = (ExceptionRangeType)type8;
-        arr[i].nestingLevel = (int)nesting;
-        arr[i].codeOffset = (int)from;
-        arr[i].numCodeBytes = (int)len;
-        arr[i].continueOffset = (int)cont;
-        arr[i].breakOffset = (int)brk;
-        arr[i].catchOffset = (int)cat;
+        /* Store in Tcl_Size domain (matches Tcl 9.1 headers).
+         * Preserve -1 sentinel encoded as 0xFFFFFFFF on the wire. */
+        arr[i].nestingLevel   = (Tcl_Size)nesting;
+        arr[i].codeOffset     = (Tcl_Size)from;
+        arr[i].numCodeBytes   = (Tcl_Size)len;
+        arr[i].continueOffset = (cont == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cont;
+        arr[i].breakOffset    = (brk  == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)brk;
+        arr[i].catchOffset    = (cat  == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cat;
     }
     *exOut = arr;
     *numOut = n;
@@ -3724,14 +3767,23 @@ static void ApplyShimPurgeStale(ApplyShim* as)
                 staleCap = newCap;
                 if (!onHeap)
                 {
-                    Tcl_Obj** tmp = (Tcl_Obj**)Tcl_Alloc(sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    Tcl_Obj** tmp = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    if (!tmp) {
+                        /* OOM: stop collecting; purge what we have */
+                        break;
+                    }
                     memcpy(tmp, stale, sizeof(Tcl_Obj*) * (size_t)nStale);
                     stale = tmp;
                     onHeap = 1;
                 }
                 else
                 {
-                    stale = (Tcl_Obj**)Tcl_Realloc(stale, sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    Tcl_Obj** tmp = (Tcl_Obj**)Tcl_AttemptRealloc(stale, sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    if (!tmp) {
+                        /* OOM: stop collecting; purge what we have */
+                        break;
+                    }
+                    stale = tmp;
                 }
             }
             stale[nStale++] = lambda;

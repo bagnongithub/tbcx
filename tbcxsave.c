@@ -1149,12 +1149,13 @@ static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top)
  * registered for stripping via the stripBodies mechanism.
  * ========================================================================== */
 
+/* NsFqn — Returns a Tcl_Obj* at refcount 1 (caller owns the reference and
+ * must Tcl_DecrRefCount when done). */
 static Tcl_Obj* NsFqn(Tcl_Namespace* nsPtr)
 {
-    if (!nsPtr)
-        return Tcl_NewStringObj("::", -1);
-    Tcl_Obj* o = Tcl_NewStringObj(nsPtr->fullName, -1);
-    return o;
+    Tcl_Obj* o = Tcl_NewStringObj(nsPtr ? nsPtr->fullName : "::", -1);
+    Tcl_IncrRefCount(o);
+    return o; /* refcount 1 */
 }
 
 static void Lit_Bignum(TbcxOut* w, Tcl_Obj* o)
@@ -1276,7 +1277,18 @@ static void Lit_Dict(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* o)
         W_Error(w, "tbcx: dict decode");
         return;
     }
-    KVPair* pairs = (KVPair*)Tcl_Alloc(sizeof(KVPair) * (size_t)(sz ? sz : 1));
+    size_t nPairs = (size_t)(sz ? sz : 1);
+    if (sz < 0 || nPairs > SIZE_MAX / sizeof(KVPair))
+    {
+        W_Error(w, "tbcx: dict too large");
+        return;
+    }
+    KVPair* pairs = (KVPair*)Tcl_AttemptAlloc(sizeof(KVPair) * nPairs);
+    if (!pairs)
+    {
+        W_Error(w, "tbcx: allocation failed (dict)");
+        return;
+    }
     Tcl_Size idx = 0;
     if (Tcl_DictObjFirst(NULL, o, &s, &k, &v, &done) != TCL_OK)
     {
@@ -1338,13 +1350,13 @@ static void Lit_LambdaBC(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* lambda)
             nsPtr = Tcl_CreateNamespace(ctx->interp, nsName, NULL, NULL);
         }
         nsFQN = Tcl_NewStringObj(nsName, -1);
+        Tcl_IncrRefCount(nsFQN);
     }
     else
     {
         nsPtr = Tcl_GetCurrentNamespace(ctx->interp);
         nsFQN = NsFqn(nsPtr);
     }
-    Tcl_IncrRefCount(nsFQN);
     int compiled_ok = 0;
     Tcl_Size nsLen = 0;
     const char* nsStr = Tbcx_GetStringFromObjSafe(nsFQN, &nsLen);
@@ -1474,7 +1486,6 @@ static void Lit_Bytecode(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
     ByteCode* codePtr = NULL;
     ByteCodeGetInternalRep(bcObj, tbcxTyBytecode, codePtr);
     Tcl_Obj* nsFQN = NsFqn((Tcl_Namespace*)(codePtr ? codePtr->nsPtr : NULL));
-    Tcl_IncrRefCount(nsFQN);
     Tcl_Size nsLen;
     const char* nsStr = Tbcx_GetStringFromObjSafe(nsFQN, &nsLen);
     W_LPString(w, nsStr, nsLen);

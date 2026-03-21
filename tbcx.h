@@ -11,6 +11,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #ifndef USE_TCL_STUBS
@@ -143,6 +144,64 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_S
         if (lenPtr)
             *lenPtr = 0;
         return &emptyByte;
+    }
+    return p;
+}
+
+/* Strict Tcl object accessors for identifier-critical contexts.
+ *
+ * Unlike the *Safe helpers above (which return "" on failure for scanning
+ * paths), these return NULL and set an interpreter error result.  Use them
+ * wherever an empty-string substitution would silently corrupt identifiers
+ * (namespace FQNs, proc/method/class names, shim-name construction, wire-
+ * format keys).  Callers must check the return value and propagate error. */
+static inline const char* Tbcx_GetStringFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
+{
+    const char* s;
+    if (!o)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
+        return NULL;
+    }
+    s = Tcl_GetStringFromObj(o, len);
+    if (!s)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
+        return NULL;
+    }
+    return s;
+}
+
+static inline const char* Tbcx_GetStringStrict(Tcl_Interp* ip, Tcl_Obj* o)
+{
+    const char* s;
+    if (!o)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
+        return NULL;
+    }
+    s = Tcl_GetString(o);
+    if (!s)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
+        return NULL;
+    }
+    return s;
+}
+
+static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
+{
+    unsigned char* p;
+    if (!o)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object (NULL Tcl_Obj)", -1));
+        return NULL;
+    }
+    p = Tcl_GetByteArrayFromObj(o, len);
+    if (!p)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object", -1));
+        return NULL;
     }
     return p;
 }
