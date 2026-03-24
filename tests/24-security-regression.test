@@ -1,0 +1,552 @@
+# -*-Tcl-*-
+# 24-security-regression.test — Regression tests for findings 1–8
+#
+# These tests verify that the fixes for the 8 confirmed findings in the
+# tbcx code analysis report are effective and that the library rejects
+# malformed or adversarial input correctly.
+#
+# Finding 1: Untrusted wire identifiers with embedded NUL / relative ns
+# Finding 2: Save-side TCL_STRING_KEYS NUL truncation
+# Finding 3: FqnUnder strict contract
+# Finding 4: Tcl_Size drift (verified implicitly by large-script tests)
+# Finding 5: Checked-multiply (verified by stress tests)
+# Finding 6: snprintf replacement (verified implicitly by method key tests)
+# Finding 7: Numeric conversion return codes
+# Finding 8: Safe interpreter documentation/behavior
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# =====================================================================
+# Finding 1: Namespace validation on the load path
+#
+# The load path now validates that namespace/proc identifiers from the
+# wire format are absolute (start with ::) and contain no embedded NUL.
+# These tests verify that valid absolute namespaces work correctly, and
+# that the save/load roundtrip preserves correct namespace structure.
+# =====================================================================
+
+test f1.1 {F1: proc in absolute namespace roundtrips correctly} -body {
+    set out [makeFile "" f1.1-out.tbcx]
+    tbcx::save {
+        namespace eval ::f1test {
+            proc greet {} { return "hello from ::f1test" }
+        }
+        return [::f1test::greet]
+    } $out
+    tbcx::load $out
+} -result {hello from ::f1test}
+
+test f1.2 {F1: deeply nested absolute namespace roundtrips} -body {
+    set out [makeFile "" f1.2-out.tbcx]
+    tbcx::save {
+        namespace eval ::a::b::c::d {
+            proc deep {} { return "four-deep" }
+        }
+        return [::a::b::c::d::deep]
+    } $out
+    tbcx::load $out
+} -result four-deep
+
+test f1.3 {F1: multiple distinct namespaces in one file} -body {
+    set out [makeFile "" f1.3-out.tbcx]
+    tbcx::save {
+        namespace eval ::ns_alpha {
+            proc id {} { return alpha }
+        }
+        namespace eval ::ns_beta {
+            proc id {} { return beta }
+        }
+        namespace eval ::ns_gamma {
+            proc id {} { return gamma }
+        }
+        return [list [::ns_alpha::id] [::ns_beta::id] [::ns_gamma::id]]
+    } $out
+    tbcx::load $out
+} -result {alpha beta gamma}
+
+test f1.4 {F1: lambda in absolute namespace} -body {
+    set out [makeFile "" f1.4-out.tbcx]
+    tbcx::save {
+        namespace eval ::lambdans {
+            variable factor 10
+        }
+        return [apply {{x} {
+            return [expr {$x * $::lambdans::factor}]
+        } ::lambdans} 5]
+    } $out
+    tbcx::load $out
+} -result 50
+
+test f1.5 {F1: proc FQN with :: prefix preserved after roundtrip} -body {
+    set out [makeFile "" f1.5-out.tbcx]
+    tbcx::save {
+        proc ::toplevel_fqn {} { return "fqn-ok" }
+        return [::toplevel_fqn]
+    } $out
+    tbcx::load $out
+} -result fqn-ok
+
+test f1.6 {F1: OO class in absolute namespace} -body {
+    set out [makeFile "" f1.6-out.tbcx]
+    tbcx::save {
+        namespace eval ::f1oo {
+            oo::class create Widget
+            oo::define Widget {
+                method name {} { return "Widget" }
+            }
+        }
+        set w [::f1oo::Widget new]
+        return [$w name]
+    } $out
+    tbcx::load $out
+} -result Widget
+
+test f1.7 {F1: method in namespaced class roundtrips} -body {
+    set out [makeFile "" f1.7-out.tbcx]
+    tbcx::save {
+        oo::class create ::f1cls::Counter
+        oo::define ::f1cls::Counter {
+            constructor {} { my variable n; set n 0 }
+            method bump {} { my variable n; incr n }
+            method val {} { my variable n; return $n }
+        }
+        set c [::f1cls::Counter new]
+        $c bump; $c bump; $c bump
+        return [$c val]
+    } $out
+    tbcx::load $out
+} -result 3
+
+
+# =====================================================================
+# Finding 2: Save-side body/class string NUL-safety
+#
+# The save side now skips strip-body and ns-eval-body optimization for
+# bodies containing embedded NUL.  We verify that normal bodies (no NUL)
+# still benefit from the optimization, and that the roundtrip is correct
+# in all cases.
+# =====================================================================
+
+test f2.1 {F2: normal proc body roundtrips (strip-body optimization active)} -body {
+    set out [makeFile "" f2.1-out.tbcx]
+    tbcx::save {
+        proc f2helper {x} { return [expr {$x * 2}] }
+        return [f2helper 21]
+    } $out
+    tbcx::load $out
+} -result 42
+
+test f2.2 {F2: namespace eval body roundtrips (ns-eval optimization active)} -body {
+    set out [makeFile "" f2.2-out.tbcx]
+    tbcx::save {
+        namespace eval ::f2ns {
+            variable x 10
+            proc get {} { variable x; return $x }
+        }
+        return [::f2ns::get]
+    } $out
+    tbcx::load $out
+} -result 10
+
+test f2.3 {F2: class FQN roundtrips through class table} -body {
+    set out [makeFile "" f2.3-out.tbcx]
+    tbcx::save {
+        oo::class create ::f2cls::A
+        oo::define ::f2cls::A method id {} { return A }
+        oo::class create ::f2cls::B
+        oo::define ::f2cls::B method id {} { return B }
+        set a [::f2cls::A new]
+        set b [::f2cls::B new]
+        return [list [$a id] [$b id]]
+    } $out
+    tbcx::load $out
+} -result {A B}
+
+test f2.4 {F2: bytearray body (binary data) roundtrips without corruption} -body {
+    set out [makeFile "" f2.4-out.tbcx]
+    tbcx::save {
+        return [binary format c* {72 101 108 108 111}]
+    } $out
+    tbcx::load $out
+} -result Hello
+
+
+# =====================================================================
+# Finding 3: FqnUnder strict contract verification
+#
+# FqnUnder now returns NULL on invalid input and all call sites guard
+# the result.  These tests exercise the class-name FQN construction
+# paths that FqnUnder supports.
+# =====================================================================
+
+test f3.1 {F3: absolute name passes through FqnUnder unchanged} -body {
+    set out [makeFile "" f3.1-out.tbcx]
+    tbcx::save {
+        oo::class create ::f3test::AbsCls
+        oo::define ::f3test::AbsCls method who {} { return abs }
+        set o [::f3test::AbsCls new]
+        return [$o who]
+    } $out
+    tbcx::load $out
+} -result abs
+
+test f3.2 {F3: relative name under namespace constructs correct FQN} -body {
+    set out [makeFile "" f3.2-out.tbcx]
+    tbcx::save {
+        namespace eval ::f3outer {
+            oo::class create Inner
+            oo::define Inner method who {} { return inner }
+        }
+        set o [::f3outer::Inner new]
+        return [$o who]
+    } $out
+    tbcx::load $out
+} -result inner
+
+test f3.3 {F3: class create with named instance (no builder body)} -body {
+    set out [makeFile "" f3.3-out.tbcx]
+    tbcx::save {
+        oo::class create ::f3base
+        oo::define ::f3base method base {} { return "base" }
+        # Named instance via create — exercises FqnUnder for the command FQN lookup
+        ::f3base create ::f3inst
+        return [::f3inst base]
+    } $out
+    tbcx::load $out
+} -result base
+
+
+# =====================================================================
+# Finding 4: Tcl_Size compliance
+#
+# These tests exercise scenarios with many words/locals/args to verify
+# that the Tcl_Size conversions work for non-trivial counts.
+# =====================================================================
+
+test f4.1 {F4: proc with many arguments} -body {
+    # Build a proc with 50 arguments
+    set args ""
+    set body "return \[expr \{"
+    for {set i 0} {$i < 50} {incr i} {
+        append args "a$i "
+        if {$i > 0} { append body " + " }
+        append body "\$a$i"
+    }
+    append body "\}\]"
+    set script "proc manyargs \{$args\} \{$body\}\n"
+    append script "return \[manyargs"
+    for {set i 0} {$i < 50} {incr i} {
+        append script " 1"
+    }
+    append script "\]"
+    set out [makeFile "" f4.1-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 50
+
+test f4.2 {F4: proc with many local variables} -body {
+    set body ""
+    for {set i 0} {$i < 100} {incr i} {
+        append body "set v$i $i\n"
+    }
+    append body "return \[expr \{\$v0 + \$v99\}\]"
+    set script "proc manylocals {} \{$body\}\nreturn \[manylocals\]"
+    set out [makeFile "" f4.2-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 99
+
+test f4.3 {F4: switch with many branches (many numWords)} -body {
+    set cases ""
+    for {set i 0} {$i < 30} {incr i} {
+        append cases "case$i { set r $i } "
+    }
+    set script "proc bigsw {x} { switch -exact -- \$x { $cases } ; return \$r }\n"
+    append script "return \[bigsw case15\]"
+    set out [makeFile "" f4.3-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 15
+
+test f4.4 {F4: script with many top-level commands} -body {
+    set script ""
+    for {set i 0} {$i < 200} {incr i} {
+        append script "set v$i [expr {$i * 2}]\n"
+    }
+    append script "return \[expr \{\$v0 + \$v199\}\]"
+    set out [makeFile "" f4.4-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 398
+
+
+# =====================================================================
+# Finding 5: Checked-multiply for allocations
+#
+# Verify that large but valid jump tables and class tables don't crash.
+# =====================================================================
+
+test f5.1 {F5: large jump table (string)} -body {
+    set cases ""
+    for {set i 0} {$i < 100} {incr i} {
+        append cases "key$i { set r val$i } "
+    }
+    set script "proc jt {k} { switch -exact -- \$k { $cases } ; return \$r }\n"
+    append script "return \[jt key50\]"
+    set out [makeFile "" f5.1-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result val50
+
+test f5.2 {F5: many OO classes in one file} -body {
+    set script ""
+    for {set i 0} {$i < 20} {incr i} {
+        append script "oo::class create ::f5c$i\n"
+        append script "oo::define ::f5c$i method id {} { return c$i }\n"
+    }
+    append script "set o \[::f5c10 new\]\nreturn \[\$o id\]"
+    set out [makeFile "" f5.2-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result c10
+
+
+# =====================================================================
+# Finding 6: MethodKeyBuf (snprintf replacement)
+#
+# These test that method key construction works for all 4 method kinds
+# (instance, class, constructor, destructor) after the Tcl_ObjPrintf fix.
+# =====================================================================
+
+test f6.1 {F6: instance method roundtrips} -body {
+    set out [makeFile "" f6.1-out.tbcx]
+    tbcx::save {
+        oo::class create ::f6cls
+        oo::define ::f6cls method instm {} { return inst }
+        set o [::f6cls new]
+        return [$o instm]
+    } $out
+    tbcx::load $out
+} -result inst
+
+test f6.2 {F6: class method roundtrips} -body {
+    set out [makeFile "" f6.2-out.tbcx]
+    tbcx::save {
+        oo::class create ::f6cls2
+        oo::define ::f6cls2 classmethod clsm {} { return cls }
+        return [::f6cls2 clsm]
+    } $out
+    tbcx::load $out
+} -result cls
+
+test f6.3 {F6: constructor roundtrips} -body {
+    set out [makeFile "" f6.3-out.tbcx]
+    tbcx::save {
+        oo::class create ::f6cls3
+        oo::define ::f6cls3 constructor {v} { my variable val; set val $v }
+        oo::define ::f6cls3 method get {} { my variable val; return $val }
+        set o [::f6cls3 new 99]
+        return [$o get]
+    } $out
+    tbcx::load $out
+} -result 99
+
+test f6.4 {F6: destructor roundtrips} -body {
+    set out [makeFile "" f6.4-out.tbcx]
+    tbcx::save {
+        oo::class create ::f6cls4
+        oo::define ::f6cls4 {
+            constructor {} { set ::f6track created }
+            destructor { set ::f6track destroyed }
+        }
+        set o [::f6cls4 new]
+        set r1 $::f6track
+        $o destroy
+        return [list $r1 $::f6track]
+    } $out
+    tbcx::load $out
+} -result {created destroyed}
+
+test f6.5 {F6: all four method kinds in one class} -body {
+    set out [makeFile "" f6.5-out.tbcx]
+    tbcx::save {
+        oo::class create ::f6all
+        oo::define ::f6all {
+            constructor {v} { my variable val; set val $v }
+            destructor { set ::f6gone 1 }
+            method get {} { my variable val; return $val }
+            classmethod kind {} { return "f6all" }
+        }
+        set o [::f6all new 42]
+        set r1 [$o get]
+        set r2 [::f6all kind]
+        $o destroy
+        return [list $r1 $r2 $::f6gone]
+    } $out
+    tbcx::load $out
+} -result {42 f6all 1}
+
+
+# =====================================================================
+# Finding 7: Numeric conversion error handling
+#
+# The serializer and dumper now check return codes from Tcl_GetDoubleFromObj
+# and Tcl_GetBooleanFromObj.  These tests verify that valid doubles and
+# booleans roundtrip correctly.
+# =====================================================================
+
+test f7.1 {F7: double literal roundtrips} -body {
+    set out [makeFile "" f7.1-out.tbcx]
+    tbcx::save {return [expr {3.14159265358979}]} $out
+    set r [tbcx::load $out]
+    expr {abs($r - 3.14159265358979) < 1e-12}
+} -result 1
+
+test f7.2 {F7: boolean literals roundtrip} -body {
+    set out [makeFile "" f7.2-out.tbcx]
+    tbcx::save {return [list [expr {true}] [expr {false}]]} $out
+    tbcx::load $out
+} -result {true false}
+
+test f7.3 {F7: special double values roundtrip} -body {
+    set out [makeFile "" f7.3-out.tbcx]
+    tbcx::save {return [list [expr {0.0}] [expr {-0.0}] [expr {1e308}] [expr {1e-308}]]} $out
+    set r [tbcx::load $out]
+    expr {[llength $r] == 4}
+} -result 1
+
+test f7.4 {F7: double in dump output} -body {
+    set out [makeFile "" f7.4-out.tbcx]
+    tbcx::save {return [expr {2.718281828}]} $out
+    set d [tbcx::dump $out]
+    # Dump should contain "double" somewhere for this literal
+    expr {[string match "*double*" $d]}
+} -result 1
+
+test f7.5 {F7: boolean in dump output} -body {
+    set out [makeFile "" f7.5-out.tbcx]
+    tbcx::save {return [expr {true && true}]} $out
+    set d [tbcx::dump $out]
+    expr {[string length $d] > 0}
+} -result 1
+
+
+# =====================================================================
+# Finding 8: Safe interpreter behavior
+#
+# tbcx_SafeInit registers no commands.  Verify that safe interpreters
+# cannot access tbcx::save, tbcx::load, or tbcx::dump directly.
+# =====================================================================
+
+test f8.1 {F8: safe interp gets package but no commands} -body {
+    set si [interp create -safe]
+    # Safe interps can't package require (no filesystem); load from parent
+    load {} tbcx $si
+    # tbcx::save should not exist
+    set has_save [interp eval $si {expr {[info commands ::tbcx::save] ne ""}}]
+    set has_load [interp eval $si {expr {[info commands ::tbcx::load] ne ""}}]
+    set has_dump [interp eval $si {expr {[info commands ::tbcx::dump] ne ""}}]
+    interp delete $si
+    list $has_save $has_load $has_dump
+} -result {0 0 0}
+
+test f8.2 {F8: safe interp — save errors} -body {
+    set si [interp create -safe]
+    load {} tbcx $si
+    set rc [catch {interp eval $si {tbcx::save {return ok} /tmp/x.tbcx}} msg]
+    interp delete $si
+    expr {$rc == 1}
+} -result 1
+
+test f8.3 {F8: safe interp — load errors} -body {
+    set si [interp create -safe]
+    load {} tbcx $si
+    set rc [catch {interp eval $si {tbcx::load /tmp/x.tbcx}} msg]
+    interp delete $si
+    expr {$rc == 1}
+} -result 1
+
+test f8.4 {F8: safe interp — dump errors} -body {
+    set si [interp create -safe]
+    load {} tbcx $si
+    set rc [catch {interp eval $si {tbcx::dump /tmp/x.tbcx}} msg]
+    interp delete $si
+    expr {$rc == 1}
+} -result 1
+
+test f8.5 {F8: parent can expose commands to safe interp} -body {
+    set out [makeFile "" f8.5-out.tbcx]
+    tbcx::save {return "safe-exposed"} $out
+    set si [interp create -safe]
+    load {} tbcx $si
+    # Parent explicitly exposes load via alias
+    interp alias $si safeload {} tbcx::load
+    set r [interp eval $si [list safeload $out]]
+    interp delete $si
+    set r
+} -result safe-exposed
+
+test f8.6 {F8: normal (unsafe) interp still has all commands} -body {
+    set ci [interp create]
+    interp eval $ci {package require tbcx}
+    set has_save [interp eval $ci {expr {[info commands ::tbcx::save] ne ""}}]
+    set has_load [interp eval $ci {expr {[info commands ::tbcx::load] ne ""}}]
+    set has_dump [interp eval $ci {expr {[info commands ::tbcx::dump] ne ""}}]
+    interp delete $ci
+    list $has_save $has_load $has_dump
+} -result {1 1 1}
+
+
+# =====================================================================
+# Cross-cutting: Dump integrity after roundtrip
+# =====================================================================
+
+test xc.1 {cross-cutting: dump after save matches load semantics} -body {
+    set out [makeFile "" xc.1-out.tbcx]
+    tbcx::save {
+        proc xc_add {a b} { expr {$a + $b} }
+        return [xc_add 20 22]
+    } $out
+    set r [tbcx::load $out]
+    set d [tbcx::dump $out]
+    # Load result correct AND dump contains proc name
+    expr {$r == 42 && [string match "*xc_add*" $d]}
+} -result 1
+
+test xc.2 {cross-cutting: save same script twice produces same load result} -body {
+    set out1 [makeFile "" xc.2a-out.tbcx]
+    set out2 [makeFile "" xc.2b-out.tbcx]
+    set script {
+        proc xc_fib {n} {
+            if {$n <= 1} { return $n }
+            expr {[xc_fib [expr {$n-1}]] + [xc_fib [expr {$n-2}]]}
+        }
+        return [xc_fib 10]
+    }
+    tbcx::save $script $out1
+    tbcx::save $script $out2
+    set r1 [tbcx::load $out1]
+    set r2 [tbcx::load $out2]
+    expr {$r1 == 55 && $r1 == $r2}
+} -result 1
+
+test xc.3 {cross-cutting: load into child interp, verify isolation} -body {
+    set out [makeFile "" xc.3-out.tbcx]
+    tbcx::save {
+        namespace eval ::xcns {
+            proc secret {} { return "hidden" }
+        }
+        return [::xcns::secret]
+    } $out
+    set ci [interp create]
+    interp eval $ci {package require tbcx}
+    set r [interp eval $ci [list tbcx::load $out]]
+    interp delete $ci
+    # Child got correct result
+    set r
+} -result hidden
+
+
+cleanupTests

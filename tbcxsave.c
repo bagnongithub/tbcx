@@ -143,7 +143,7 @@ static void CtxAddCompiled(TbcxCtx* ctx, Tcl_Obj* orig, Tcl_Obj* compiled);
 static Tcl_Obj* CtxGetCompiled(TbcxCtx* ctx, Tcl_Obj* orig);
 static void CtxFreeCompiled(TbcxCtx* ctx);
 static void CtxInitNsEval(TbcxCtx* ctx);
-static void CtxAddNsEval(TbcxCtx* ctx, const char* bodyText, Tcl_Obj* nsFqn);
+static void CtxAddNsEval(TbcxCtx* ctx, const char* bodyText, Tcl_Size bodyLen, Tcl_Obj* nsFqn);
 static void CtxFreeNsEval(TbcxCtx* ctx);
 static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top);
 static void ScanForNsEvalBodies(TbcxCtx* ctx, const char* script, Tcl_Size len);
@@ -155,7 +155,7 @@ static void DV_Free(DefVec* dv);
 static void DV_Init(DefVec* dv);
 static void DV_Push(DefVec* dv, DefRec r);
 static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w);
-static Tcl_Obj* FqnUnder(Tcl_Obj* curNs, Tcl_Obj* name);
+static Tcl_Obj* FqnUnder(Tcl_Interp* ip, Tcl_Obj* curNs, Tcl_Obj* name);
 static int IsPureOodefineBuilderBody(Tcl_Interp* ip, const char* script, Tcl_Size len);
 static void Lit_Bignum(TbcxOut* w, Tcl_Obj* o);
 static void Lit_Bytecode(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj);
@@ -348,6 +348,10 @@ static void CtxAddStripBody(TbcxCtx* ctx, Tcl_Obj* body)
     const char* s = Tbcx_GetStringFromObjSafe(body, &len);
     if (!s)
         return;
+    /* TCL_STRING_KEYS truncates at embedded NUL — skip optimization for
+       binary body text to avoid false collisions. */
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
+        return;
     int isNew;
     /* For TCL_STRING_KEYS, Tcl_CreateHashEntry() *copies* the key internally. */
     Tcl_HashEntry* he = Tcl_CreateHashEntry(&ctx->stripBodies, (const char*)s, &isNew);
@@ -364,6 +368,9 @@ static int ShouldStripBody(TbcxCtx* ctx, Tcl_Obj* obj)
     Tcl_Size len = 0;
     const char* s = Tbcx_GetStringFromObjSafe(obj, &len);
     if (!s)
+        return 0;
+    /* TCL_STRING_KEYS truncates at embedded NUL — never match binary bodies. */
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
         return 0;
     Tcl_HashEntry* he = Tcl_FindHashEntry(&ctx->stripBodies, (const char*)s);
     if (!he)
@@ -447,9 +454,13 @@ static void CtxInitNsEval(TbcxCtx* ctx)
     ctx->nsEvalInit = 1;
 }
 
-static void CtxAddNsEval(TbcxCtx* ctx, const char* bodyText, Tcl_Obj* nsFqn)
+static void CtxAddNsEval(TbcxCtx* ctx, const char* bodyText, Tcl_Size bodyLen, Tcl_Obj* nsFqn)
 {
     if (!ctx || !ctx->nsEvalInit || !bodyText || !nsFqn)
+        return;
+    /* TCL_STRING_KEYS truncates at embedded NUL — skip precompile side-table
+       for binary body text to avoid false collisions. */
+    if (bodyLen > 0 && memchr(bodyText, '\0', (size_t)bodyLen) != NULL)
         return;
     int isNew;
     Tcl_HashEntry* he = Tcl_CreateHashEntry(&ctx->nsEvalBodies, bodyText, &isNew);
@@ -541,7 +552,7 @@ static void RegisterBodyAndRecurse(TbcxCtx* ctx, const Tcl_Token* tok, Tcl_Obj* 
            Note: namespace eval bodies are registered by the explicit
            handler in ScanScriptBodiesRec, not via this function. */
         if (!hasDollar)
-            CtxAddNsEval(ctx, bs, curNs);
+            CtxAddNsEval(ctx, bs, bl, curNs);
         ScanScriptBodiesRec(ctx, bs, bl, curNs, depth + 1);
     }
     Tcl_DecrRefCount(bodyObj);
@@ -617,7 +628,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                             Tcl_AppendObjToObj(nsFqn, nsObj);
                             Tcl_IncrRefCount(nsFqn);
                         }
-                        CtxAddNsEval(ctx, bs, nsFqn);
+                        CtxAddNsEval(ctx, bs, bl, nsFqn);
                         ScanScriptBodiesRec(ctx, bs, bl, nsFqn, depth + 1);
                         Tcl_DecrRefCount(nsFqn);
                     }
@@ -642,10 +653,10 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                         {
                             Tcl_Size bl;
                             const char* bs = Tbcx_GetStringFromObjSafe(bodyObj, &bl);
-                            Tcl_Obj* nsFqn = FqnUnder(curNs, nsObj);
+                            Tcl_Obj* nsFqn = FqnUnder(ctx->interp, curNs, nsObj);
                             if (bs && nsFqn)
                             {
-                                CtxAddNsEval(ctx, bs, nsFqn);
+                                CtxAddNsEval(ctx, bs, bl, nsFqn);
                                 ScanScriptBodiesRec(ctx, bs, bl, nsFqn, depth + 1);
                             }
                             if (nsFqn)
@@ -708,7 +719,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                 else if (strcmp(c0, "foreach") == 0 && p.numWords >= 4)
                 {
                     const Tcl_Token* tok = w0;
-                    for (int fw = 0; fw < p.numWords - 1; fw++)
+                    for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                         tok = NextWord(tok);
                     RegisterBodyAndRecurse(ctx, tok, curNs, depth);
                 }
@@ -746,7 +757,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                 else if (strcmp(c0, "uplevel") == 0 && p.numWords >= 2 && p.numWords <= 3)
                 {
                     const Tcl_Token* tok = w0;
-                    for (int fw = 0; fw < p.numWords - 1; fw++)
+                    for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                         tok = NextWord(tok);
                     Tcl_Obj* bodyObj = WordLiteralObj(tok);
                     if (bodyObj)
@@ -882,7 +893,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                 else if (strcmp(c0, "lmap") == 0 && p.numWords >= 4)
                 {
                     const Tcl_Token* tok = w0;
-                    for (int fw = 0; fw < p.numWords - 1; fw++)
+                    for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                         tok = NextWord(tok);
                     RegisterBodyAndRecurse(ctx, tok, curNs, depth);
                 }
@@ -899,7 +910,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                         if ((strcmp(sc, "for") == 0 || strcmp(sc, "map") == 0) && p.numWords == 5)
                         {
                             const Tcl_Token* tok = w0;
-                            for (int fw = 0; fw < p.numWords - 1; fw++)
+                            for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                                 tok = NextWord(tok);
                             RegisterBodyAndRecurse(ctx, tok, curNs, depth);
                         }
@@ -907,7 +918,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                         else if (strcmp(sc, "with") == 0 && p.numWords >= 4)
                         {
                             const Tcl_Token* tok = w0;
-                            for (int fw = 0; fw < p.numWords - 1; fw++)
+                            for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                                 tok = NextWord(tok);
                             RegisterBodyAndRecurse(ctx, tok, curNs, depth);
                         }
@@ -922,7 +933,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                 {
                     /* Last word is the pattern/body dictionary */
                     const Tcl_Token* tok = w0;
-                    for (int fw = 0; fw < p.numWords - 1; fw++)
+                    for (Tcl_Size fw = 0; fw + 1 < p.numWords; fw++)
                         tok = NextWord(tok);
                     Tcl_Obj* dictBody = WordLiteralObj(tok);
                     if (dictBody)
@@ -948,7 +959,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                                             hasDollar = 1;
                                     }
                                     if (hasScriptInd && !hasDollar)
-                                        CtxAddNsEval(ctx, bs, curNs);
+                                        CtxAddNsEval(ctx, bs, bl, curNs);
                                     if (hasScriptInd)
                                         ScanScriptBodiesRec(ctx, bs, bl, curNs, depth + 1);
                                 }
@@ -1007,7 +1018,7 @@ static void ScanScriptBodiesRec(TbcxCtx* ctx, const char* script, Tcl_Size len, 
                 const Tcl_Token* wtk = p.tokenPtr;
                 if (wtk->type == TCL_TOKEN_COMMAND)
                     wtk++; /* skip Tcl 9.x command envelope */
-                for (int wIdx = 0; wIdx < p.numWords; wIdx++)
+                for (Tcl_Size wIdx = 0; wIdx < p.numWords; wIdx++)
                 {
                     for (int sub = 0; sub < wtk->numComponents; sub++)
                     {
@@ -1116,7 +1127,7 @@ static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top)
         if (TclSetByteCodeFromAny(ctx->interp, copy, NULL, NULL) == TCL_OK)
         {
             ByteCode* bc = NULL;
-            ByteCodeGetInternalRep(copy, tbcxTyBytecode, bc);
+            bc = TbcxGetByteCode(copy);
             if (!bc)
             {
                 /* Tcl 9.1 slot-based lookup fallback */
@@ -1404,7 +1415,7 @@ static void Lit_LambdaBC(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* lambda)
     procPtr->numCompiledLocals = (int)argc;
     {
         CompiledLocal *first = NULL, *last = NULL;
-        int numA = 0;
+        Tcl_Size numA = 0;
         if (Tbcx_BuildLocals(ctx->interp, argsList, &first, &last, &numA) != TCL_OK)
         {
             W_Error(w, "tbcx: lambda args decode");
@@ -1484,7 +1495,7 @@ lambda_cleanup:
 static void Lit_Bytecode(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
 {
     ByteCode* codePtr = NULL;
-    ByteCodeGetInternalRep(bcObj, tbcxTyBytecode, codePtr);
+    codePtr = TbcxGetByteCode(bcObj);
     Tcl_Obj* nsFQN = NsFqn((Tcl_Namespace*)(codePtr ? codePtr->nsPtr : NULL));
     Tcl_Size nsLen;
     const char* nsStr = Tbcx_GetStringFromObjSafe(nsFQN, &nsLen);
@@ -1493,7 +1504,7 @@ static void Lit_Bytecode(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
     Tcl_DecrRefCount(nsFQN);
 }
 
-int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, int* numArgsOut)
+int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, Tcl_Size* numArgsOut)
 {
     if (!firstOut || !lastOut || !numArgsOut)
         return TCL_ERROR;
@@ -1504,13 +1515,6 @@ int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut
     Tcl_Obj** argv = NULL;
     if (Tcl_ListObjGetElements(ip, argsList, &argc, &argv) != TCL_OK)
     {
-        return TCL_ERROR;
-    }
-    /* Guard against Tcl_Size -> int overflow (CompiledLocal fields are int) */
-    if (argc > INT_MAX)
-    {
-        if (ip)
-            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument list too large", -1));
         return TCL_ERROR;
     }
 
@@ -1525,14 +1529,6 @@ int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut
             return TCL_ERROR;
         }
         const char* nm = Tbcx_GetStringFromObjSafe(fv[0], &nmLen);
-        /* Guard Tcl_Size → int overflow (CompiledLocal::nameLength is int) */
-        if (nmLen < 0 || nmLen > INT_MAX)
-        {
-            Tbcx_FreeLocals(first);
-            if (ip)
-                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument name too long", -1));
-            return TCL_ERROR;
-        }
         /* Checked allocation size: offsetof(CompiledLocal, name) + 1 + nmLen */
         size_t baseSize = offsetof(CompiledLocal, name) + 1u;
         size_t allocSize = baseSize + (size_t)nmLen;
@@ -1547,9 +1543,9 @@ int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut
             allocSize = sizeof(CompiledLocal);
         CompiledLocal* cl = (CompiledLocal*)Tcl_Alloc(allocSize);
         memset(cl, 0, allocSize);
-        cl->nameLength = (int)nmLen;
+        cl->nameLength = nmLen;
         memcpy(cl->name, nm, (size_t)nmLen + 1);
-        cl->frameIndex = (int)i;
+        cl->frameIndex = i;
         cl->flags = VAR_ARGUMENT;
         if (nf == 2)
         {
@@ -1569,7 +1565,7 @@ int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut
 
     *firstOut = first;
     *lastOut = last;
-    *numArgsOut = (int)argc;
+    *numArgsOut = argc;
     return TCL_OK;
 }
 
@@ -1603,7 +1599,7 @@ static int CompileProcLike(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* nsFQN, Tcl_Obj* ar
     procPtr->refCount = 1;
     {
         CompiledLocal *first = NULL, *last = NULL;
-        int numA = 0;
+        Tcl_Size numA = 0;
         if (Tbcx_BuildLocals(ip, argsList, &first, &last, &numA) != TCL_OK)
         {
             W_Error(w, "tbcx: bad arg spec");
@@ -1882,7 +1878,7 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                     if (TclSetByteCodeFromAny(ctx->interp, copy, NULL, NULL) == TCL_OK)
                     {
                         ByteCode* bc = NULL;
-                        ByteCodeGetInternalRep(copy, tbcxTyBytecode, bc);
+                        bc = TbcxGetByteCode(copy);
                         if (!bc)
                         {
                             const Tcl_ObjInternalRep* ir = Tcl_FetchInternalRep(copy, tbcxTyBytecode);
@@ -2059,7 +2055,11 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
     else if (ty == tbcxTyDouble)
     {
         double d = 0;
-        Tcl_GetDoubleFromObj(NULL, obj, &d);
+        if (Tcl_GetDoubleFromObj(NULL, obj, &d) != TCL_OK)
+        {
+            W_Error(w, "tbcx: double literal conversion failed");
+            return;
+        }
         union
         {
             double d;
@@ -2190,7 +2190,7 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
             if (p && p->bodyPtr)
             {
                 ByteCode* bc = NULL;
-                ByteCodeGetInternalRep(p->bodyPtr, tbcxTyBytecode, bc);
+                bc = TbcxGetByteCode(p->bodyPtr);
                 if (bc)
                 {
                     /* Dual dedup (same as bytecode branch) */
@@ -2265,7 +2265,12 @@ static void WriteAux_JTStr(TbcxOut* w, AuxData* ad)
         W_U32(w, 0);
         return;
     }
-    JTEntry* arr = (JTEntry*)Tcl_Alloc(sizeof(JTEntry) * cnt);
+    size_t arrBytes = 0;
+    if (!tbcx_checked_mul(sizeof(JTEntry), (size_t)cnt, &arrBytes)) {
+        W_Error(w, "tbcx: jumptable string aux too large");
+        return;
+    }
+    JTEntry* arr = (JTEntry*)Tcl_Alloc(arrBytes);
     uint32_t i = 0;
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
     {
@@ -2305,7 +2310,12 @@ static void WriteAux_JTNum(TbcxOut* w, AuxData* ad)
         W_U32(w, 0);
         return;
     }
-    JTNumEntry* arr = (JTNumEntry*)Tcl_Alloc(sizeof(JTNumEntry) * cnt);
+    size_t numBytes = 0;
+    if (!tbcx_checked_mul(sizeof(JTNumEntry), (size_t)cnt, &numBytes)) {
+        W_Error(w, "tbcx: jumptable numeric aux too large");
+        return;
+    }
+    JTNumEntry* arr = (JTNumEntry*)Tcl_Alloc(numBytes);
     uint32_t i = 0;
     for (h = Tcl_FirstHashEntry(&info->hashTable, &srch); h; h = Tcl_NextHashEntry(&srch))
     {
@@ -2434,7 +2444,7 @@ static Tcl_Obj* ResolveToBytecodeObj(Tcl_Obj* cand)
     if (!cand)
         return NULL;
     ByteCode* bc = NULL;
-    ByteCodeGetInternalRep(cand, tbcxTyBytecode, bc);
+    bc = TbcxGetByteCode(cand);
     if (bc)
         return cand;
     if (cand->typePtr == tbcxTyProcBody)
@@ -2443,7 +2453,7 @@ static Tcl_Obj* ResolveToBytecodeObj(Tcl_Obj* cand)
         if (p && p->bodyPtr)
         {
             ByteCode* bc2 = NULL;
-            ByteCodeGetInternalRep(p->bodyPtr, tbcxTyBytecode, bc2);
+            bc2 = TbcxGetByteCode(p->bodyPtr);
             if (bc2)
                 return p->bodyPtr;
         }
@@ -2454,7 +2464,7 @@ static Tcl_Obj* ResolveToBytecodeObj(Tcl_Obj* cand)
 static void WriteCompiledBlock(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
 {
     ByteCode* bc = NULL;
-    ByteCodeGetInternalRep(bcObj, tbcxTyBytecode, bc);
+    bc = TbcxGetByteCode(bcObj);
 
     if (!bc)
     {
@@ -2645,7 +2655,7 @@ static void WriteCompiledBlock(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
 static void WriteHeaderTop(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* topObj)
 {
     ByteCode* top = NULL;
-    ByteCodeGetInternalRep(topObj, tbcxTyBytecode, top);
+    top = TbcxGetByteCode(topObj);
     if (!top)
     {
         W_Error(w, "tbcx: failed to get top bytecode");
@@ -2751,7 +2761,12 @@ static void CS_Add(ClsSet* cs, Tcl_Obj* clsFqn)
 {
     if (!cs || !cs->init || !clsFqn)
         return;
-    const char* s = Tbcx_GetStringSafe(clsFqn);
+    Tcl_Size len = 0;
+    const char* s = Tbcx_GetStringFromObjSafe(clsFqn, &len);
+    /* TCL_STRING_KEYS truncates at embedded NUL — skip class registration
+       for binary FQNs to avoid false collisions. */
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
+        return;
     int isNew = 0;
     Tcl_HashEntry* he = Tcl_CreateHashEntry(&cs->ht, s, &isNew);
     if (isNew)
@@ -2871,26 +2886,39 @@ static inline const char* CmdCore(const char* s)
     return s;
 }
 
-static Tcl_Obj* FqnUnder(Tcl_Obj* curNs, Tcl_Obj* name)
+static Tcl_Obj* FqnUnder(Tcl_Interp* ip, Tcl_Obj* curNs, Tcl_Obj* name)
 {
-    const char* nm = Tbcx_GetStringSafe(name);
+    Tcl_Size nameLen = 0;
+    const char* nm = Tbcx_GetStringFromObjStrict(ip, name, &nameLen);
     if (!nm)
         return NULL;
-    if (nm[0] == ':' && nm[1] == ':')
+    if (nameLen > 0 && memchr(nm, '\0', (size_t)nameLen) != NULL)
     {
-        Tcl_IncrRefCount(name);
+        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: name contains embedded NUL"));
+        return NULL;
+    }
+    if (nameLen >= 2 && nm[0] == ':' && nm[1] == ':')
+    {
+        Tcl_IncrRefCount(name);      /* returned refcount = 1 */
         return name;
     }
-    Tcl_Size ln = 0;
-    const char* ns = Tbcx_GetStringFromObjSafe(curNs, &ln);
+
+    Tcl_Size nsLen = 0;
+    const char* ns = Tbcx_GetStringFromObjStrict(ip, curNs, &nsLen);
     if (!ns)
         return NULL;
-    Tcl_Obj* fqn = Tcl_NewStringObj(ns, ln);
-    if (!(ln == 2 && ns[0] == ':' && ns[1] == ':'))
+    if (nsLen > 0 && memchr(ns, '\0', (size_t)nsLen) != NULL)
+    {
+        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: namespace contains embedded NUL"));
+        return NULL;
+    }
+
+    Tcl_Obj* fqn = Tcl_NewStringObj(ns, nsLen); /* refcount 0 */
+    Tcl_IncrRefCount(fqn);                      /* refcount 1 — own before mutation */
+    if (!(nsLen == 2 && ns[0] == ':' && ns[1] == ':'))
         Tcl_AppendToObj(fqn, "::", 2);
     Tcl_AppendObjToObj(fqn, name);
-    Tcl_IncrRefCount(fqn);
-    return fqn;
+    return fqn;                                /* returned refcount = 1 */
 }
 
 static void CaptureClassBody(Tcl_Interp* ip,
@@ -2933,7 +2961,7 @@ static void CaptureClassBody(Tcl_Interp* ip,
                        between name and args and are ignored here. */
                     const Tcl_Token* wN = NextWord(w0);
                     const Tcl_Token* t = w0;
-                    for (int w = 0; w < p.numWords - 2; w++)
+                    for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
                         t = NextWord(t);
                     const Tcl_Token* wA = t;
                     const Tcl_Token* wB = NextWord(wA);
@@ -2971,13 +2999,13 @@ static void CaptureClassBody(Tcl_Interp* ip,
                     /* Last two words are args/body; allow the {body}-only form too */
                     const Tcl_Token *wArgs = NULL, *wBody = NULL;
                     const Tcl_Token* tokWalk = w0;
-                    for (int w = 0; w < p.numWords - 1; w++)
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
                         tokWalk = NextWord(tokWalk);
                     wBody = tokWalk;
                     if (p.numWords >= 3)
                     {
                         const Tcl_Token* pre = w0;
-                        for (int w = 0; w < p.numWords - 2; w++)
+                        for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
                             pre = NextWord(pre);
                         wArgs = pre;
                     }
@@ -3029,14 +3057,14 @@ static void CaptureClassBody(Tcl_Interp* ip,
                 {
                     /* Destructor may be "… destructor {body}" or "… destructor {args} {body}" */
                     const Tcl_Token* tokWalk = w0;
-                    for (int w = 0; w < p.numWords - 1; w++)
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
                         tokWalk = NextWord(tokWalk);
                     const Tcl_Token* wBody = tokWalk;
                     Tcl_Obj* args = NULL;
                     if (p.numWords >= 3)
                     {
                         const Tcl_Token* pre = w0;
-                        for (int w = 0; w < p.numWords - 2; w++)
+                        for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
                             pre = NextWord(pre);
                         args = WordLiteralObj(pre);
                     }
@@ -3342,7 +3370,7 @@ static Tcl_Obj* StubbedBuilderBody(Tcl_Interp* ip, Tcl_Obj* bodyObj)
                     Tcl_DString ln;
                     Tcl_DStringInit(&ln);
                     const Tcl_Token* t = w0;
-                    for (int w = 0; w < p.numWords - 1; w++)
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
                     {
                         Tcl_Obj* word = WordLiteralObj(t);
                         if (word)
@@ -3362,13 +3390,13 @@ static Tcl_Obj* StubbedBuilderBody(Tcl_Interp* ip, Tcl_Obj* bodyObj)
                 else if ((strcmp(kw, "constructor") == 0) && p.numWords >= 2)
                 {
                     const Tcl_Token* t = w0;
-                    for (int w = 0; w < p.numWords - 1; w++)
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
                         t = NextWord(t);
                     const Tcl_Token* wArgs = NULL;
                     if (p.numWords >= 3)
                     {
                         const Tcl_Token* pre = w0;
-                        for (int w = 0; w < p.numWords - 2; w++)
+                        for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
                             pre = NextWord(pre);
                         wArgs = pre;
                     }
@@ -3590,13 +3618,13 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
         Tcl_Obj* kwd = WordLiteralObj(wK);
         if (cls && kwd)
         {
-            Tcl_Obj* clsFqn = FqnUnder(ctx->curNs, cls);
+            Tcl_Obj* clsFqn = FqnUnder(ctx->ip, ctx->curNs, cls);
             const char* kw = clsFqn ? Tbcx_GetStringSafe(kwd) : "";
 
             if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p->numWords >= 6)
             {
                 const Tcl_Token* tokP = w0;
-                for (int w = 0; w < p->numWords - 3; w++)
+                for (Tcl_Size w = 0; w + 3 < p->numWords; w++)
                     tokP = NextWord(tokP);
                 const Tcl_Token *wN = tokP, *wA = NextWord(wN), *wB = NextWord(wA);
                 Tcl_Obj *mname = WordLiteralObj(wN), *args = WordLiteralObj(wA), *body = WordLiteralObj(wB);
@@ -3652,13 +3680,13 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
             else if ((strcmp(kw, "constructor") == 0 || strcmp(kw, "destructor") == 0) && p->numWords >= 4)
             {
                 const Tcl_Token* tokP = w0;
-                for (int w = 0; w < p->numWords - 1; w++)
+                for (Tcl_Size w = 0; w + 1 < p->numWords; w++)
                     tokP = NextWord(tokP);
                 const Tcl_Token *wBody = tokP, *wArgsTok = NULL;
                 if (p->numWords >= 5)
                 {
                     const Tcl_Token* pre = w0;
-                    for (int w = 0; w < p->numWords - 2; w++)
+                    for (Tcl_Size w = 0; w + 2 < p->numWords; w++)
                         pre = NextWord(pre);
                     wArgsTok = pre;
                 }
@@ -3736,7 +3764,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
         Tcl_Obj* bod = wBod ? WordLiteralObj(wBod) : NULL;
         if (cls && bod)
         {
-            Tcl_Obj* clsFqn = FqnUnder(ctx->curNs, cls);
+            Tcl_Obj* clsFqn = FqnUnder(ctx->ip, ctx->curNs, cls);
             if (clsFqn)
             {
                 Tcl_Size bl = 0;
@@ -3784,7 +3812,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
             Tcl_Obj* nm = WordLiteralObj(w2);
             if (nm)
             {
-                Tcl_Obj* clsFqn = FqnUnder(ctx->curNs, nm);
+                Tcl_Obj* clsFqn = FqnUnder(ctx->ip, ctx->curNs, nm);
                 if (clsFqn)
                 {
                     CS_Add(ctx->classes, clsFqn);
@@ -3862,12 +3890,14 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
         Tcl_Obj* sub = WordLiteralObj(wSub);
         if (sub && strcmp(Tbcx_GetStringSafe(sub), "create") == 0)
         {
-            Tcl_Obj* cmdFqn = FqnUnder(ctx->curNs, cmd);
-            const char* cmdFqnStr = Tbcx_GetStringSafe(cmdFqn);
-            Tcl_HashEntry* clsHe = Tcl_FindHashEntry(&ctx->classes->ht, cmdFqnStr);
+            Tcl_Obj* cmdFqn = FqnUnder(ctx->ip, ctx->curNs, cmd);
             int isMetaCreate = 0;
-            if (clsHe)
+            if (cmdFqn)
             {
+                const char* cmdFqnStr = Tcl_GetString(cmdFqn);
+                Tcl_HashEntry* clsHe = Tcl_FindHashEntry(&ctx->classes->ht, cmdFqnStr);
+                if (clsHe)
+                {
                 /* Verify the 4th word is a builder body, not a ctor arg.
                    Check if it contains any OO builder keyword when parsed. */
                 const Tcl_Token* w3 = NextWord(NextWord(wSub));
@@ -3912,14 +3942,16 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                     Tcl_ResetResult(ctx->ip);
                     Tcl_DecrRefCount(probe);
                 }
-            }
+                } /* if (clsHe) */
+            } /* if (cmdFqn) — skip meta-create optimization on FQN failure */
+            Tcl_ResetResult(ctx->ip);
             if (isMetaCreate)
             {
                 const Tcl_Token* w2 = NextWord(wSub);
                 Tcl_Obj* nm = WordLiteralObj(w2);
                 if (nm)
                 {
-                    Tcl_Obj* clsFqn = FqnUnder(ctx->curNs, nm);
+                    Tcl_Obj* clsFqn = FqnUnder(ctx->ip, ctx->curNs, nm);
                     if (clsFqn)
                     {
                         CS_Add(ctx->classes, clsFqn);
@@ -3988,7 +4020,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
         Tcl_Obj* bod = wBod ? WordLiteralObj(wBod) : NULL;
         if (objNm && bod)
         {
-            Tcl_Obj* objFqn = FqnUnder(ctx->curNs, objNm);
+            Tcl_Obj* objFqn = FqnUnder(ctx->ip, ctx->curNs, objNm);
             if (objFqn)
             {
                 Tcl_Size bl = 0;
@@ -4030,7 +4062,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                                 {
                                     /* Emit all words except last (body), then empty stub */
                                     const Tcl_Token* wt = pw0;
-                                    for (int wi = 0; wi < pp.numWords - 1; wi++)
+                                    for (Tcl_Size wi = 0; wi + 1 < pp.numWords; wi++)
                                     {
                                         Tcl_Obj* w = WordLiteralObj(wt);
                                         if (w)
@@ -4045,7 +4077,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                                 else if (strcmp(pk, "constructor") == 0 && pp.numWords >= 3)
                                 {
                                     const Tcl_Token* wt = pw0;
-                                    for (int wi = 0; wi < pp.numWords - 1; wi++)
+                                    for (Tcl_Size wi = 0; wi + 1 < pp.numWords; wi++)
                                     {
                                         Tcl_Obj* w = WordLiteralObj(wt);
                                         if (w)
@@ -4066,7 +4098,7 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
                                 {
                                     /* Non-body command (variable etc.) — emit verbatim */
                                     const Tcl_Token* wt = pw0;
-                                    for (int wi = 0; wi < pp.numWords; wi++)
+                                    for (Tcl_Size wi = 0; wi < pp.numWords; wi++)
                                     {
                                         Tcl_Obj* w = WordLiteralObj(wt);
                                         if (w)
@@ -4121,13 +4153,13 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
         Tcl_Obj* kwd = WordLiteralObj(wK);
         if (objNm && kwd)
         {
-            Tcl_Obj* objFqn = FqnUnder(ctx->curNs, objNm);
+            Tcl_Obj* objFqn = FqnUnder(ctx->ip, ctx->curNs, objNm);
             const char* kw = objFqn ? Tbcx_GetStringSafe(kwd) : "";
 
             if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p->numWords >= 6)
             {
                 const Tcl_Token* tokP = w0;
-                for (int w = 0; w < p->numWords - 3; w++)
+                for (Tcl_Size w = 0; w + 3 < p->numWords; w++)
                     tokP = NextWord(tokP);
                 const Tcl_Token *wN = tokP, *wA = NextWord(wN), *wB = NextWord(wA);
                 Tcl_Obj *mname = WordLiteralObj(wN), *args = WordLiteralObj(wA), *body = WordLiteralObj(wB);
@@ -4182,13 +4214,13 @@ static int RewriteOoCmd(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0, cons
             else if ((strcmp(kw, "constructor") == 0 || strcmp(kw, "destructor") == 0) && p->numWords >= 4)
             {
                 const Tcl_Token* tokP = w0;
-                for (int w = 0; w < p->numWords - 1; w++)
+                for (Tcl_Size w = 0; w + 1 < p->numWords; w++)
                     tokP = NextWord(tokP);
                 const Tcl_Token *wBody = tokP, *wArgsTok = NULL;
                 if (p->numWords >= 5)
                 {
                     const Tcl_Token* pre = w0;
-                    for (int w = 0; w < p->numWords - 2; w++)
+                    for (Tcl_Size w = 0; w + 2 < p->numWords; w++)
                         pre = NextWord(pre);
                     wArgsTok = pre;
                 }
@@ -4342,7 +4374,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
     {
         /* foreach ... body — last word is the body */
         const Tcl_Token* tok = w0;
-        for (int fw = 0; fw < p->numWords - 1; fw++)
+        for (Tcl_Size fw = 0; fw + 1 < p->numWords; fw++)
             tok = NextWord(tok);
         Tcl_Obj* rew = RecurseScriptBody(ctx->ip, tok, ctx->curNs, ctx->defs, ctx->classes, ctx->depth + 1);
         if (rew)
@@ -4350,7 +4382,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
             /* Pre-scan: all middle words must be literals */
             int allLit = 1;
             const Tcl_Token* wt = NextWord(w0);
-            for (int fw = 1; fw < p->numWords - 1; fw++)
+            for (Tcl_Size fw = 1; fw + 1 < p->numWords; fw++)
             {
                 Tcl_Obj* probe = WordLiteralObj(wt);
                 if (!probe)
@@ -4367,7 +4399,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                 Tcl_DStringInit(&ln);
                 Tcl_DStringAppendElement(&ln, "foreach");
                 wt = NextWord(w0);
-                for (int fw = 1; fw < p->numWords - 1; fw++)
+                for (Tcl_Size fw = 1; fw + 1 < p->numWords; fw++)
                 {
                     Tcl_Obj* wo = WordLiteralObj(wt);
                     Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(wo));
@@ -4392,7 +4424,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
             /* Pre-scan trailing words */
             int allLit = 1;
             const Tcl_Token* wt = NextWord(wBody);
-            for (int fw = 2; fw < p->numWords; fw++)
+            for (Tcl_Size fw = 2; fw < p->numWords; fw++)
             {
                 Tcl_Obj* probe = WordLiteralObj(wt);
                 if (!probe)
@@ -4410,7 +4442,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                 Tcl_DStringAppendElement(&ln, "catch");
                 Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(rew));
                 wt = NextWord(wBody);
-                for (int fw = 2; fw < p->numWords; fw++)
+                for (Tcl_Size fw = 2; fw < p->numWords; fw++)
                 {
                     Tcl_Obj* wo = WordLiteralObj(wt);
                     Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(wo));
@@ -4441,9 +4473,9 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
         {
             const Tcl_Token** twords = (const Tcl_Token**)Tcl_Alloc(twordsSz);
             twords[0] = w0;
-            for (int fi = 1; fi < p->numWords; fi++)
+            for (Tcl_Size fi = 1; fi < p->numWords; fi++)
                 twords[fi] = NextWord(twords[fi - 1]);
-            for (int fi = 0; fi < p->numWords; fi++)
+            for (Tcl_Size fi = 0; fi < p->numWords; fi++)
             {
                 Tcl_Obj* probe = WordLiteralObj(twords[fi]);
                 if (!probe)
@@ -4457,7 +4489,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
             {
                 int anyMod = 0;
                 Tcl_Obj** rw = (Tcl_Obj**)Tcl_Alloc(twordsSz); /* same count, pointers same size */
-                for (int fi = 0; fi < p->numWords; fi++)
+                for (Tcl_Size fi = 0; fi < p->numWords; fi++)
                     rw[fi] = WordLiteralObj(twords[fi]);
                 /* Walk if structure:
                    word 0 = "if", word 1 = condition,
@@ -4515,7 +4547,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                 {
                     Tcl_DString ln;
                     Tcl_DStringInit(&ln);
-                    for (int fi2 = 0; fi2 < p->numWords; fi2++)
+                    for (Tcl_Size fi2 = 0; fi2 < p->numWords; fi2++)
                     {
                         if (rw[fi2])
                             Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(rw[fi2]));
@@ -4525,7 +4557,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                     Tcl_DStringFree(&ln);
                     *handled = 1;
                 }
-                for (int fi2 = 0; fi2 < p->numWords; fi2++)
+                for (Tcl_Size fi2 = 0; fi2 < p->numWords; fi2++)
                 {
                     if (rw[fi2])
                         Tcl_DecrRefCount(rw[fi2]);
@@ -4548,10 +4580,10 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
         {
             const Tcl_Token** twords = (const Tcl_Token**)Tcl_Alloc(trySz);
             twords[0] = w0;
-            for (int fi = 1; fi < p->numWords; fi++)
+            for (Tcl_Size fi = 1; fi < p->numWords; fi++)
                 twords[fi] = NextWord(twords[fi - 1]);
             /* Check that all words are literals */
-            for (int fi = 0; fi < p->numWords; fi++)
+            for (Tcl_Size fi = 0; fi < p->numWords; fi++)
             {
                 Tcl_Obj* probe = WordLiteralObj(twords[fi]);
                 if (!probe)
@@ -4565,7 +4597,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
             {
                 int anyMod = 0;
                 Tcl_Obj** rw = (Tcl_Obj**)Tcl_Alloc(trySz); /* same count, pointers same size */
-                for (int fi = 0; fi < p->numWords; fi++)
+                for (Tcl_Size fi = 0; fi < p->numWords; fi++)
                     rw[fi] = WordLiteralObj(twords[fi]);
                 /* Identify body positions and try to rewrite them.
                    Word 1 is the main try body.  Then walk handlers. */
@@ -4618,7 +4650,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                 {
                     Tcl_DString ln;
                     Tcl_DStringInit(&ln);
-                    for (int fi2 = 0; fi2 < p->numWords; fi2++)
+                    for (Tcl_Size fi2 = 0; fi2 < p->numWords; fi2++)
                     {
                         if (rw[fi2])
                             Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(rw[fi2]));
@@ -4628,7 +4660,7 @@ static int RewriteControlFlow(RewriteCtx* ctx, Tcl_Parse* p, const Tcl_Token* w0
                     Tcl_DStringFree(&ln);
                     *handled = 1;
                 }
-                for (int fi2 = 0; fi2 < p->numWords; fi2++)
+                for (Tcl_Size fi2 = 0; fi2 < p->numWords; fi2++)
                 {
                     if (rw[fi2])
                         Tcl_DecrRefCount(rw[fi2]);
@@ -4772,7 +4804,7 @@ static Tcl_Obj* CaptureAndRewriteScript(
                         Tcl_Obj* bodyObj = WordLiteralObj(w3);
                         if (nsObj && bodyObj)
                         {
-                            Tcl_Obj* nsFqn = FqnUnder(curNs, nsObj);
+                            Tcl_Obj* nsFqn = FqnUnder(ip, curNs, nsObj);
                             if (nsFqn)
                             {
                                 /* Recurse: single-pass capture+rewrite of inner body */
@@ -4894,7 +4926,7 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
         goto cleanup;
     }
     ByteCode* top = NULL;
-    ByteCodeGetInternalRep(srcCopy, tbcxTyBytecode, top);
+    top = TbcxGetByteCode(srcCopy);
     if (!top)
     {
         Tcl_SetObjResult(w->interp, Tcl_NewStringObj("tbcx: failed to get top bytecode", -1));
@@ -5018,7 +5050,12 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
         if (numClasses > 0)
         {
             /* Collect keys, sort, then emit for reproducibility */
-            const char** keys = (const char**)Tcl_Alloc(sizeof(const char*) * numClasses);
+            size_t keyBytes = 0;
+            if (!tbcx_checked_mul(sizeof(const char*), (size_t)numClasses, &keyBytes)) {
+                W_Error(w, "tbcx: class table too large");
+                goto done_classes;
+            }
+            const char** keys = (const char**)Tcl_Alloc(keyBytes);
             uint32_t ki = 0;
             for (h = Tcl_FirstHashEntry(&classes.ht, &srch); h; h = Tcl_NextHashEntry(&srch))
             {
@@ -5033,6 +5070,7 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
             }
             Tcl_Free((char*)keys);
         }
+done_classes: ;
     }
 
     /* 7. Methods section: emit captured OO methods/ctors/dtors */

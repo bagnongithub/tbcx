@@ -212,4 +212,235 @@ test adv.14 {memoized fibonacci} -body {
     tbcx::load $out
 } -result 6765
 
+# ---- Coroutines ----
+
+test adv.15 {coroutine: basic yield/resume} -body {
+    set out [makeFile "" adv.15-out.tbcx]
+    tbcx::save {
+        proc counter {} {
+            set i 0
+            while 1 {
+                yield $i
+                incr i
+            }
+        }
+        coroutine gen counter
+        set r [list [gen] [gen] [gen] [gen]]
+        rename gen {}
+        return $r
+    } $out
+    tbcx::load $out
+} -result {1 2 3 4}
+
+test adv.16 {coroutine: generator pattern} -body {
+    set out [makeFile "" adv.16-out.tbcx]
+    tbcx::save {
+        proc fibonacci {} {
+            set a 0; set b 1
+            while 1 {
+                yield $a
+                lassign [list $b [expr {$a + $b}]] a b
+            }
+        }
+        coroutine fib fibonacci
+        set r {}
+        for {set i 0} {$i < 8} {incr i} { lappend r [fib] }
+        rename fib {}
+        return $r
+    } $out
+    tbcx::load $out
+} -result {1 1 2 3 5 8 13 21}
+
+test adv.17 {coroutine: send values to coroutine} -body {
+    set out [makeFile "" adv.17-out.tbcx]
+    tbcx::save {
+        proc accumulator {} {
+            set total 0
+            while 1 {
+                set val [yield $total]
+                incr total $val
+            }
+        }
+        coroutine acc accumulator
+        acc 0 ;# prime (send 0 — yield returns this to incr)
+        acc 10
+        acc 20
+        set r [acc 5]
+        rename acc {}
+        return $r
+    } $out
+    tbcx::load $out
+} -result 35
+
+# ---- Tailcall ----
+
+test adv.18 {tailcall: basic} -body {
+    set out [makeFile "" adv.18-out.tbcx]
+    tbcx::save {
+        proc inner {x} { return [expr {$x * 2}] }
+        proc outer {x} { tailcall inner $x }
+        return [outer 21]
+    } $out
+    tbcx::load $out
+} -result 42
+
+test adv.19 {tailcall: recursive with tail optimization} -body {
+    set out [makeFile "" adv.19-out.tbcx]
+    tbcx::save {
+        proc tloop {n acc} {
+            if {$n <= 0} { return $acc }
+            tailcall tloop [expr {$n - 1}] [expr {$acc + $n}]
+        }
+        return [tloop 100 0]
+    } $out
+    tbcx::load $out
+} -result 5050
+
+# ---- Binary format/scan ----
+
+test adv.20 {binary: format and scan integers} -body {
+    set out [makeFile "" adv.20-out.tbcx]
+    tbcx::save {
+        set packed [binary format i2 {42 100}]
+        binary scan $packed i2 vals
+        return $vals
+    } $out
+    tbcx::load $out
+} -result {42 100}
+
+test adv.21 {binary: format and scan mixed types} -body {
+    set out [makeFile "" adv.21-out.tbcx]
+    tbcx::save {
+        set packed [binary format a5c hello 65]
+        binary scan $packed a5c str byte
+        return [list $str $byte]
+    } $out
+    tbcx::load $out
+} -result {hello 65}
+
+test adv.22 {binary: scan float} -body {
+    set out [makeFile "" adv.22-out.tbcx]
+    tbcx::save {
+        set packed [binary format d 3.14]
+        binary scan $packed d val
+        return [expr {abs($val - 3.14) < 1e-10}]
+    } $out
+    tbcx::load $out
+} -result 1
+
+# ---- Scoping: upvar, uplevel, global, variable ----
+
+test adv.23 {uplevel: run script in caller's frame} -body {
+    set out [makeFile "" adv.23-out.tbcx]
+    tbcx::save {
+        proc runup {script} { uplevel 1 $script }
+        set x 10
+        runup {set x [expr {$x * 2}]}
+        return $x
+    } $out
+    tbcx::load $out
+} -result 20
+
+test adv.24 {upvar: nested upvar chain} -body {
+    set out [makeFile "" adv.24-out.tbcx]
+    tbcx::save {
+        proc level2 {name} {
+            upvar 1 $name v
+            incr v 100
+        }
+        proc level1 {name} {
+            upvar 1 $name v
+            level2 v
+        }
+        set myvar 5
+        level1 myvar
+        return $myvar
+    } $out
+    tbcx::load $out
+} -result 105
+
+# ---- Info introspection ----
+
+test adv.25 {info: body and args after roundtrip} -body {
+    set out [makeFile "" adv.25-out.tbcx]
+    tbcx::save {
+        proc sample {a b {c 0}} { return [expr {$a + $b + $c}] }
+        set args [info args sample]
+        return [list [llength $args] [lindex $args 2]]
+    } $out
+    tbcx::load $out
+} -result {3 c}
+
+# ---- subst ----
+
+test adv.26 {subst: variable and command substitution} -body {
+    set out [makeFile "" adv.26-out.tbcx]
+    tbcx::save {
+        set who "World"
+        return [subst {Hello $who, 1+2=[expr {1+2}]}]
+    } $out
+    tbcx::load $out
+} -result {Hello World, 1+2=3}
+
+# ---- encoding ----
+
+test adv.27 {encoding: convertto and convertfrom} -body {
+    set out [makeFile "" adv.27-out.tbcx]
+    tbcx::save {
+        set utf8 [encoding convertto utf-8 "ABC"]
+        set back [encoding convertfrom utf-8 $utf8]
+        return $back
+    } $out
+    tbcx::load $out
+} -result ABC
+
+# ---- Complex patterns ----
+
+test adv.28 {complex: closure via namespace + apply} -body {
+    set out [makeFile "" adv.28-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            return [list {x} [format {expr {$x + %d}} $n]]
+        }
+        set add5 [make_adder 5]
+        set add10 [make_adder 10]
+        return [list [apply $add5 3] [apply $add10 3]]
+    } $out
+    tbcx::load $out
+} -result {8 13}
+
+test adv.29 {complex: dispatch table with procs} -body {
+    set out [makeFile "" adv.29-out.tbcx]
+    tbcx::save {
+        proc op_add {a b} { expr {$a + $b} }
+        proc op_mul {a b} { expr {$a * $b} }
+        proc op_sub {a b} { expr {$a - $b} }
+        proc dispatch {op a b} {
+            set cmd "op_$op"
+            $cmd $a $b
+        }
+        return [list [dispatch add 3 4] [dispatch mul 3 4] [dispatch sub 10 3]]
+    } $out
+    tbcx::load $out
+} -result {7 12 7}
+
+test adv.30 {complex: data pipeline with list/dict ops} -body {
+    set out [makeFile "" adv.30-out.tbcx]
+    tbcx::save {
+        set data {
+            {name Alice age 30 score 85}
+            {name Bob age 25 score 92}
+            {name Carol age 35 score 78}
+        }
+        set total 0
+        set count 0
+        foreach record $data {
+            incr total [dict get $record score]
+            incr count
+        }
+        return [expr {$total / $count}]
+    } $out
+    tbcx::load $out
+} -result 85
+
 cleanupTests

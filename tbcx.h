@@ -206,6 +206,28 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_
     return p;
 }
 
+/* Validate a key string for use with namespace/hash APIs.
+ * Rejects embedded NULs and optionally requires absolute namespace form.
+ * Returns TCL_OK on success, TCL_ERROR with interp result set on failure. */
+static inline int
+Tbcx_ValidateKeyString(Tcl_Interp *ip, const char *s, Tcl_Size len,
+                       const char *what, int requireAbsoluteNs)
+{
+    if (!s) {
+        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing %s", what));
+        return TCL_ERROR;
+    }
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL) {
+        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
+        return TCL_ERROR;
+    }
+    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':')) {
+        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
 /* Maximum length of generated shim command names (oo::define rename targets).
  * Must accommodate "::tbcx::__oo_objdef_orig_NNNN__" with generous room. */
 #define TBCX_OSHIM_NAME_MAX 80
@@ -214,6 +236,51 @@ extern const Tcl_ObjType* tbcxTyBignum;
 extern const Tcl_ObjType* tbcxTyBoolean;
 extern const Tcl_ObjType* tbcxTyByteArray;
 extern const Tcl_ObjType* tbcxTyBytecode;
+
+/* TbcxGetByteCode — extract ByteCode* from a Tcl_Obj using the runtime
+ * type pointer (tbcxTyBytecode), NOT the compile-time &tclByteCodeType.
+ *
+ * ByteCodeGetInternalRep (from tclCompile.h) uses &tclByteCodeType, which
+ * is resolved at LINK time.  In stubs-linked extensions (especially on
+ * macOS with two-level namespace), this symbol may resolve to a different
+ * address than what Tcl_GetObjType("bytecode") returns at RUNTIME.  When
+ * they differ, ByteCodeGetInternalRep silently returns NULL, causing all
+ * procPtr/epoch fixups to be skipped — leading to crashes on coroutine
+ * yield/resume (procPtr=NULL, SIGSEGV at offset 0x30). */
+static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
+{
+    const Tcl_ObjInternalRep* irPtr = Tcl_FetchInternalRep(objPtr, tbcxTyBytecode);
+    return irPtr ? (ByteCode*)irPtr->twoPtrValue.ptr1 : NULL;
+}
+
+/* ---- Tcl-internal API audit (proposal #1) ----
+ *
+ * The following Tcl-internal symbols are used through the STUBS TABLE
+ * (tclIntDecls.h) and resolve at RUNTIME through function pointers.
+ * They are safe in stubs-linked builds — unlike compile-time macros:
+ *
+ *   TclHandlePreserve, TclHandleRelease  — interp handle management
+ *   TclRenameCommand                     — shim installation/removal
+ *   TclUpdateReturnInfo                  — TCL_RETURN handling
+ *   TclProcDeleteProc                    — proc cleanup
+ *   TclSetByteCodeFromAny                — force compilation
+ *   TclGetAuxDataType                    — aux data type lookup
+ *   TclBN_mp_*                           — bignum operations
+ *
+ * The ONE symbol that was NOT safe was ByteCodeGetInternalRep — a
+ * compile-time MACRO that resolved &tclByteCodeType at link time.
+ * It has been fully replaced by TbcxGetByteCode() above.
+ *
+ * Struct field access (Interp*, Command*, Proc*, ByteCode*, etc.) is
+ * unavoidable — TBCX must manipulate Tcl internals by design.  These
+ * are stable across Tcl 9.1.x patch releases.  Any Tcl 9.2+ migration
+ * should audit these fields against the new tclInt.h.
+ */
+
+/* Flags for TbcxFixupByteCode cache handling strategy. */
+#define TBCX_FIXUP_CACHE_KEEP   0  /* Preserve + fix LocalCache (methods, lambdas) */
+#define TBCX_FIXUP_CACHE_DROP   1  /* NULL out LocalCache (procs — Tcl rebuilds) */
+#define TBCX_FIXUP_CACHE_NONE   2  /* Don't touch LocalCache */
 extern const Tcl_ObjType* tbcxTyDict;
 extern const Tcl_ObjType* tbcxTyDouble;
 extern const Tcl_ObjType* tbcxTyInt;
@@ -254,7 +321,7 @@ typedef struct
  * Forward Declarations
  * ========================================================================== */
 
-int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, int* numArgsOut);
+int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, Tcl_Size* numArgsOut);
 int Tbcx_CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch);
 Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
 void Tbcx_FreeLocals(CompiledLocal* first);
@@ -276,5 +343,35 @@ Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* num
 int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
 
 void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
+
+/* Proposal #3: Centralized ByteCode fixup.
+ * Links a ByteCode to its Proc, refreshes epochs, propagates procPtr to
+ * literal-pool bytecodes, and handles LocalCache per the cacheMode flag.
+ * Every code path that sets bc->procPtr should use this instead of
+ * calling RefreshBC + FixLiteralPoolProcPtr + TbcxFixLocalCacheExtras
+ * individually — prevents forgetting a step. */
+void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
+                        Namespace* ns, int cacheMode);
+
+/* Proposal #2: Pre-warm literal pool entries by JIT-compiling string
+ * literals inside a proc body's ByteCode.  This ensures inner bodies
+ * (while/for/foreach/try) get compiled with the correct procPtr BEFORE
+ * execution, preventing SIGSEGV on coroutine yield/resume when Tcl
+ * lazily compiles them with procPtr=NULL.
+ *
+ * Thread safety: must be called from the interp-owning thread.
+ * The function temporarily sets iPtr->compiledProcPtr and restores it. */
+void TbcxPrewarmLiterals(ByteCode* bc, Proc* proc, Tcl_Interp* ip);
+
+/* Proposal #4: Post-load verification pass.
+ * Walks all ByteCode objects reachable from topBC and verifies invariants:
+ *   - procPtr is non-NULL on proc/method/lambda bodies
+ *   - PRECOMPILED flag is set
+ *   - interpHandle matches the loading interp
+ * Returns TCL_OK if all checks pass, TCL_ERROR with diagnostic in interp
+ * result if a violation is found.  Call after LoadTbcxStream execution
+ * but before returning to the caller.
+ * In release builds, violations are logged but don't abort the load. */
+int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label);
 
 #endif

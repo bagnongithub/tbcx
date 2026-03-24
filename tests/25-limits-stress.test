@@ -1,0 +1,261 @@
+# -*-Tcl-*-
+# 25-limits-stress.test — Boundary and stress tests for TBCX
+#
+# These tests exercise near-limit scenarios for allocations, large
+# literal pools, many procs/methods, large bytecode blocks, and
+# concurrent multi-interp usage.  They verify that the checked-multiply
+# guards (Finding 5) and Tcl_Size conversions (Finding 4) hold under
+# non-trivial workloads.
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# =====================================================================
+# Large literal pool
+# =====================================================================
+
+test lim.1 {limits: 500 distinct string literals} -body {
+    set script ""
+    for {set i 0} {$i < 500} {incr i} {
+        append script "set s$i \"string_literal_$i\"\n"
+    }
+    append script "return \$s499"
+    set out [makeFile "" lim.1-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result string_literal_499
+
+test lim.2 {limits: 200 distinct integer literals} -body {
+    set script ""
+    for {set i 0} {$i < 200} {incr i} {
+        append script "set n$i [expr {$i * 17 + 3}]\n"
+    }
+    append script "return \[expr \{\$n0 + \$n199\}\]"
+    set out [makeFile "" lim.2-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result [expr {3 + (199*17+3)}]
+
+test lim.3 {limits: 100 double literals} -body {
+    set script ""
+    for {set i 0} {$i < 100} {incr i} {
+        set val [expr {$i * 0.123456789}]
+        append script "set d$i $val\n"
+    }
+    append script "return \[expr \{\$d99 > 0\}\]"
+    set out [makeFile "" lim.3-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 1
+
+
+# =====================================================================
+# Many procs
+# =====================================================================
+
+test lim.4 {limits: 100 procs in one file} -body {
+    set script ""
+    for {set i 0} {$i < 100} {incr i} {
+        append script "proc lp$i {} { return $i }\n"
+    }
+    append script "return \[list \[lp0\] \[lp50\] \[lp99\]\]"
+    set out [makeFile "" lim.4-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {0 50 99}
+
+test lim.5 {limits: 50 procs each in different namespace} -body {
+    set script ""
+    for {set i 0} {$i < 50} {incr i} {
+        append script "namespace eval ::limns$i { proc f {} { return $i } }\n"
+    }
+    append script "return \[list \[::limns0::f\] \[::limns25::f\] \[::limns49::f\]\]"
+    set out [makeFile "" lim.5-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {0 25 49}
+
+
+# =====================================================================
+# Many OO classes and methods
+# =====================================================================
+
+test lim.6 {limits: 30 classes with 3 methods each} -body {
+    set script ""
+    for {set i 0} {$i < 30} {incr i} {
+        append script "oo::class create ::lc$i\n"
+        append script "oo::define ::lc$i {\n"
+        append script "    method a {} { return a$i }\n"
+        append script "    method b {} { return b$i }\n"
+        append script "    method c {} { return c$i }\n"
+        append script "}\n"
+    }
+    append script "set o \[::lc15 new\]\n"
+    append script "return \[list \[\$o a\] \[\$o b\] \[\$o c\]\]"
+    set out [makeFile "" lim.6-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {a15 b15 c15}
+
+test lim.7 {limits: class with 20 methods} -body {
+    set script "oo::class create ::BigClass\noo::define ::BigClass {\n"
+    for {set i 0} {$i < 20} {incr i} {
+        append script "    method m$i {} { return $i }\n"
+    }
+    append script "}\n"
+    append script "set o \[::BigClass new\]\n"
+    append script "return \[list \[\$o m0\] \[\$o m10\] \[\$o m19\]\]"
+    set out [makeFile "" lim.7-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result {0 10 19}
+
+
+# =====================================================================
+# Large bytecode blocks
+# =====================================================================
+
+test lim.8 {limits: proc with large body (1000 statements)} -body {
+    set body ""
+    for {set i 0} {$i < 1000} {incr i} {
+        append body "set v $i\n"
+    }
+    append body "return \$v"
+    set script "proc bigbody {} \{$body\}\nreturn \[bigbody\]"
+    set out [makeFile "" lim.8-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result 999
+
+test lim.9 {limits: deeply nested control flow} -body {
+    # 20 levels of nested if
+    set script "proc nested {x} \{\n"
+    for {set i 0} {$i < 20} {incr i} {
+        append script [string repeat "    " $i]
+        append script "if \{\$x > $i\} \{\n"
+    }
+    append script [string repeat "    " 20]
+    append script "return deep\n"
+    for {set i 19} {$i >= 0} {incr i -1} {
+        append script [string repeat "    " $i]
+        append script "\}\n"
+    }
+    append script "return shallow\n\}\n"
+    append script "return \[nested 25\]"
+    set out [makeFile "" lim.9-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result deep
+
+
+# =====================================================================
+# Large strings and bytearrays
+# =====================================================================
+
+test lim.10 {limits: 100KB string literal} -body {
+    set bigstr [string repeat "abcdefghij" 10000]
+    set out [makeFile "" lim.10-out.tbcx]
+    tbcx::save [list return $bigstr] $out
+    set r [tbcx::load $out]
+    expr {[string length $r] == 100000 && $r eq $bigstr}
+} -result 1
+
+test lim.11 {limits: 50KB bytearray} -body {
+    set out [makeFile "" lim.11-out.tbcx]
+    set bytes ""
+    for {set i 0} {$i < 50000} {incr i} {
+        append bytes [format %c [expr {$i % 256}]]
+    }
+    set script "return \[binary format a* [list $bytes]\]"
+    tbcx::save $script $out
+    set r [tbcx::load $out]
+    expr {[string length $r] == 50000}
+} -result 1
+
+
+# =====================================================================
+# Multi-interp concurrent-like stress
+# =====================================================================
+
+test lim.12 {limits: 10 child interps load same file} -body {
+    set out [makeFile "" lim.12-out.tbcx]
+    tbcx::save {
+        proc shared_fn {x} { expr {$x * $x} }
+        return [shared_fn 7]
+    } $out
+    set results {}
+    for {set i 0} {$i < 10} {incr i} {
+        set ci [interp create]
+        interp eval $ci {package require tbcx}
+        lappend results [interp eval $ci [list tbcx::load $out]]
+        interp delete $ci
+    }
+    # All 10 should produce 49
+    set ok 1
+    foreach r $results {
+        if {$r != 49} { set ok 0 }
+    }
+    set ok
+} -result 1
+
+test lim.13 {limits: different scripts in different interps} -body {
+    set results {}
+    for {set i 0} {$i < 5} {incr i} {
+        set out [makeFile "" lim.13-$i-out.tbcx]
+        set val [expr {$i * 100 + 7}]
+        tbcx::save "return $val" $out
+        set ci [interp create]
+        interp eval $ci {package require tbcx}
+        lappend results [interp eval $ci [list tbcx::load $out]]
+        interp delete $ci
+    }
+    set results
+} -result {7 107 207 307 407}
+
+
+# =====================================================================
+# Large jump tables (Finding 5 - checked multiply)
+# =====================================================================
+
+test lim.14 {limits: switch with 200 string cases} -body {
+    set cases ""
+    for {set i 0} {$i < 200} {incr i} {
+        append cases "item$i { set r found_$i } "
+    }
+    set script "proc bigjt {k} { switch -exact -- \$k { $cases } ; return \$r }\n"
+    append script "return \[bigjt item150\]"
+    set out [makeFile "" lim.14-out.tbcx]
+    tbcx::save $script $out
+    tbcx::load $out
+} -result found_150
+
+
+# =====================================================================
+# Roundtrip determinism under repeated save/load
+# =====================================================================
+
+test lim.15 {limits: repeated save/load of same complex script} -body {
+    set script {
+        namespace eval ::rt {
+            variable state {}
+            proc push {v} { variable state; lappend state $v }
+            proc dump {} { variable state; return $state }
+        }
+        ::rt::push alpha
+        ::rt::push beta
+        ::rt::push gamma
+        return [::rt::dump]
+    }
+    set ok 1
+    for {set i 0} {$i < 5} {incr i} {
+        set out [makeFile "" lim.15-$i-out.tbcx]
+        tbcx::save $script $out
+        set r [tbcx::load $out]
+        if {$r ne "alpha beta gamma"} { set ok 0 }
+    }
+    set ok
+} -result 1
+
+
+cleanupTests

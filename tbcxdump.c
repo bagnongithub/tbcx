@@ -350,7 +350,11 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
     else if (tbcxTyBoolean && tbcxTyBoolean != tbcxTyInt && ty == tbcxTyBoolean)
     {
         int b = 0;
-        Tcl_GetBooleanFromObj(NULL, lit, &b);
+        if (Tcl_GetBooleanFromObj(NULL, lit, &b) != TCL_OK)
+        {
+            Tcl_AppendToObj(dst, "(boolean:invalid)", -1);
+            return TCL_OK;
+        }
         Tcl_AppendPrintfToObj(dst, "(boolean) %s", b ? "true" : "false");
         return TCL_OK;
     }
@@ -380,7 +384,11 @@ static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
     else if (ty == tbcxTyDouble)
     {
         double d = 0;
-        Tcl_GetDoubleFromObj(NULL, lit, &d);
+        if (Tcl_GetDoubleFromObj(NULL, lit, &d) != TCL_OK)
+        {
+            Tcl_AppendToObj(dst, "(double:invalid)", -1);
+            return TCL_OK;
+        }
         Tcl_AppendPrintfToObj(dst, "(double) %.17g", d);
         return TCL_OK;
     }
@@ -614,7 +622,7 @@ static void DumpBCDetails(Tcl_Obj* bcObj, Tcl_Obj* dst)
     if (!bcObj)
         return;
     ByteCode* bc = NULL;
-    ByteCodeGetInternalRep(bcObj, tbcxTyBytecode, bc);
+    bc = TbcxGetByteCode(bcObj);
     if (!bc)
         return;
 
@@ -646,7 +654,7 @@ static void DisassembleBCObj(Tcl_Obj* bcObj, Tcl_Obj* dst, const char* title)
     if (!bcObj)
         return;
     ByteCode* bcPtr = NULL;
-    ByteCodeGetInternalRep(bcObj, tbcxTyBytecode, bcPtr);
+    bcPtr = TbcxGetByteCode(bcObj);
     TbcxDisassembleCode(bcPtr, dst, title);
 }
 

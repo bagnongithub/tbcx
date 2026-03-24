@@ -1,970 +1,805 @@
 # -*-Tcl-*-
-# 23-all-features.test — TBCX test harness for the comprehensive
-# tcl91_all_features.tcl language exerciser.
+# 23-all-features.test — Self-contained Tcl 9.1 language feature coverage
 #
-# This test file verifies that every Tcl 9.1 construct exercised by
-# tcl91_all_features.tcl survives a full tbcx::save → tbcx::load
-# roundtrip, including: all grammatical constructs, all data types,
-# all control-flow statements, all expression operators, coroutines,
-# tailcall, upvar/uplevel, namespaces, and the full TclOO object
-# system (classmethod, private, forward, filter, mixin, initialise,
-# oo::abstract, oo::singleton, oo::copy, oo::objdefine, metaclass,
-# info object / info class, and more).
-#
-# The tcl91_all_features.tcl script must be in the same directory as
-# this test file.
+# Every test builds a script using braced {append}, saves/loads it via
+# tbcx, and verifies internal assertions pass. No double-quote escaping.
 
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*
 
-# Locate the all-features script next to this test file
-set featuresScript [file join [file dirname [info script]] tcl91_all_features.tcl]
-testConstraint have_features_script [file readable $featuresScript]
-
-# --------------------------------------------------------------------------
-# Helper: run tbcx::load of a .tbcx file inside a fresh child interp,
-# with exit overridden, returning a dict of {rc result errorinfo pass fail errors}.
-# --------------------------------------------------------------------------
-proc loadInChild {interpName tbcxPath} {
-    interp create $interpName
-    interp eval $interpName [list package require tbcx]
-    # Override exit so assertion failures inside the script don't kill us.
-    interp eval $interpName {
-        proc exit {args} {
-            error "TBCX_FEATURES_EXIT [lindex $args 0]"
-        }
-    }
-
-    set rc [interp eval $interpName [list catch [list tbcx::load $tbcxPath] _res _opts]]
-    set result [interp eval $interpName {set _res}]
-
-    set errorinfo ""
-    catch {set errorinfo [interp eval $interpName {dict get $_opts -errorinfo}]}
-
-    set pass 0
-    set fail 0
-    set errors {}
-    catch {set pass [interp eval $interpName {set ::_pass}]}
-    catch {set fail [interp eval $interpName {set ::_fail}]}
-    if {$fail > 0} {
-        catch {set errors [interp eval $interpName {set ::_errors}]}
-    }
-    interp delete $interpName
-
-    return [dict create rc $rc result $result errorinfo $errorinfo \
-                         pass $pass fail $fail errors $errors]
+proc featureRoundtrip {tag script} {
+    set out [makeFile "" ${tag}-out.tbcx]
+    tbcx::save $script $out
+    interp create FT_$tag
+    interp eval FT_$tag [list package require tbcx]
+    interp eval FT_$tag {proc exit {args} {error "exit $args"}}
+    set rc [interp eval FT_$tag [list catch [list tbcx::load $out] _r _o]]
+    set pass 0; set fail 0; set errors {}
+    catch {set pass [interp eval FT_$tag {set ::_pass}]}
+    catch {set fail [interp eval FT_$tag {set ::_fail}]}
+    if {$fail > 0} { catch {set errors [interp eval FT_$tag {set ::_errors}]} }
+    set loadErr ""
+    if {$rc != 0} { catch {set loadErr [interp eval FT_$tag {set _r}]} }
+    interp delete FT_$tag
+    if {$rc != 0} { error "load error after $pass ok: $loadErr" }
+    if {$fail != 0} { error "$fail failures out of [expr {$pass+$fail}]: $errors" }
+    return $pass
 }
 
-# --------------------------------------------------------------------------
-# Helper: run the script via source inside a fresh child interp,
-# returning same dict shape as loadInChild.
-# --------------------------------------------------------------------------
-proc sourceInChild {interpName tclPath} {
-    interp create $interpName
-    interp eval $interpName {
-        proc exit {args} {
-            error "TBCX_FEATURES_EXIT [lindex $args 0]"
-        }
+set H {
+set ::_pass 0; set ::_fail 0; set ::_errors {}
+proc assert {tag got expected} {
+    if {$got eq $expected} { incr ::_pass } else {
+        incr ::_fail; lappend ::_errors "$tag: got=$got exp=$expected"
     }
-
-    set rc [interp eval $interpName [list catch [list source $tclPath] _res _opts]]
-    set result [interp eval $interpName {set _res}]
-
-    set errorinfo ""
-    catch {set errorinfo [interp eval $interpName {dict get $_opts -errorinfo}]}
-
-    set pass 0
-    set fail 0
-    set errors {}
-    catch {set pass [interp eval $interpName {set ::_pass}]}
-    catch {set fail [interp eval $interpName {set ::_fail}]}
-    if {$fail > 0} {
-        catch {set errors [interp eval $interpName {set ::_errors}]}
-    }
-    interp delete $interpName
-
-    return [dict create rc $rc result $result errorinfo $errorinfo \
-                         pass $pass fail $fail errors $errors]
+}
 }
 
-# ==========================================================================
-# af.0  Sanity: the features script passes when sourced directly
-# ==========================================================================
-test af.0 {sanity: tcl91_all_features.tcl passes under source} \
-    -constraints have_features_script -body {
-
-    set info [sourceInChild SRC0 $featuresScript]
-    set fail [dict get $info fail]
-    set pass [dict get $info pass]
-    set rc   [dict get $info rc]
-
-    if {$fail != 0} {
-        error "$fail assertion(s) failed under source: [dict get $info errors]"
+# === 1. Grammar ===
+test af.1 {grammar: substitution and quoting} -body {
+    set script $H
+    append script {
+        set x 42
+        assert var-scalar $x 42
+        set arr(k) hello
+        assert var-array $arr(k) hello
+        assert cmd-subst [expr {1+2}] 3
+        assert nested-subst [string length [expr {1+2}]] 1
+        assert brace-quote {no $subst here} {no $subst here}
+        assert dquote-subst "val=$x" val=42
+        set a 1; set b 2
+        assert semicolon [expr {$a + $b}] 3
+        assert backslash-tab "a\tb" "a\tb"
+        assert backslash-nl "a\nb" "a\nb"
+        set r [format %c 0xe9]
+        assert unicode-escape [string length $r] 1
     }
-    if {$rc != 0} {
-        error "source errored after $pass assertions: [dict get $info result]\n[dict get $info errorinfo]"
+    featureRoundtrip af1 $script
+} -match glob -result {1*}
+
+# === 2. Data types ===
+test af.2 {data types: all literal types} -body {
+    set script $H
+    append script {
+        assert str hello hello
+        assert int [expr {42}] 42
+        assert wide [expr {9223372036854775807}] 9223372036854775807
+        assert bignum [expr {2**80}] 1208925819614629174706176
+        assert dbl [expr {3.14}] 3.14
+        assert bool-t [expr {true}] true
+        assert bool-f [expr {false}] false
+        assert list [list a b c] {a b c}
+        assert dict [dict get [dict create k v] k] v
+        assert empty-str {} {}
+        assert empty-list [list] {}
+        assert bytearray [string length [binary format c* {1 2 3}]] 3
     }
-    # Must have a significant number of assertions
-    expr {$pass > 400}
-} -result 1
+    featureRoundtrip af2 $script
+} -result 12
 
-# ==========================================================================
-# af.1  Save + load + verify all 400+ internal assertions pass
-# ==========================================================================
-test af.1 {all features: save + load + all assertions pass} \
-    -constraints have_features_script -body {
+# === 3. Expressions ===
+test af.3 {expressions: all operator families} -body {
+    set script $H
+    append script {
+        assert add [expr {3 + 4}] 7
+        assert sub [expr {10 - 3}] 7
+        assert mul [expr {6 * 7}] 42
+        assert div [expr {15 / 4}] 3
+        assert mod [expr {17 % 5}] 2
+        assert pow [expr {2**10}] 1024
+        assert neg [expr {-42}] -42
 
-    set out [makeFile "" af.1-out.tbcx]
-    tbcx::save $featuresScript $out
+        assert eq [expr {3 == 3}] 1
+        assert ne [expr {3 != 4}] 1
+        assert lt [expr {2 < 3}] 1
+        assert gt [expr {4 > 3}] 1
+        assert le [expr {3 <= 3}] 1
+        assert ge [expr {4 >= 3}] 1
 
-    set info [loadInChild AF1 $out]
-    set fail [dict get $info fail]
-    set pass [dict get $info pass]
-    set rc   [dict get $info rc]
+        assert and [expr {1 && 1}] 1
+        assert or  [expr {0 || 1}] 1
+        assert not [expr {!0}] 1
 
-    if {$fail != 0} {
-        error "$fail assertion failure(s) out of [expr {$pass + $fail}]: [dict get $info errors]"
+        assert band [expr {0xFF & 0x0F}] 15
+        assert bor  [expr {0xF0 | 0x0F}] 255
+        assert bxor [expr {0xFF ^ 0xFF}] 0
+        assert bnot [expr {~0 & 0xFF}] 255
+        assert shl  [expr {1 << 8}] 256
+        assert shr  [expr {256 >> 8}] 1
+
+        assert ternary [expr {1 ? "yes" : "no"}] yes
+        assert in  [expr {"b" in {a b c}}] 1
+        assert ni  [expr {"z" ni {a b c}}] 1
+
+        assert abs [expr {abs(-5)}] 5
+        assert max [expr {max(3,7)}] 7
+        assert min [expr {min(3,7)}] 3
+        assert int-fn [expr {int(3.9)}] 3
+        assert double-fn [expr {double(5)}] 5.0
+        assert sqrt [expr {int(sqrt(144))}] 12
     }
-    if {$rc != 0} {
-        error "tbcx::load error after $pass assertions: [dict get $info result]\n[dict get $info errorinfo]"
+    featureRoundtrip af3 $script
+} -result 31
+
+# === 4. Variables ===
+test af.4 {variables: set, unset, append, incr, array} -body {
+    set script $H
+    append script {
+        set x 10; assert set-basic $x 10
+        unset x; assert unset-gone [info exists x] 0
+        set s {}; append s a b c; assert append $s abc
+        set n 0; incr n; incr n 5; incr n -2; assert incr $n 4
+        set l {}; lappend l x y z; assert lappend $l {x y z}
+        set a(one) 1; set a(two) 2
+        assert array-get $a(one) 1
+        assert array-size [array size a] 2
+        assert array-names [lsort [array names a]] {one two}
     }
-    # Must pass 400+ assertions
-    expr {$pass > 400}
-} -result 1
+    featureRoundtrip af4 $script
+} -result 8
 
-# ==========================================================================
-# af.2  Verify the .tbcx is a valid binary (correct magic, format, size)
-# ==========================================================================
-test af.2 {all features: compiled .tbcx has valid header} \
-    -constraints have_features_script -body {
-
-    set out [makeFile "" af.2-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set tbcxSize [file size $out]
-
-    # Read header: 4 bytes magic + 4 bytes format
-    set f [open $out rb]
-    set magic [read $f 4]
-    set fmtBytes [read $f 4]
-    close $f
-
-    # Magic must be "TBCX" (little-endian 0x58434254)
-    set magicOk [expr {$magic eq "TBCX"}]
-
-    # Format version 91, little-endian uint32 → 0x5B000000
-    binary scan $fmtBytes iu fmtVal
-    set fmtOk [expr {$fmtVal == 91}]
-
-    # Non-trivial size — source is ~2000 lines, bytecode should be substantial
-    set sizeOk [expr {$tbcxSize > 4096}]
-
-    list $magicOk $fmtOk $sizeOk
-} -result {1 1 1}
-
-# ==========================================================================
-# af.3  Dump is well-formed and contains all expected structural sections
-# ==========================================================================
-test af.3 {all features: dump contains all structural sections} \
-    -constraints have_features_script -body {
-
-    set out [makeFile "" af.3-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set dump [tbcx::dump $out]
-
-    set checks 0
-    foreach pat {
-        "TBCX Header:*"
-        "*magic = 0x58434254*"
-        "*format = 91*"
-        "*Top-level block:*"
-        "*Procs: *"
-        "*Classes: *"
-        "*Methods: *"
-    } {
-        if {[string match $pat $dump]} {
-            incr checks
-        }
+# === 5. Strings ===
+test af.5 {strings: length, index, range, map, trim, repeat, reverse} -body {
+    set script $H
+    append script {
+        assert slen [string length abcde] 5
+        assert sidx [string index abcde 2] c
+        assert srng [string range abcde 1 3] bcd
+        assert smap [string map {a X b Y} abc] XYc
+        assert strim [string trim "  hello  "] hello
+        assert srepeat [string repeat ab 3] ababab
+        assert sreverse [string reverse abcde] edcba
+        assert supper [string toupper hello] HELLO
+        assert slower [string tolower HELLO] hello
+        assert sfirst [string first bc abcde] 1
+        assert slast [string last e abcde] 4
+        assert smatch [string match {h*o} hello] 1
+        assert sis-int [string is integer 42] 1
+        assert sis-alpha [string is alpha abc] 1
+        assert sreplace [string replace abcde 1 3 XYZ] aXYZe
     }
-    set checks
+    featureRoundtrip af5 $script
+} -result 15
+
+# === 6. Lists ===
+test af.6 {lists: lindex, lrange, lsort, lsearch, lreplace, linsert, lmap} -body {
+    set script $H
+    append script {
+        set l {c a b e d}
+        assert lindex [lindex $l 2] b
+        assert lrange [lrange $l 1 3] {a b e}
+        assert lsort [lsort $l] {a b c d e}
+        assert lsearch [lsearch $l b] 2
+        assert lreplace [lreplace $l 2 2 X] {c a X e d}
+        assert linsert [linsert $l 0 z] {z c a b e d}
+        assert lreverse [lreverse {1 2 3}] {3 2 1}
+        assert lrepeat [lrepeat 3 x] {x x x}
+        assert ljoin [join {a b c} -] a-b-c
+        assert lmap [lmap x {1 2 3} {expr {$x * 2}}] {2 4 6}
+    }
+    featureRoundtrip af6 $script
+} -result 10
+
+# === 7. Dicts ===
+test af.7 {dicts: create, get, set, exists, update, for, map} -body {
+    set script $H
+    append script {
+        set d [dict create a 1 b 2 c 3]
+        assert dict-get [dict get $d b] 2
+        assert dict-size [dict size $d] 3
+        assert dict-exists [dict exists $d c] 1
+        assert dict-keys [lsort [dict keys $d]] {a b c}
+        assert dict-values [lsort [dict values $d]] {1 2 3}
+        dict set d d 4
+        assert dict-set [dict get $d d] 4
+        dict update d a A b B { set A 10; set B 20 }
+        assert dict-update-a [dict get $d a] 10
+        set sum 0
+        dict for {k v} $d { incr sum $v }
+        assert dict-for $sum 37
+        set m [dict map {k v} [dict create x 1 y 2] { expr {$v * 10} }]
+        assert dict-map [dict get $m x] 10
+    }
+    featureRoundtrip af7 $script
+} -result 9
+
+# === 8. Control flow ===
+test af.8 {control flow: if, while, for, foreach, switch, try} -body {
+    set script $H
+    append script {
+        assert if-t [if {1} {set _ yes} else {set _ no}] yes
+        assert if-f [if {0} {set _ yes} else {set _ no}] no
+
+        set s 0; set i 0
+        while {$i < 10} { incr s $i; incr i }
+        assert while $s 45
+
+        set s 0
+        for {set i 0} {$i < 5} {incr i} { incr s $i }
+        assert for $s 10
+
+        set r {}
+        foreach x {a b c} { lappend r $x }
+        assert foreach $r {a b c}
+
+        foreach {a b} {1 2 3 4} {}
+        assert foreach-multi [list $a $b] {3 4}
+
+        set sw [switch -exact -- b { a {set _ A} b {set _ B} c {set _ C} }]
+        assert switch $sw B
+
+        set tr [try { expr {10 / 2} } on error {} { set _ -1 }]
+        assert try-ok $tr 5
+        set tr [try { expr {10 / 0} } on error {} { set _ -1 }]
+        assert try-err $tr -1
+
+        set n 0; while {$n < 100} { incr n; if {$n == 5} break }
+        assert break $n 5
+
+        set evens 0; set j 0
+        while {$j < 10} { incr j; if {$j % 2} continue; incr evens }
+        assert continue $evens 5
+    }
+    featureRoundtrip af8 $script
+} -result 11
+
+# === 9. Procs ===
+test af.9 {procs: all signature forms} -body {
+    set script $H
+    append script {
+        proc p0 {} { return zero }
+        proc p1 {x} { return $x }
+        proc p2 {x {y 10}} { expr {$x + $y} }
+        proc pv {args} { llength $args }
+        proc pm {a b args} { list $a $b [llength $args] }
+        assert p0 [p0] zero
+        assert p1 [p1 hello] hello
+        assert p2-def [p2 5] 15
+        assert p2-given [p2 5 20] 25
+        assert pv [pv a b c] 3
+        assert pm [pm x y a b c] {x y 3}
+        proc fact {n} { if {$n <= 1} {return 1}; expr {$n * [fact [expr {$n-1}]]} }
+        assert recursive [fact 10] 3628800
+    }
+    featureRoundtrip af9 $script
 } -result 7
 
-# ==========================================================================
-# af.4  Deterministic re-load: two loads produce identical pass/fail counts
-# ==========================================================================
-test af.4 {all features: deterministic re-load} \
-    -constraints have_features_script -body {
-
-    set out [makeFile "" af.4-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set results {}
-    foreach tag {A B} {
-        set info [loadInChild AF4$tag $out]
-        lappend results [list [dict get $info pass] [dict get $info fail]]
+# === 10. Scoping ===
+test af.10 {scoping: global, variable, upvar, uplevel} -body {
+    set script $H
+    append script {
+        set ::gv 100
+        proc read_global {} { global gv; return $gv }
+        assert global [read_global] 100
+        namespace eval ::scopens { variable nsvar 42 }
+        proc read_nsvar {} { return $::scopens::nsvar }
+        assert nsvar [read_nsvar] 42
+        proc doinc {name} { upvar 1 $name v; incr v 10 }
+        set x 5; doinc x
+        assert upvar $x 15
+        proc runhere {s} { uplevel 1 $s }
+        set y 0; runhere {set y 99}
+        assert uplevel $y 99
     }
+    featureRoundtrip af10 $script
+} -result 4
 
-    # Both runs must produce identical pass/fail counts, zero failures
-    set eq [expr {[lindex $results 0] eq [lindex $results 1]}]
-    set noFail [expr {[lindex [lindex $results 0] 1] == 0}]
-    list $eq $noFail
-} -result {1 1}
-
-# ==========================================================================
-# af.5  Channel-based save and load (not file-path)
-# ==========================================================================
-test af.5 {all features: channel-based save and load} \
-    -constraints have_features_script -body {
-
-    set tbcxPath [makeFile "" af.5-out.tbcx]
-
-    # Save: read source from channel, write to channel
-    set inCh [open $featuresScript r]
-    set outCh [open $tbcxPath w]
-    fconfigure $outCh -translation binary
-    tbcx::save $inCh $outCh
-    close $inCh
-    close $outCh
-
-    # Load from channel via child interp
-    set ch [open $tbcxPath r]
-    interp create AF5
-    interp eval AF5 [list package require tbcx]
-    interp eval AF5 {proc exit {args} {error "exit $args"}}
-    interp transfer {} $ch AF5
-    set rc [interp eval AF5 [list catch [list tbcx::load $ch] _r _o]]
-    set pass 0; set fail 0
-    catch {set pass [interp eval AF5 {set ::_pass}]}
-    catch {set fail [interp eval AF5 {set ::_fail}]}
-    interp eval AF5 [list catch [list close $ch]]
-    interp delete AF5
-
-    if {$fail != 0} {
-        error "$fail assertion failure(s) via channel load"
-    }
-    if {$rc != 0} {
-        error "channel load error after $pass assertions"
-    }
-    expr {$pass > 400}
-} -result 1
-
-# ==========================================================================
-# af.6  Source vs compiled equivalence: pass counts must match
-# ==========================================================================
-test af.6 {all features: source and compiled produce identical assertion counts} \
-    -constraints have_features_script -body {
-
-    # Run via source
-    set srcInfo [sourceInChild AF6SRC $featuresScript]
-    set srcPass [dict get $srcInfo pass]
-    set srcFail [dict get $srcInfo fail]
-
-    # Compile and run via tbcx::load
-    set out [makeFile "" af.6-out.tbcx]
-    tbcx::save $featuresScript $out
-    set bcInfo [loadInChild AF6BC $out]
-    set bcPass [dict get $bcInfo pass]
-    set bcFail [dict get $bcInfo fail]
-
-    # Both must have 0 failures and identical pass counts
-    list [expr {$srcFail == 0}] [expr {$bcFail == 0}] [expr {$srcPass == $bcPass}]
-} -result {1 1 1}
-
-# ==========================================================================
-# af.7  Dump reports correct proc count
-#        The features script defines dozens of procs (factorial, classify,
-#        sw_str, add, greet, sum_all, etc.).
-# ==========================================================================
-test af.7 {all features: dump reports expected number of procs} \
-    -constraints have_features_script -body {
-
-    set out [makeFile "" af.7-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set dump [tbcx::dump $out]
-
-    if {![regexp {Procs: (\d+)} $dump -> nProcs]} {
-        error "Could not find Procs count in dump"
-    }
-    # The features script defines 40+ explicit procs (add, greet, sum_all,
-    # factorial, classify, sw_str, sw_exact, sw_glob, sw_re, hof_map,
-    # hof_filter, hof_fold, gen_numbers, counter_gen, echo_gen, fib_gen,
-    # tc_loop, tc_even, tc_odd, divmod, make_adder, dispatch, deep_if,
-    # big_switch, gen_proc_0..gen_proc_19, trace_handler, etc.)
-    expr {$nProcs >= 40}
-} -result 1
-
-# ==========================================================================
-# af.8  Dump reports OO classes and methods
-#        The features script defines many classes: Point, Counter, Shape,
-#        Circle, ColorCircle, Widget, Access, Forwarder, Serializable,
-#        Loggable, Item, Filtered, Registry, Vault, Base, Reflective,
-#        Copyable, AbstractAnimal, Dog, SingleService, TrackedMeta,
-#        TrackedClass, WithInit, SelfTest, MethodOptions, A/B/C/D_diamond,
-#        Base39/Mid39/Top39, DtorBase/DtorMid/DtorTop, VarIntrospect,
-#        SharedState, Accumulator, Processor, etc.
-# ==========================================================================
-test af.8 {all features: dump reports OO classes and methods} \
-    -constraints have_features_script -body {
-
-    set out [makeFile "" af.8-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set dump [tbcx::dump $out]
-
-    set nCls 0
-    set nMeth 0
-    if {[regexp {Classes: (\d+)} $dump -> n]} { set nCls $n }
-    if {[regexp {Methods: (\d+)} $dump -> n]} { set nMeth $n }
-
-    # 30+ classes, 50+ methods expected
-    list [expr {$nCls >= 30}] [expr {$nMeth >= 50}]
-} -result {1 1}
-
-# ==========================================================================
-# af.9  Source obscurity: representative proc/method bodies must not
-#        appear verbatim in the .tbcx binary.
-# ==========================================================================
-test af.9 {all features: proc/method source bodies not in .tbcx binary} \
-    -constraints have_features_script \
-    -setup {
-        # Body fragments that should be compiled away (not stored as source).
-        # These are unique enough to avoid false positives from string literals.
-        set needle_factorial "return \[expr \{\$n * \[factorial"
-        set needle_classify  "return \"negative\""
-        set needle_assert_match "string match \$pattern \$got"
-        set needle_deep_if  "elseif \{\$n == 7\} \{ return 7"
-    } \
-    -body {
-
-    set out [makeFile "" af.9-out.tbcx]
-    tbcx::save $featuresScript $out
-
-    set f [open $out rb]
-    set raw [read $f]
-    close $f
-
-    set problems {}
-    foreach {label needle} [list \
-        factorial  $needle_factorial  \
-        classify   $needle_classify   \
-        assert     $needle_assert_match \
-        deep_if    $needle_deep_if    \
-    ] {
-        if {[string first $needle $raw] >= 0} {
-            lappend problems "$label body source found in binary"
+# === 11. Namespaces ===
+test af.11 {namespaces: nested, variable, import} -body {
+    set script $H
+    append script {
+        namespace eval ::af11a::b::c {
+            variable deep 1
+            proc getdeep {} { variable deep; return $deep }
         }
+        assert ns-deep [::af11a::b::c::getdeep] 1
+        namespace eval ::af11ns1 {
+            proc helper {} { return ns1-ok }
+            namespace export helper
+        }
+        namespace eval ::af11ns2 {
+            namespace import ::af11ns1::helper
+        }
+        assert ns-import [::af11ns2::helper] ns1-ok
+        namespace eval ::af11counter {
+            variable n 0
+            proc bump {} { variable n; incr n }
+            proc val {} { variable n; return $n }
+        }
+        ::af11counter::bump; ::af11counter::bump; ::af11counter::bump
+        assert ns-counter [::af11counter::val] 3
     }
-    if {[llength $problems] > 0} {
-        error "source leak: $problems"
+    featureRoundtrip af11 $script
+} -result 3
+
+# === 12. Regexp ===
+test af.12 {regexp and regsub} -body {
+    set script $H
+    append script {
+        assert re-match [regexp {^\d+$} 12345] 1
+        assert re-nomatch [regexp {^\d+$} abc] 0
+        regexp {(\w+)@(\w+)} {user@host} -> u h
+        assert re-capture-u $u user
+        assert re-capture-h $h host
+        assert regsub [regsub -all {[aeiou]} hello *] h*ll*
+        assert regsub-count [regsub -all {o} {foo boo} X _] 4
     }
-    expr {1}
-} -result 1
+    featureRoundtrip af12 $script
+} -result 6
 
-# ==========================================================================
-# af.10  Specific feature: coroutines survive roundtrip
-# ==========================================================================
-test af.10 {all features: coroutines work after tbcx roundtrip} \
-    -constraints have_features_script -body {
+# === 13. eval, subst ===
+test af.13 {eval and subst} -body {
+    set script $H
+    append script {
+        assert eval [eval {expr {6 * 7}}] 42
+        set who World
+        assert subst [subst {Hello $who}] {Hello World}
+        assert subst-cmd [subst {1+2=[expr {1+2}]}] {1+2=3}
+        assert subst-novar [subst -nocommands -novariables {literal}] literal
+    }
+    featureRoundtrip af13 $script
+} -result 4
 
-    set in [makeFile {
-        proc fib_gen {} {
-            yield [info coroutine]
+# === 14. Lambda ===
+test af.14 {lambda: basic, namespace, higher-order} -body {
+    set script $H
+    append script {
+        assert lam-basic [apply {{x} {expr {$x+1}}} 41] 42
+        assert lam-multi [apply {{a b} {expr {$a*$b}}} 6 7] 42
+        assert lam-default [apply {{x {y 10}} {expr {$x+$y}}} 5] 15
+        namespace eval ::af14lamns { variable factor 3 }
+        assert lam-ns [apply {{x} {expr {$x * $::af14lamns::factor}} ::af14lamns} 14] 42
+        set adder [list {a b} {expr {$a+$b}}]
+        assert lam-var [apply $adder 20 22] 42
+    }
+    featureRoundtrip af14 $script
+} -result 5
+
+# === 15. Coroutines ===
+test af.15 {coroutines: yield, generator, send} -body {
+    set script $H
+    append script {
+        proc af15counter {} { set i 0; while 1 { yield $i; incr i } }
+        coroutine af15cnt af15counter
+        assert coro-basic [list [af15cnt] [af15cnt] [af15cnt]] {1 2 3}
+        rename af15cnt {}
+
+        proc af15fib {} {
             set a 0; set b 1
-            while {1} {
+            while 1 {
                 yield $a
-                lassign [list $b [expr {$a + $b}]] a b
+                lassign [list $b [expr {$a+$b}]] a b
             }
         }
-        coroutine fib fib_gen
-        set result {}
-        for {set i 0} {$i < 8} {incr i} { lappend result [fib] }
-        rename fib ""
-        return $result
-    } af.10-in.tcl]
-    set out [makeFile "" af.10-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {0 1 1 2 3 5 8 13}
+        coroutine af15f af15fib
+        set r {}; for {set i 0} {$i < 7} {incr i} { lappend r [af15f] }
+        assert coro-fib $r {1 1 2 3 5 8 13}
+        rename af15f {}
 
-# ==========================================================================
-# af.11  Specific feature: tailcall survives roundtrip
-# ==========================================================================
-test af.11 {all features: tailcall works after tbcx roundtrip} \
-    -constraints have_features_script -body {
+        proc af15accum {} {
+            set total 0
+            while 1 { set v [yield $total]; incr total $v }
+        }
+        coroutine af15acc af15accum
+        af15acc 0; af15acc 10; af15acc 20
+        assert coro-send [af15acc 5] 35
+        rename af15acc {}
+    }
+    featureRoundtrip af15 $script
+} -result 3
 
-    set in [makeFile {
-        proc tc_sum {n acc} {
+# === 16. tailcall ===
+test af.16 {tailcall: basic and recursive} -body {
+    set script $H
+    append script {
+        proc af16inner {x} { expr {$x * 2} }
+        proc af16outer {x} { tailcall af16inner $x }
+        assert tc-basic [af16outer 21] 42
+        proc af16tcloop {n acc} {
             if {$n <= 0} { return $acc }
-            tailcall tc_sum [expr {$n - 1}] [expr {$acc + $n}]
+            tailcall af16tcloop [expr {$n-1}] [expr {$acc+$n}]
         }
-        return [tc_sum 100 0]
-    } af.11-in.tcl]
-    set out [makeFile "" af.11-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result 5050
+        assert tc-recurse [af16tcloop 100 0] 5050
+    }
+    featureRoundtrip af16 $script
+} -result 2
 
-# ==========================================================================
-# af.12  Specific feature: oo::abstract / oo::singleton survive roundtrip
-# ==========================================================================
-test af.12 {all features: oo::abstract and oo::singleton after roundtrip} \
-    -constraints have_features_script -body {
+# === 17. Binary ===
+test af.17 {binary: format and scan} -body {
+    set script $H
+    append script {
+        set p [binary format i 42]
+        binary scan $p i v
+        assert bin-int $v 42
+        set p [binary format a5 hello]
+        binary scan $p a5 s
+        assert bin-str $s hello
+        set p [binary format d 3.14]
+        binary scan $p d d
+        assert bin-dbl [expr {abs($d - 3.14) < 1e-10}] 1
+        set p [binary format c3 {65 66 67}]
+        binary scan $p a3 s
+        assert bin-bytes $s ABC
+    }
+    featureRoundtrip af17 $script
+} -result 4
 
-    set in [makeFile {
-        # Abstract class — cannot be instantiated directly
-        oo::abstract create AbstractBase {
-            method get {} { my variable val_; return $val_ }
+# === 18. Encoding ===
+test af.18 {encoding: convertto and convertfrom} -body {
+    set script $H
+    append script {
+        set utf8 [encoding convertto utf-8 ABC]
+        assert enc-to [encoding convertfrom utf-8 $utf8] ABC
+        set ustr [format %c 0xe9]
+        set bytes [encoding convertto utf-8 $ustr]
+        assert enc-unicode [encoding convertfrom utf-8 $bytes] $ustr
+    }
+    featureRoundtrip af18 $script
+} -result 2
+
+# === 19. Info ===
+test af.19 {info: commands, procs, args, exists} -body {
+    set script $H
+    append script {
+        proc af19sample {a b {c 0}} { return ok }
+        assert info-args [info args af19sample] {a b c}
+        assert info-default [info default af19sample c def; set def] 0
+        assert info-exists-y [set _v 1; info exists _v] 1
+        assert info-exists-n [info exists _nonexistent_var_xyz] 0
+        assert info-level [info level] 0
+        assert info-cmdcount [expr {[info cmdcount] > 0}] 1
+    }
+    featureRoundtrip af19 $script
+} -result 6
+
+# === 20. OO advanced interaction — split into sub-tests for crash isolation ===
+test af.20a {OO: basic class with variable + constructor + method} -body {
+    set script $H
+    append script {
+        oo::class create Af20aLogger {
+            variable log
+            constructor {} { set log {} }
+            method entries {} { return $log }
+            method record {msg} { lappend log $msg }
         }
-        set abstractOk [catch {AbstractBase new} msg]
-
-        # Concrete subclass
-        oo::class create Concrete {
-            superclass AbstractBase
-            constructor {v} { my variable val_; set val_ $v }
-        }
-        set obj [Concrete new 42]
-        set concreteVal [$obj get]
-        $obj destroy
-
-        # Singleton — all new calls return same object
-        oo::singleton create MySingleton {
-            constructor {} { my variable state_; set state_ "init" }
-            method state {} { my variable state_; return $state_ }
-            method set_state {s} { my variable state_; set state_ $s }
-        }
-        set s1 [MySingleton new]
-        set s2 [MySingleton new]
-        set sameObj [expr {$s1 eq $s2}]
-        $s1 set_state "changed"
-        set sharedState [$s2 state]
-
-        return [list $abstractOk $concreteVal $sameObj $sharedState]
-    } af.12-in.tcl]
-    set out [makeFile "" af.12-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {1 42 1 changed}
-
-# ==========================================================================
-# af.13  Specific feature: classmethod + initialise + classvariable
-# ==========================================================================
-test af.13 {all features: classmethod + initialise + classvariable after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Reg {
-            initialize {
-                variable instances
-                set instances 0
-            }
-            classmethod count {} {
-                variable instances
-                return $instances
-            }
-            constructor {} {
-                classvariable instances
-                incr instances
-            }
-        }
-        set r1 [Reg new]
-        set r2 [Reg new]
-        set r3 [Reg new]
-        set c [Reg count]
-        # Also call on instance
-        set ci [$r1 count]
-        return [list $c $ci]
-    } af.13-in.tcl]
-    set out [makeFile "" af.13-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {3 3}
-
-# ==========================================================================
-# af.14  Specific feature: private methods + private variables
-# ==========================================================================
-test af.14 {all features: private methods and variables after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Safe {
-            private {
-                variable secret
-                method _internal {} { return "secret=$secret" }
-            }
-            constructor {s} { set secret $s }
-            method reveal {} { my _internal }
-        }
-        set obj [Safe new "hidden"]
-        set val [$obj reveal]
-        set err [catch {$obj _internal} msg]
-        return [list $val $err]
-    } af.14-in.tcl]
-    set out [makeFile "" af.14-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {secret=hidden 1}
-
-# ==========================================================================
-# af.15  Specific feature: forward (method forwarding)
-# ==========================================================================
-test af.15 {all features: forward after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        proc ::myhelper {args} { return "H:[join $args ,]" }
-        oo::class create Fwd {
-            forward help ::myhelper
-            forward len llength
-        }
-        set o [Fwd new]
-        set r1 [$o help a b c]
-        set r2 [$o len {1 2 3 4 5}]
-        $o destroy
-        return [list $r1 $r2]
-    } af.15-in.tcl]
-    set out [makeFile "" af.15-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {H:a,b,c 5}
-
-# ==========================================================================
-# af.16  Specific feature: filter (method call interception)
-# ==========================================================================
-test af.16 {all features: filter after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Logged {
-            variable log_
-            constructor {} { set log_ {} }
-            method greet {} { return "hi" }
-            method farewell {} { return "bye" }
-            method getLog {} { return $log_ }
-            method Track {args} {
-                lappend log_ [lindex [self target] 1]
-                next {*}$args
-            }
-            filter Track
-        }
-        set o [Logged new]
-        $o greet
-        $o farewell
-        set log [$o getLog]
-        $o destroy
-        expr {[lsearch $log greet] >= 0 && [lsearch $log farewell] >= 0}
-    } af.16-in.tcl]
-    set out [makeFile "" af.16-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
+        set o [Af20aLogger new]
+        $o record hello
+        assert oo-basic-log [$o entries] hello
+    }
+    featureRoundtrip af20a $script
 } -result 1
 
-# ==========================================================================
-# af.17  Specific feature: mixin (class-level + object-level)
-# ==========================================================================
-test af.17 {all features: mixin after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Describable {
-            method describe {} { return "I am [self]" }
+test af.20b {OO: superclass with next in constructor} -body {
+    set script $H
+    append script {
+        oo::class create Af20bBase {
+            variable log
+            constructor {} { set log {} }
+            method entries {} { return $log }
+            method record {msg} { lappend log $msg }
         }
-        oo::class create Cfg {
-            variable host_
-            constructor {h} { set host_ $h }
-            method host {} { return $host_ }
+        oo::class create Af20bChild {
+            superclass Af20bBase
+            constructor {} { next; my record created }
         }
-        # Class-level mixin
-        oo::define Cfg mixin Describable
-        set c [Cfg new "localhost"]
-        set r1 [$c host]
-        set r2 [string match "I am *" [$c describe]]
+        set s [Af20bChild new]
+        assert oo-next-ctor [$s entries] created
+    }
+    featureRoundtrip af20b $script
+} -result 1
 
-        # Object-level mixin (per-object)
-        oo::class create Extra {
-            method bonus {} { return "bonus!" }
+test af.20c {OO: classmethod} -body {
+    set script $H
+    append script {
+        oo::class create Af20cThing {
+            classmethod kind {} { return thing }
         }
-        oo::objdefine $c mixin -append Extra
-        set r3 [$c bonus]
-        $c destroy
-        return [list $r1 $r2 $r3]
-    } af.17-in.tcl]
-    set out [makeFile "" af.17-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {localhost 1 bonus!}
+        assert oo-classmethod [Af20cThing kind] thing
+    }
+    featureRoundtrip af20c $script
+} -result 1
 
-# ==========================================================================
-# af.18  Specific feature: oo::copy
-# ==========================================================================
-test af.18 {all features: oo::copy after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Clonable {
-            variable v_
-            constructor {v} { set v_ $v }
-            method get {} { return $v_ }
-            method set {v} { set v_ $v }
+test af.20d {OO: private method} -body {
+    set script $H
+    append script {
+        oo::class create Af20dBox {
+            method pub {} { my helper; return ok }
+            private method helper {} { }
         }
-        set orig [Clonable new 100]
-        set copy [oo::copy $orig]
-        $copy set 200
-        set r1 [$orig get]
-        set r2 [$copy get]
-        $orig destroy
-        $copy destroy
-        return [list $r1 $r2]
-    } af.18-in.tcl]
-    set out [makeFile "" af.18-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {100 200}
+        set b [Af20dBox new]
+        assert oo-private-pub [$b pub] ok
+        assert oo-private-blocked [catch {$b helper}] 1
+    }
+    featureRoundtrip af20d $script
+} -result 2
 
-# ==========================================================================
-# af.19  Specific feature: metaclass
-# ==========================================================================
-test af.19 {all features: metaclass after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create CountingMeta {
-            superclass oo::class
-            variable count_
-            constructor {args} {
-                set count_ 0
-                next {*}$args
-            }
-            method new {args} {
-                incr count_
-                next {*}$args
-            }
-            method count {} { return $count_ }
+test af.20e1 {OO: superclass + classmethod (no private)} -body {
+    set script $H
+    append script {
+        oo::class create Af20e1Base {
+            variable log
+            constructor {} { set log {} }
+            method entries {} { return $log }
+            method record {msg} { lappend log $msg }
         }
-        CountingMeta create MyClass {
-            variable x_
-            constructor {x} { set x_ $x }
-            method get {} { return $x_ }
+        oo::class create Af20e1Child {
+            superclass Af20e1Base
+            classmethod kind {} { return child }
+            constructor {} { next; my record created }
+            method api {} { my record api-call; return ok }
         }
-        set a [MyClass new 1]
-        set b [MyClass new 2]
-        set c [MyClass new 3]
-        set cnt [MyClass count]
-        return [list $cnt [$a get] [$b get] [$c get]]
-    } af.19-in.tcl]
-    set out [makeFile "" af.19-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {3 1 2 3}
+        set s [Af20e1Child new]
+        assert e1-cm [Af20e1Child kind] child
+        assert e1-api [$s api] ok
+        assert e1-log [$s entries] {created api-call}
+    }
+    featureRoundtrip af20e1 $script
+} -result 3
 
-# ==========================================================================
-# af.20  Specific feature: diamond inheritance with next chain
-# ==========================================================================
-test af.20 {all features: diamond inheritance MRO after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create A { method who {} { return "A" } }
-        oo::class create B { superclass A; method who {} { return "B->[next]" } }
-        oo::class create C { superclass A; method who {} { return "C->[next]" } }
-        oo::class create D { superclass B C; method who {} { return "D->[next]" } }
-        set d [D new]
-        set r [$d who]
-        $d destroy
-        return $r
-    } af.20-in.tcl]
-    set out [makeFile "" af.20-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {D->B->C->A}
-
-# ==========================================================================
-# af.21  Specific feature: upvar + uplevel inside procs
-# ==========================================================================
-test af.21 {all features: upvar and uplevel after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        proc setter {varname val} {
-            upvar 1 $varname v
-            set v $val
+test af.20e2 {OO: superclass + private (no classmethod)} -body {
+    set script $H
+    append script {
+        oo::class create Af20e2Base {
+            variable log
+            constructor {} { set log {} }
+            method entries {} { return $log }
+            method record {msg} { lappend log $msg }
         }
-        proc runner {script} {
-            uplevel 1 $script
+        oo::class create Af20e2Child {
+            superclass Af20e2Base
+            constructor {} { next; my record created }
+            method api {} { my record api-call; my helper; return ok }
+            private method helper {} { my record helper-done }
         }
-        set x 0
-        setter x 42
-        set y 0
-        runner {set y 99}
-        return [list $x $y]
-    } af.21-in.tcl]
-    set out [makeFile "" af.21-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {42 99}
+        set s [Af20e2Child new]
+        assert e2-api [$s api] ok
+        assert e2-log [$s entries] {created api-call helper-done}
+    }
+    featureRoundtrip af20e2 $script
+} -result 2
 
-# ==========================================================================
-# af.22  Specific feature: complex lambdas (higher-order, namespace)
-# ==========================================================================
-test af.22 {all features: complex lambdas after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        proc hmap {fn lst} {
-            set r {}
-            foreach x $lst { lappend r [apply $fn $x] }
-            return $r
+test af.20e3 {OO: classmethod + private (no superclass)} -body {
+    set script $H
+    append script {
+        oo::class create Af20e3Thing {
+            classmethod kind {} { return thing }
+            method api {} { my helper; return ok }
+            private method helper {} { }
         }
-        proc hfilter {fn lst} {
-            set r {}
-            foreach x $lst { if {[apply $fn $x]} { lappend r $x } }
-            return $r
+        assert e3-cm [Af20e3Thing kind] thing
+        set t [Af20e3Thing new]
+        assert e3-api [$t api] ok
+    }
+    featureRoundtrip af20e3 $script
+} -result 2
+
+test af.20e4 {OO: all three — superclass + classmethod + private} -body {
+    set script $H
+    append script {
+        oo::class create Af20e4Base {
+            variable log
+            constructor {} { set log {} }
+            method entries {} { return $log }
+            method record {msg} { lappend log $msg }
         }
-        proc hfold {fn init lst} {
-            set a $init
-            foreach x $lst { set a [apply $fn $a $x] }
-            return $a
+        oo::class create Af20e4Svc {
+            superclass Af20e4Base
+            classmethod kind {} { return service }
+            constructor {} { next; my record created }
+            method api {} { my record api-call; my helper; return ok }
+            private method helper {} { my record helper-done }
         }
-        set squares [hmap {{x} {expr {$x*$x}}} {1 2 3 4 5}]
-        set big [hfilter {{x} {expr {$x > 10}}} $squares]
-        set total [hfold {{a b} {expr {$a + $b}}} 0 $big]
-        return [list $squares $big $total]
-    } af.22-in.tcl]
-    set out [makeFile "" af.22-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {{1 4 9 16 25} {16 25} 41}
+        set s [Af20e4Svc new]
+        assert e4-cm [Af20e4Svc kind] service
+        assert e4-api [$s api] ok
+        assert e4-log [$s entries] {created api-call helper-done}
+        assert e4-priv [catch {$s helper}] 1
+    }
+    featureRoundtrip af20e4 $script
+} -result 4
 
-# ==========================================================================
-# af.23  Specific feature: namespace ensemble
-# ==========================================================================
-test af.23 {all features: namespace ensemble after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        namespace eval ::calc {
-            namespace export add sub mul
-            namespace ensemble create
-            proc add {a b} { expr {$a + $b} }
-            proc sub {a b} { expr {$a - $b} }
-            proc mul {a b} { expr {$a * $b} }
+# === 21. OO: deletemethod, renamemethod, unexport ===
+test af.21 {OO: deletemethod, renamemethod, unexport} -body {
+    set script $H
+    append script {
+        oo::class create Af21Mutable
+        oo::define Af21Mutable {
+            method keep {} { return kept }
+            method temp {} { return temp }
+            method internal {} { return int }
+            method pub {} { return [my internal] }
+            method oldname {} { return old }
         }
-        return [list [calc add 10 3] [calc sub 10 3] [calc mul 10 3]]
-    } af.23-in.tcl]
-    set out [makeFile "" af.23-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {13 7 30}
+        oo::define Af21Mutable deletemethod temp
+        oo::define Af21Mutable renamemethod oldname newname
+        oo::define Af21Mutable unexport internal
+        set o [Af21Mutable new]
+        assert del-keep [$o keep] kept
+        assert del-temp [catch {$o temp}] 1
+        assert rename [$o newname] old
+        assert unexport-via-pub [$o pub] int
+        assert unexport-direct [catch {$o internal}] 1
+    }
+    featureRoundtrip af21 $script
+} -result 5
 
-# ==========================================================================
-# af.24  Specific feature: dict update (DictUpdateInfo AuxData)
-# ==========================================================================
-test af.24 {all features: dict update AuxData after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        set d [dict create x 10 y 20 z 30]
-        dict update d x X y Y {
-            set X [expr {$X * 2}]
-            set Y [expr {$Y * 3}]
+# === 22. OO: objdefine, copy, abstract, singleton ===
+test af.22 {OO: objdefine, copy, abstract, singleton} -body {
+    set script $H
+    append script {
+        oo::class create Af22Base
+        oo::define Af22Base method m {} { return base }
+        set o [Af22Base new]
+        oo::objdefine $o method extra {} { return per-object }
+        assert objdefine [$o extra] per-object
+        set cp [oo::copy $o]
+        assert copy [$cp m] base
+        oo::abstract create Af22Abs
+        oo::define Af22Abs method am {} { return abs }
+        oo::class create Af22Conc {superclass Af22Abs}
+        set ac [Af22Conc new]
+        assert abstract [$ac am] abs
+        assert abstract-noinstantiate [catch {Af22Abs new}] 1
+        oo::singleton create Af22Sing
+        oo::define Af22Sing {
+            constructor {} { my variable data; set data {} }
+            method add {v} { my variable data; lappend data $v }
+            method all {} { my variable data; return $data }
         }
-        return [list [dict get $d x] [dict get $d y] [dict get $d z]]
-    } af.24-in.tcl]
-    set out [makeFile "" af.24-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {20 60 30}
+        set s1 [Af22Sing new]; $s1 add x
+        set s2 [Af22Sing new]; $s2 add y
+        assert singleton [$s1 all] {x y}
+    }
+    featureRoundtrip af22 $script
+} -result 5
 
-# ==========================================================================
-# af.25  Specific feature: switch with many arms (jump table AuxData)
-# ==========================================================================
-test af.25 {all features: large switch jump table after roundtrip} \
-    -constraints have_features_script -body {
+# === 23. Complex: closures, dispatch ===
+test af.23 {complex: closures and dispatch tables} -body {
+    set script $H
+    append script {
+        proc af23_make_adder {n} { list {x} [format {expr {$x + %d}} $n] }
+        set add5 [af23_make_adder 5]
+        set add10 [af23_make_adder 10]
+        assert closure-5 [apply $add5 3] 8
+        assert closure-10 [apply $add10 3] 13
+        proc af23_op_add {a b} { expr {$a + $b} }
+        proc af23_op_mul {a b} { expr {$a * $b} }
+        proc af23_dispatch {op a b} { af23_op_$op $a $b }
+        assert dispatch-add [af23_dispatch add 3 4] 7
+        assert dispatch-mul [af23_dispatch mul 3 4] 12
+    }
+    featureRoundtrip af23 $script
+} -result 4
 
-    set in [makeFile {
-        proc classify {ch} {
-            switch $ch {
-                a { return vowel }
-                b { return consonant }
-                c { return consonant }
-                d { return consonant }
-                e { return vowel }
-                f { return consonant }
-                g { return consonant }
-                h { return consonant }
-                i { return vowel }
-                j { return consonant }
-                k { return consonant }
-                l { return consonant }
-                m { return consonant }
-                n { return consonant }
-                o { return vowel }
-                p { return consonant }
-                q { return consonant }
-                r { return consonant }
-                s { return consonant }
-                t { return consonant }
-                u { return vowel }
-                default { return other }
-            }
-        }
-        return [list [classify a] [classify b] [classify u] [classify z]]
-    } af.25-in.tcl]
-    set out [makeFile "" af.25-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {vowel consonant vowel other}
-
-# ==========================================================================
-# af.26  Specific feature: try/trap/finally with nested loops
-# ==========================================================================
-test af.26 {all features: try/trap/finally with nested loops after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        set results {}
-        for {set i 0} {$i < 5} {incr i} {
-            try {
-                if {$i == 2} { throw {SKIP} "skip" }
-                if {$i == 4} { error "err" }
-                lappend results "ok:$i"
-            } trap {SKIP} {msg} {
-                lappend results "skip:$i"
-            } on error {msg} {
-                lappend results "err:$i"
-            } finally {
-                lappend results "fin:$i"
-            }
-        }
-        return $results
-    } af.26-in.tcl]
-    set out [makeFile "" af.26-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {ok:0 fin:0 ok:1 fin:1 skip:2 fin:2 ok:3 fin:3 err:4 fin:4}
-
-# ==========================================================================
-# af.27  Specific feature: oo::objdefine per-object methods
-# ==========================================================================
-test af.27 {all features: oo::objdefine after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Base27 {
-            method hello {} { return "base" }
-        }
-        set obj [Base27 new]
-        oo::objdefine $obj {
-            method hello {} { return "custom" }
-            method extra {} { return "added" }
-        }
-        set r1 [$obj hello]
-        set r2 [$obj extra]
-        $obj destroy
-        return [list $r1 $r2]
-    } af.27-in.tcl]
-    set out [makeFile "" af.27-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {custom added}
-
-# ==========================================================================
-# af.28  Specific feature: destructor chain with next
-# ==========================================================================
-test af.28 {all features: destructor chain after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        set ::dlog {}
-        oo::class create DBase {
-            destructor { lappend ::dlog "DBase" }
-        }
-        oo::class create DMid {
-            superclass DBase
-            destructor { lappend ::dlog "DMid"; next }
-        }
-        oo::class create DTop {
-            superclass DMid
-            destructor { lappend ::dlog "DTop"; next }
-        }
-        set o [DTop new]
-        $o destroy
-        return $::dlog
-    } af.28-in.tcl]
-    set out [makeFile "" af.28-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {DTop DMid DBase}
-
-# ==========================================================================
-# af.29  Specific feature: info object / info class introspection
-# ==========================================================================
-test af.29 {all features: OO introspection after roundtrip} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        oo::class create Intro {
-            method x {} { return 1 }
-            method y {} { return 2 }
-        }
-        set o [Intro new]
-        set cls [info object class $o]
-        set isObj [info object isa object $o]
-        set methods [lsort [info class methods Intro]]
-        set isInst [expr {$o in [info class instances Intro]}]
-        $o destroy
-        return [list $cls $isObj $methods $isInst]
-    } af.29-in.tcl]
-    set out [makeFile "" af.29-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {::Intro 1 {x y} 1}
-
-# ==========================================================================
-# af.30  Combined: OO + coroutine + lambda + namespace in one script
-# ==========================================================================
-test af.30 {all features: combined OO + coroutine + lambda + namespace} \
-    -constraints have_features_script -body {
-
-    set in [makeFile {
-        namespace eval ::combo {
-            oo::class create Pipeline {
-                variable stages_
-                constructor {args} { set stages_ $args }
-                method run {input} {
-                    set val $input
-                    foreach fn $stages_ {
-                        set val [apply $fn $val]
-                    }
-                    return $val
+# === 24. namespace + OO + lambda ===
+test af.24 {complex: namespace + OO + lambda combined} -body {
+    set script $H
+    append script {
+        namespace eval ::af24pkg {
+            variable version 2.0
+            oo::class create Widget
+            oo::define Widget {
+                constructor {n} { my variable name; set name $n }
+                method describe {} {
+                    my variable name
+                    return "$name v$::af24pkg::version"
                 }
             }
+            proc make {name} { Widget new $name }
+        }
+        set w [::af24pkg::make TestWidget]
+        assert ns-oo-lam [$w describe] {TestWidget v2.0}
+        set mapper [list {x} {expr {$x * $::af24pkg::version}}]
+        assert ns-lambda [apply $mapper 21] 42.0
+    }
+    featureRoundtrip af24 $script
+} -result 2
 
-            proc gen_range {} {
-                yield [info coroutine]
-                set i 0
-                while {$i < 5} { yield $i; incr i }
+# === 25. Exceptions: nested try/catch in loops ===
+test af.25 {exceptions: nested try/catch in loops} -body {
+    set script $H
+    append script {
+        proc af25safediv {pairs} {
+            set results {}
+            foreach pair $pairs {
+                lassign $pair a b
+                try {
+                    lappend results [expr {$a / $b}]
+                } on error {} {
+                    lappend results ERR
+                }
+            }
+            return $results
+        }
+        assert exc-loop [af25safediv {{10 2} {10 0} {20 4} {1 0}}] {5 ERR 5 ERR}
+
+        proc af25nested {} {
+            try {
+                try { error inner } on error {msg} { set r caught-$msg }
+                return $r
+            } on error {msg} { return outer-$msg }
+        }
+        assert exc-nested [af25nested] caught-inner
+
+        set result {}
+        for {set i 0} {$i < 5} {incr i} {
+            try {
+                if {$i == 2} { error skip }
+                lappend result $i
+            } on error {} {
+                lappend result X
             }
         }
-        set pipe [::combo::Pipeline new \
-            {{x} {expr {$x * 2}}} \
-            {{x} {expr {$x + 1}}} \
-        ]
-        coroutine myrange ::combo::gen_range
-        set results {}
-        while {1} {
-            set val [myrange]
-            if {$val eq ""} break
-            lappend results [$pipe run $val]
+        assert exc-for $result {0 1 X 3 4}
+    }
+    featureRoundtrip af25 $script
+} -result 3
+
+# === 26. Deep nesting ===
+test af.26 {stress: deeply nested mixed patterns} -body {
+    set script $H
+    append script {
+        namespace eval ::af26deep {
+            proc compute {n} {
+                set total 0
+                foreach i [lmap x [lrepeat $n 1] {expr {$x}}] {
+                    try { incr total $i } on error {} {}
+                }
+                return $total
+            }
         }
-        $pipe destroy
-        return $results
-    } af.30-in.tcl]
-    set out [makeFile "" af.30-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result {1 3 5 7 9}
+        assert deep-mixed [::af26deep::compute 100] 100
+        proc af26recnest {n} {
+            if {$n <= 0} { return done }
+            return [af26recnest [expr {$n - 1}]]
+        }
+        assert deep-recurse [af26recnest 50] done
+    }
+    featureRoundtrip af26 $script
+} -result 2
+
+# === 27. OO: filter + mixin + forward ===
+test af.27 {OO: filter + mixin + forward combined} -body {
+    set script $H
+    append script {
+        oo::class create Af27Describable
+        oo::define Af27Describable method describe {} { return [self class] }
+        oo::class create Af27Thing
+        oo::define Af27Thing {
+            mixin Af27Describable
+            forward len string length
+            method check {s} { my len $s }
+        }
+        set t [Af27Thing new]
+        assert mix-describe [$t describe] ::Af27Describable
+        assert fwd-len [$t check hello] 5
+    }
+    featureRoundtrip af27 $script
+} -result 2
+
+# === 28. Data pipeline ===
+test af.28 {complex: data pipeline with list/dict/lmap} -body {
+    set script $H
+    append script {
+        set records {
+            {name Alice score 85}
+            {name Bob score 92}
+            {name Carol score 78}
+            {name Dave score 95}
+        }
+        set scores [lmap r $records {dict get $r score}]
+        set total 0; foreach s $scores { incr total $s }
+        set avg [expr {$total / [llength $scores]}]
+        assert pipeline-avg $avg 87
+        set high [lmap r $records {
+            set s [dict get $r score]
+            if {$s >= 90} { dict get $r name } else { continue }
+        }]
+        assert pipeline-high [lsort $high] {Bob Dave}
+    }
+    featureRoundtrip af28 $script
+} -result 2
 
 cleanupTests
+

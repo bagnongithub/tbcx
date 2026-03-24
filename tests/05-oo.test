@@ -232,6 +232,261 @@ test oo.13 {oo: exception in method} -body {
     tbcx::load $out
 } -result {5 Inf}
 
+# ---- Advanced OO features (Tcl 9.1) ----
+
+# classmethod
+test oo.14 {oo: classmethod} -body {
+    set out [makeFile "" oo.14-out.tbcx]
+    tbcx::save {
+        oo::class create Factory
+        oo::define Factory {
+            classmethod kind {} { return "Factory" }
+            method produce {} { return "item" }
+        }
+        set o [Factory new]
+        return [list [Factory kind] [$o produce]]
+    } $out
+    tbcx::load $out
+} -result {Factory item}
+
+# private method
+test oo.15 {oo: private method} -body {
+    set out [makeFile "" oo.15-out.tbcx]
+    tbcx::save {
+        oo::class create Secret
+        oo::define Secret {
+            method public {} { return [my helper] }
+            private method helper {} { return "secret-data" }
+        }
+        set s [Secret new]
+        return [$s public]
+    } $out
+    tbcx::load $out
+} -result secret-data
+
+# forward
+test oo.16 {oo: method forward} -body {
+    set out [makeFile "" oo.16-out.tbcx]
+    tbcx::save {
+        oo::class create Wrapper
+        oo::define Wrapper {
+            constructor {} { my variable buf; set buf {} }
+            forward len string length
+            method store {s} { my variable buf; set buf $s }
+            method size {} { my variable buf; my len $buf }
+        }
+        set w [Wrapper new]
+        $w store "hello"
+        return [$w size]
+    } $out
+    tbcx::load $out
+} -result 5
+
+# filter
+test oo.17 {oo: method filter} -body {
+    set out [makeFile "" oo.17-out.tbcx]
+    tbcx::save {
+        oo::class create Logged
+        oo::define Logged {
+            variable log
+            constructor {} { set log {} }
+            method logfilter {args} {
+                lappend log [self target]
+                next {*}$args
+            }
+            method getlog {} { return $log }
+            method greet {} { return "hi" }
+            filter logfilter
+        }
+        set o [Logged new]
+        $o greet
+        $o greet
+        return [llength [$o getlog]]
+    } $out
+    tbcx::load $out
+} -result 3
+
+# mixin
+test oo.18 {oo: mixin} -body {
+    set out [makeFile "" oo.18-out.tbcx]
+    tbcx::save {
+        oo::class create Describable
+        oo::define Describable method describe {} { return "I am [self class]" }
+        oo::class create Thing
+        oo::define Thing method name {} { return "thing" }
+        oo::define Thing mixin Describable
+        set t [Thing new]
+        return [list [$t name] [$t describe]]
+    } $out
+    tbcx::load $out
+} -result {thing {I am ::Describable}}
+
+# oo::objdefine
+test oo.19 {oo: objdefine per-object method} -body {
+    set out [makeFile "" oo.19-out.tbcx]
+    tbcx::save {
+        oo::class create Oo19Base
+        oo::define Oo19Base method shared {} { return "shared" }
+        set o [Oo19Base new]
+        oo::objdefine $o method special {} { return "per-object" }
+        return [list [$o shared] [$o special]]
+    } $out
+    tbcx::load $out
+} -result {shared per-object}
+
+# oo::copy
+test oo.20 {oo: copy object} -body {
+    set out [makeFile "" oo.20-out.tbcx]
+    tbcx::save {
+        oo::class create Stateful
+        oo::define Stateful {
+            constructor {v} { my variable val; set val $v }
+            method get {} { my variable val; return $val }
+        }
+        set a [Stateful new 42]
+        set b [oo::copy $a]
+        return [list [$a get] [$b get]]
+    } $out
+    tbcx::load $out
+} -result {42 42}
+
+# oo::abstract
+test oo.21 {oo: abstract class} -body {
+    set out [makeFile "" oo.21-out.tbcx]
+    tbcx::save {
+        oo::abstract create Shape
+        oo::define Shape method area {} { error "abstract" }
+        oo::class create Circle {superclass Shape}
+        oo::define Circle {
+            constructor {r} { my variable radius; set radius $r }
+            method area {} { my variable radius; expr {3.14159 * $radius * $radius} }
+        }
+        set c [Circle new 1.0]
+        return [expr {int([$c area] * 100)}]
+    } $out
+    tbcx::load $out
+} -result 314
+
+# oo::singleton
+test oo.22 {oo: singleton class} -body {
+    set out [makeFile "" oo.22-out.tbcx]
+    tbcx::save {
+        oo::singleton create Registry
+        oo::define Registry {
+            constructor {} { my variable data; set data {} }
+            method add {k v} { my variable data; dict set data $k $v }
+            method get {k} { my variable data; dict get $data $k }
+        }
+        set a [Registry new]
+        $a add color blue
+        set b [Registry new]
+        return [$b get color]
+    } $out
+    tbcx::load $out
+} -result blue
+
+# deletemethod
+test oo.23 {oo: deletemethod} -body {
+    set out [makeFile "" oo.23-out.tbcx]
+    tbcx::save {
+        oo::class create HasExtra
+        oo::define HasExtra {
+            method keep {} { return "kept" }
+            method temp {} { return "temporary" }
+        }
+        oo::define HasExtra deletemethod temp
+        set o [HasExtra new]
+        set kept [$o keep]
+        set rc [catch {$o temp} msg]
+        return [list $kept $rc]
+    } $out
+    tbcx::load $out
+} -result {kept 1}
+
+# renamemethod
+test oo.24 {oo: renamemethod} -body {
+    set out [makeFile "" oo.24-out.tbcx]
+    tbcx::save {
+        oo::class create Oo24Named
+        oo::define Oo24Named method original {} { return "content" }
+        oo::define Oo24Named renamemethod original aliased
+        set o [Oo24Named new]
+        return [$o aliased]
+    } $out
+    tbcx::load $out
+} -result content
+
+# unexport
+test oo.25 {oo: unexport method} -body {
+    set out [makeFile "" oo.25-out.tbcx]
+    tbcx::save {
+        oo::class create Guarded
+        oo::define Guarded {
+            method internal {} { return "internal" }
+            method api {} { return [my internal] }
+        }
+        oo::define Guarded unexport internal
+        set o [Guarded new]
+        set api [$o api]
+        set rc [catch {$o internal} msg]
+        return [list $api $rc]
+    } $out
+    tbcx::load $out
+} -result {internal 1}
+
+# metaclass
+test oo.26 {oo: metaclass} -body {
+    set out [makeFile "" oo.26-out.tbcx]
+    tbcx::save {
+        oo::class create Oo26Meta {
+            superclass oo::class
+            self method create {name args} {
+                set cls [next $name {*}$args]
+                return $cls
+            }
+        }
+        Oo26Meta create Oo26Animal {
+            method speak {} { return "..." }
+        }
+        set a [Oo26Animal new]
+        return [$a speak]
+    } $out
+    tbcx::load $out
+} -result ...
+
+# next in constructor chain
+test oo.27 {oo: constructor with next chaining} -body {
+    set out [makeFile "" oo.27-out.tbcx]
+    tbcx::save {
+        oo::class create Oo27A
+        oo::define Oo27A constructor {} { append ::trace "A" }
+        oo::class create Oo27B {superclass Oo27A}
+        oo::define Oo27B constructor {} { set ::trace "B+"; next }
+        set ::trace ""
+        set o [Oo27B new]
+        return $::trace
+    } $out
+    tbcx::load $out
+} -result B+A
+
+# Diamond inheritance
+test oo.28 {oo: diamond inheritance with next} -body {
+    set out [makeFile "" oo.28-out.tbcx]
+    tbcx::save {
+        oo::class create Top
+        oo::define Top method who {} { return "Top" }
+        oo::class create Left {superclass Top}
+        oo::define Left method who {} { return "Left+[next]" }
+        oo::class create Right {superclass Top}
+        oo::define Right method who {} { return "Right+[next]" }
+        oo::class create Bottom {superclass Left Right}
+        oo::define Bottom method who {} { return "Bottom+[next]" }
+        set o [Bottom new]
+        return [$o who]
+    } $out
+    tbcx::load $out
+} -result Bottom+Left+Right+Top
+
 
 
 cleanupTests
