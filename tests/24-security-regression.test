@@ -548,5 +548,4 @@ test xc.3 {cross-cutting: load into child interp, verify isolation} -body {
     set r
 } -result hidden
 
-
 cleanupTests

@@ -7,8 +7,7 @@ namespace import ::tcltest::*
 configure \
     -testdir   [file dirname [info script]] \
     -verbose   {body error} \
-    -preservecore 0
+    -preservecore 0 \
+    {*}$argv
 
 runAllTests
-
-cleanupTests
