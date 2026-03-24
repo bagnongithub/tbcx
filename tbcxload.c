@@ -444,8 +444,20 @@ static void TbcxFixLocalCacheExtras(ByteCode* bcPtr, Proc* procPtr)
     Tcl_Size numVars = old->numVars;
     Tcl_Size numArgs = procPtr->numArgs;
 
-    /* Allocate new cache with the extras area */
-    size_t bytes = offsetof(LocalCache, varName0) + (size_t)numVars * sizeof(Tcl_Obj*) + (size_t)numArgs * sizeof(Var);
+    /* Allocate new cache with the extras area.
+     * F1 fix: overflow-safe arithmetic — numVars and numArgs derive from
+     * Proc fields set from wire data; unchecked multiply can wrap on 32-bit. */
+    size_t nameBytes, extraBytes, bytes;
+    if (!tbcx_checked_mul((size_t)numVars, sizeof(Tcl_Obj*), &nameBytes) ||
+        !tbcx_checked_mul((size_t)numArgs, sizeof(Var), &extraBytes))
+        return; /* overflow — skip cache fix; Tcl rebuilds on first call */
+    bytes = offsetof(LocalCache, varName0);
+    if (nameBytes > SIZE_MAX - bytes)
+        return;
+    bytes += nameBytes;
+    if (extraBytes > SIZE_MAX - bytes)
+        return;
+    bytes += extraBytes;
     LocalCache* lc = (LocalCache*)Tcl_Alloc(bytes);
     memset(lc, 0, bytes);
     lc->refCount = 1;
@@ -1319,10 +1331,13 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
 
     /* After builder form execution, apply precompiled bodies.
        Use oo::define (the renamed original) for body installation via PrecompClass,
-       since per-object methods can also be set through oo::define on the object. */
+       since per-object methods can also be set through oo::define on the object.
+       F6 fix: if PrecompClass fails, clean interp result to prevent
+       contaminating subsequent operations. */
     if (isBuilderForm && rc == TCL_OK)
     {
-        (void)PrecompClass(ip, os, objFqn);
+        if (PrecompClass(ip, os, objFqn) != TCL_OK)
+            Tcl_ResetResult(ip);
     }
 
     if (objFqn != obj)
@@ -1886,7 +1901,8 @@ static void FixCompiledLocalNames(Proc* procPtr, LocalCache* lc)
         memcpy(repl, cl, offsetof(CompiledLocal, name));
         memcpy(repl->name, nm, (size_t)nameLen);
         repl->name[nameLen] = '\0';
-        repl->nameLength = (int)nameLen;
+        /* F7 fix: Tcl's CompiledLocal.nameLength is int — guard the narrowing cast */
+        repl->nameLength = (nameLen > INT_MAX) ? INT_MAX : (int)nameLen;
 
         /* Splice replacement into the linked list using tracked predecessor
            (O(1) instead of the previous O(n) predecessor search). */
@@ -1919,6 +1935,14 @@ void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
     /* Proposal #8: Proc structs created by TBCX are per-interp.
        Assert we have a valid interp context for refCount safety. */
     assert(ip != NULL && "TbcxFixupByteCode requires non-NULL interp");
+    /* S3: verify we're on the interp-owning thread in debug builds */
+#ifndef NDEBUG
+    {
+        Interp* _iPtr = (Interp*)ip;
+        assert(_iPtr->threadId == Tcl_GetCurrentThread() &&
+               "TbcxFixupByteCode: must be called from interp-owning thread");
+    }
+#endif
     bc->procPtr = proc;
     RefreshBC(bc, ip, ns);
     FixLiteralPoolProcPtr(bc);
@@ -1960,62 +1984,6 @@ void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
     }
 }
 
-/* ==========================================================================
- * Proposal #2: Pre-warm literal pool entries
- *
- * After installing a precompiled proc, its inner bodies (while/for/foreach/
- * try bodies) may still be string literals that Tcl will JIT-compile lazily
- * during execution.  Because the PRECOMPILED flag causes Tcl to skip
- * TclProcCompileProc (which sets iPtr->compiledProcPtr), the JIT gives
- * those inner bodies procPtr=NULL, crashing on coroutine yield/resume.
- *
- * This function forces JIT compilation of all string literals in the
- * proc's literal pool while compiledProcPtr is correctly set, ensuring
- * inner bodies get the right procPtr.  Non-script literals harmlessly
- * fail compilation (Tcl_ResetResult cleans up).
- *
- * Thread safety: must be called from the interp-owning thread (same
- * constraint as all tbcx::load operations).
- * ========================================================================== */
-void TbcxPrewarmLiterals(ByteCode* bc, Proc* proc, Tcl_Interp* ip)
-{
-    if (!bc || !proc || !ip || bc->numLitObjects <= 0 || !bc->objArrayPtr)
-        return;
-    /* Proposal #8: this function manipulates iPtr->compiledProcPtr.
-       Must only be called from the interp-owning thread. */
-
-    Interp* iPtr = (Interp*)ip;
-    Proc* saved = iPtr->compiledProcPtr;
-    iPtr->compiledProcPtr = proc;
-
-    for (Tcl_Size i = 0; i < bc->numLitObjects; i++)
-    {
-        Tcl_Obj* lit = bc->objArrayPtr[i];
-        if (!lit)
-            continue;
-        /* Skip if already has bytecode — nothing to pre-warm */
-        if (TbcxGetByteCode(lit))
-            continue;
-        /* Skip non-string types (ints, doubles, lists, etc.) */
-        const Tcl_ObjType* ty = lit->typePtr;
-        if (ty == tbcxTyInt || ty == tbcxTyDouble || ty == tbcxTyBoolean ||
-            ty == tbcxTyBignum || ty == tbcxTyByteArray || ty == tbcxTyList ||
-            (tbcxTyDict && ty == tbcxTyDict) || ty == tbcxTyProcBody)
-            continue;
-        /* Skip short strings — not script bodies */
-        Tcl_Size sLen = 0;
-        (void)Tcl_GetStringFromObj(lit, &sLen);
-        if (sLen < 2)
-            continue;
-        /* Attempt compilation.  If it succeeds, the literal now has a
-           bytecode internal rep with procPtr = compiledProcPtr = proc.
-           If it fails (not a valid script), harmless — just clean up. */
-        TclSetByteCodeFromAny(ip, lit, NULL, NULL);
-        Tcl_ResetResult(ip);
-    }
-
-    iPtr->compiledProcPtr = saved;
-}
 
 /* ==========================================================================
  * Proposal #4: Post-load verification pass
@@ -2155,19 +2123,21 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
+    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
     /* Build Proc + compiled locals from argsObj */
     Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
     procPtr->iPtr = (Interp*)ip;
     procPtr->refCount = 1;
     procPtr->bodyPtr = bodyBC;
-    Tcl_IncrRefCount(bodyBC);
+    Tcl_IncrRefCount(bodyBC); /* Proc's own reference */
     {
         CompiledLocal *first = NULL, *last = NULL;
         Tcl_Size numA = 0;
         if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK)
         {
-            Tcl_DecrRefCount(bodyBC);
+            Tcl_DecrRefCount(bodyBC); /* Proc's reference */
+            Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -2204,6 +2174,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
         Tcl_DecrRefCount(procBodyObj);
+        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2220,6 +2191,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     {
         Tcl_DecrRefCount(pair);
         Tcl_DecrRefCount(procBodyObj);
+        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2231,6 +2203,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     if (oldPair)
         Tcl_DecrRefCount(oldPair);
     Tcl_DecrRefCount(procBodyObj);
+    Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
     Tcl_DecrRefCount(nameObj);
     Tcl_DecrRefCount(clsFqn);
     Tcl_DecrRefCount(argsObj);
@@ -2478,8 +2451,9 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         Tcl_Free((char*)procPtr);
         return NULL;
     }
+    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
     procPtr->bodyPtr = bodyBC;
-    Tcl_IncrRefCount(bodyBC);
+    Tcl_IncrRefCount(bodyBC); /* Proc's own reference */
     {
         ByteCode* bc = TbcxGetByteCode(bodyBC);
         if (bc)
@@ -2496,7 +2470,8 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         bc2 = TbcxGetByteCode(bodyBC);
         if (bc2)
             bc2->procPtr = NULL;
-        Tcl_DecrRefCount(bodyBC);
+        Tcl_DecrRefCount(bodyBC); /* Proc's reference */
+        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
         Tcl_Free((char*)procPtr);
         Tcl_DecrRefCount(nsObj);
@@ -2528,6 +2503,7 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
     if (!dumpOnly)
     {
         RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
+        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
     }
     else
     {
@@ -2535,7 +2511,8 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         bc2 = TbcxGetByteCode(bodyBC);
         if (bc2)
             bc2->procPtr = NULL;
-        Tcl_DecrRefCount(bodyBC);
+        Tcl_DecrRefCount(bodyBC); /* Proc's reference */
+        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
         Tcl_Free((char*)procPtr);
     }
@@ -4312,6 +4289,7 @@ static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx)
     Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, ip, nsPtr, &nLoc, 1, 0);
     if (!bodyBC)
         goto cleanup_objs;
+    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
 
     /* ---- Stage 5: build FQN key ---- */
     Tcl_Obj* fqnKey = NULL;
@@ -4409,6 +4387,7 @@ static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx)
     /* ---- Cleanup chain ---- */
 cleanup_fqn:
     if (fqnKey) Tcl_DecrRefCount(fqnKey);
+    if (bodyBC) Tcl_DecrRefCount(bodyBC); /* release our local reference (F4) */
 cleanup_objs:
     if (nameFqn) Tcl_DecrRefCount(nameFqn);
     if (nsObj) Tcl_DecrRefCount(nsObj);
@@ -4454,9 +4433,21 @@ static void TopLocals_Begin(Tcl_Interp* ip, ByteCode* bcPtr, TbcxTopFrameSave* s
         return;
     }
     /* Allocate compiled locals and directly link each slot to the target Var
-     * in the global namespace (no extra compilation, no upvar command call). */
-    f->compiledLocals = (Var*)Tcl_Alloc(sizeof(Var) * (size_t)n);
-    memset(f->compiledLocals, 0, sizeof(Var) * (size_t)n);
+     * in the global namespace (no extra compilation, no upvar command call).
+     * F2 fix: overflow-safe multiply — n derives from wire data. */
+    {
+        size_t varBytes;
+        if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes))
+        {
+            /* Overflow — fall back to no compiled locals (safe default) */
+            f->compiledLocals = NULL;
+            f->numCompiledLocals = 0;
+            sv->allocated = NULL;
+            return;
+        }
+        f->compiledLocals = (Var*)Tcl_Alloc(varBytes);
+        memset(f->compiledLocals, 0, varBytes);
+    }
     f->numCompiledLocals = n;
     sv->allocated = f->compiledLocals;
 
@@ -4697,9 +4688,30 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
 
         TopLocals_End(ip, &_sv);
 
-        /* Detach and free the temporary Proc. */
+        /* Detach and free the temporary Proc.
+         *
+         * F0 fix: FixLiteralPoolProcPtr propagated topProc to inner
+         * TBCX_LIT_BYTECODE literals in the top-level block (each
+         * incremented topProc->refCount).  We must NULL out those
+         * borrowed references BEFORE freeing topProc — otherwise
+         * Tcl_DecrRefCount(topBC) → TclCleanupByteCode on inner BCs
+         * would access freed memory via litBC->procPtr->refCount--. */
         if (topProc)
         {
+            if (top && top->numLitObjects > 0 && top->objArrayPtr)
+            {
+                for (Tcl_Size _fi = 0; _fi < top->numLitObjects; _fi++)
+                {
+                    if (!top->objArrayPtr[_fi])
+                        continue;
+                    ByteCode* litBC = TbcxGetByteCode(top->objArrayPtr[_fi]);
+                    if (litBC && litBC->procPtr == topProc)
+                    {
+                        litBC->procPtr = NULL;
+                        topProc->refCount--;
+                    }
+                }
+            }
             if (top)
                 top->procPtr = NULL;
             Tcl_DecrRefCount(topProc->bodyPtr);

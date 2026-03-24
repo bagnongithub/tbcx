@@ -353,16 +353,6 @@ void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
 void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
                         Namespace* ns, int cacheMode);
 
-/* Proposal #2: Pre-warm literal pool entries by JIT-compiling string
- * literals inside a proc body's ByteCode.  This ensures inner bodies
- * (while/for/foreach/try) get compiled with the correct procPtr BEFORE
- * execution, preventing SIGSEGV on coroutine yield/resume when Tcl
- * lazily compiles them with procPtr=NULL.
- *
- * Thread safety: must be called from the interp-owning thread.
- * The function temporarily sets iPtr->compiledProcPtr and restores it. */
-void TbcxPrewarmLiterals(ByteCode* bc, Proc* proc, Tcl_Interp* ip);
-
 /* Proposal #4: Post-load verification pass.
  * Walks all ByteCode objects reachable from topBC and verifies invariants:
  *   - procPtr is non-NULL on proc/method/lambda bodies

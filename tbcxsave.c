@@ -1660,8 +1660,15 @@ static void WriteLocalNames(TbcxOut* w, ByteCode* bc, uint32_t numLocals)
         return;
     if (bc && bc->procPtr && bc->procPtr->numCompiledLocals > 0)
     {
-        Tcl_Obj** tmp = (Tcl_Obj**)Tcl_Alloc((size_t)n * sizeof(Tcl_Obj*));
-        memset(tmp, 0, (size_t)n * sizeof(Tcl_Obj*));
+        /* F3 fix: overflow-safe multiply — n from numCompiledLocals */
+        size_t tmpBytes;
+        if (!tbcx_checked_mul((size_t)n, sizeof(Tcl_Obj*), &tmpBytes))
+        {
+            W_Error(w, "tbcx: local name array size overflow");
+            return;
+        }
+        Tcl_Obj** tmp = (Tcl_Obj**)Tcl_Alloc(tmpBytes);
+        memset(tmp, 0, tmpBytes);
         for (CompiledLocal* cl = bc->procPtr->firstLocalPtr; cl; cl = cl->nextPtr)
         {
             if (cl->frameIndex >= 0 && cl->frameIndex < n)
@@ -1768,8 +1775,17 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                         const char* bodyStr = Tbcx_GetStringFromObjSafe(elems[1], &bodyLen);
                         if (bodyLen >= 4)
                         {
+                            /* Skip leading whitespace — multi-line lambda bodies
+                               (natural Tcl formatting) start with \n + indentation. */
+                            const char* bp = bodyStr;
+                            Tcl_Size bpLen = bodyLen;
+                            while (bpLen > 0 && ((unsigned char)*bp <= ' '))
+                            {
+                                bp++;
+                                bpLen--;
+                            }
                             int startsWithLetter =
-                                ((bodyStr[0] >= 'a' && bodyStr[0] <= 'z') || (bodyStr[0] >= 'A' && bodyStr[0] <= 'Z'));
+                                (bpLen > 0 && ((bp[0] >= 'a' && bp[0] <= 'z') || (bp[0] >= 'A' && bp[0] <= 'Z')));
                             if (startsWithLetter)
                             {
                                 int hasSpace = 0, hasIndicator = 0;
@@ -1956,7 +1972,26 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
         }
     }
 
-    /* Fallback: emit as plain string */
+    /* Fallback: emit as plain string.
+     *
+     * KNOWN LIMITATION (S4): String literals that contain $var references
+     * (loop bodies, dict for/lmap bodies, try/catch handler bodies, eval
+     * bodies, expr bodies, format templates) reach this fallback and are
+     * stored as readable plaintext in the .tbcx file.  ~37 unique source
+     * strings leak across the test suite (~0.35% of 10,577 string literals).
+     *
+     * These cannot be safely precompiled at the literal-pool level because
+     * the saver cannot distinguish body arguments (foreach body, try handler)
+     * from data arguments (format templates, proc body strings built by
+     * double-quote interpolation).  Both are `push` + `invokeStk` in
+     * bytecode.  Precompiling a data string destroys its string rep on
+     * load (TBCX_LIT_BYTECODE has empty string rep), breaking format/proc
+     * calls that depend on the original text.
+     *
+     * A future fix requires instruction-level analysis: walking the bytecode
+     * instructions to identify which literal indices are body arguments to
+     * eval-like commands (foreach, while, for, try, dict for, lmap) and
+     * precompiling only those. */
     W_U32(w, TBCX_LIT_STRING);
     W_LPString(w, s, n);
 }
