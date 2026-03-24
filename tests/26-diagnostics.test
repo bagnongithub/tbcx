@@ -1,0 +1,524 @@
+# -*-Tcl-*-
+# 26-diagnostics.test - progressive isolation tests for known failures
+#
+# Each failure is decomposed into a chain of sub-tests from simplest
+# to most complex.  The first sub-test that FAILS identifies the
+# mechanism responsible.
+#
+# Run with:  tclsh all.tcl -file 26-diagnostics.test
+#
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# =====================================================================
+# GROUP A: adv.7 - proc creating procs with double-quoted body
+#
+# Failure: "invalid command name 10}" in proc add10
+# Hypothesis chain:
+#   A1: strcat of string fragments works at all
+#   A2: dynamic proc name ("add$n") works
+#   A3: dynamic proc body via double-quote interpolation works
+#   A4: ProcShim doesn't interfere with dynamic (non-marker) procs
+#   A5: full pattern (proc inside proc, called twice)
+# =====================================================================
+
+test diag.a1 {A1: strcat produces correct string} -body {
+    set out [makeFile "" diag.a1-out.tbcx]
+    tbcx::save {
+        set a "hello "
+        set b "world"
+        return "$a$b"
+    } $out
+    tbcx::load $out
+} -result {hello world}
+
+test diag.a2 {A2: dynamic proc name via variable} -body {
+    set out [makeFile "" diag.a2-out.tbcx]
+    tbcx::save {
+        set name "myfunc"
+        proc $name {} { return "ok" }
+        return [$name]
+    } $out
+    tbcx::load $out
+} -result ok
+
+test diag.a3 {A3: proc with static body created inside another proc} -body {
+    set out [makeFile "" diag.a3-out.tbcx]
+    tbcx::save {
+        proc maker {} {
+            proc inner {} { return 42 }
+        }
+        maker
+        return [inner]
+    } $out
+    tbcx::load $out
+} -result 42
+
+test diag.a4 {A4: proc with dynamic name created inside another proc} -body {
+    set out [makeFile "" diag.a4-out.tbcx]
+    tbcx::save {
+        proc maker {suffix} {
+            proc "fn_$suffix" {} { return "ok" }
+        }
+        maker hello
+        return [fn_hello]
+    } $out
+    tbcx::load $out
+} -result ok
+
+test diag.a5 {A5: double-quoted body with literal (no variable)} -body {
+    set out [makeFile "" diag.a5-out.tbcx]
+    tbcx::save {
+        proc maker {} {
+            proc dq_test {x} "expr {10 + 20}"
+        }
+        maker
+        return [dq_test ignored]
+    } $out
+    tbcx::load $out
+} -result 30
+
+test diag.a6 {A6: double-quoted body with $var interpolation} -body {
+    set out [makeFile "" diag.a6-out.tbcx]
+    tbcx::save {
+        proc maker {n} {
+            proc "dq_add" {x} "return $n"
+        }
+        maker 77
+        return [dq_add ignored]
+    } $out
+    tbcx::load $out
+} -result 77
+
+test diag.a7 {A7: strcat body - "expr {\$x + $n}" pattern} -body {
+    set out [makeFile "" diag.a7-out.tbcx]
+    tbcx::save {
+        set n 10
+        proc adder {x} "expr {\$x + $n}"
+        return [adder 5]
+    } $out
+    tbcx::load $out
+} -result 15
+
+test diag.a8 {A8: strcat body inside a proc (the adv.7 core)} -body {
+    set out [makeFile "" diag.a8-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            proc "add$n" {x} "expr {\$x + $n}"
+        }
+        make_adder 10
+        return [add10 5]
+    } $out
+    tbcx::load $out
+} -result 15
+
+test diag.a9 {A9: full adv.7 - two dynamic procs} -body {
+    set out [makeFile "" diag.a9-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            proc "add$n" {x} "expr {\$x + $n}"
+        }
+        make_adder 10
+        make_adder 20
+        return [list [add10 5] [add20 5]]
+    } $out
+    tbcx::load $out
+} -result {15 25}
+
+# =====================================================================
+# GROUP B: adv.28/af.23 - closure via format + apply
+#
+# Failure: apply returns {} instead of computed value
+# Hypothesis chain:
+#   B1: format produces correct string
+#   B2: apply with literal lambda works
+#   B3: apply with runtime-constructed lambda (list) works
+#   B4: apply with format-constructed lambda works
+#   B5: lambda constructed inside a proc works
+#   B6: full pattern (make_adder returning lambda, applied outside)
+# =====================================================================
+
+test diag.b1 {B1: format produces correct body string} -body {
+    set out [makeFile "" diag.b1-out.tbcx]
+    tbcx::save {
+        set body [format {expr {$x + %d}} 5]
+        return $body
+    } $out
+    tbcx::load $out
+} -result {expr {$x + 5}}
+
+test diag.b2 {B2: apply with literal lambda} -body {
+    set out [makeFile "" diag.b2-out.tbcx]
+    tbcx::save {
+        return [apply {{x} {expr {$x + 5}}} 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test diag.b3 {B3: apply with runtime-constructed lambda via list} -body {
+    set out [makeFile "" diag.b3-out.tbcx]
+    tbcx::save {
+        set body {expr {$x + 5}}
+        set lambda [list {x} $body]
+        return [apply $lambda 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test diag.b4 {B4: apply with format-constructed body} -body {
+    set out [makeFile "" diag.b4-out.tbcx]
+    tbcx::save {
+        set body [format {expr {$x + %d}} 5]
+        set lambda [list {x} $body]
+        return [apply $lambda 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test diag.b5 {B5: lambda built inside proc, returned and applied} -body {
+    set out [makeFile "" diag.b5-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            return [list {x} "expr {\$x + $n}"]
+        }
+        set fn [make_adder 5]
+        return [apply $fn 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test diag.b6 {B6: lambda via format inside proc} -body {
+    set out [makeFile "" diag.b6-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            return [list {x} [format {expr {$x + %d}} $n]]
+        }
+        set fn [make_adder 5]
+        return [apply $fn 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test diag.b7 {B7: full adv.28 - two closures} -body {
+    set out [makeFile "" diag.b7-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            return [list {x} [format {expr {$x + %d}} $n]]
+        }
+        set add5 [make_adder 5]
+        set add10 [make_adder 10]
+        return [list [apply $add5 3] [apply $add10 3]]
+    } $out
+    tbcx::load $out
+} -result {8 13}
+
+# =====================================================================
+# GROUP C: oo.26 - metaclass
+#
+# Failure: ::Oo26Animal does not refer to an object
+# Hypothesis chain:
+#   C1: basic oo::class create + method works
+#   C2: oo::class with superclass works
+#   C3: class with "self method" works
+#   C4: metaclass (superclass oo::class) created standalone
+#   C5: metaclass create producing a new class
+#   C6: full pattern - metaclass creates class, class creates object
+# =====================================================================
+
+test diag.c1 {C1: basic oo::class + method} -body {
+    set out [makeFile "" diag.c1-out.tbcx]
+    tbcx::save {
+        oo::class create DiagC1 {
+            method greet {} { return "hi" }
+        }
+        set o [DiagC1 new]
+        return [$o greet]
+    } $out
+    tbcx::load $out
+} -result hi
+
+test diag.c2 {C2: oo::class with superclass} -body {
+    set out [makeFile "" diag.c2-out.tbcx]
+    tbcx::save {
+        oo::class create DiagC2Base {
+            method base {} { return "base" }
+        }
+        oo::class create DiagC2Child {
+            superclass DiagC2Base
+            method child {} { return "child" }
+        }
+        set o [DiagC2Child new]
+        return [list [$o base] [$o child]]
+    } $out
+    tbcx::load $out
+} -result {base child}
+
+test diag.c3 {C3: class with self method (class-level method)} -body {
+    set out [makeFile "" diag.c3-out.tbcx]
+    tbcx::save {
+        oo::class create DiagC3 {
+            self method describe {} { return "I am DiagC3" }
+            method id {} { return "instance" }
+        }
+        return [list [DiagC3 describe] [[DiagC3 new] id]]
+    } $out
+    tbcx::load $out
+} -result {{I am DiagC3} instance}
+
+test diag.c4 {C4: metaclass creation (superclass oo::class)} -body {
+    set out [makeFile "" diag.c4-out.tbcx]
+    tbcx::save {
+        oo::class create DiagMeta {
+            superclass oo::class
+        }
+        return [info object class DiagMeta]
+    } $out
+    tbcx::load $out
+} -result ::oo::class
+
+test diag.c5 {C5: metaclass with self method create} -body {
+    set out [makeFile "" diag.c5-out.tbcx]
+    tbcx::save {
+        oo::class create DiagMeta5 {
+            superclass oo::class
+            self method create {name args} {
+                set cls [next $name {*}$args]
+                return $cls
+            }
+        }
+        return [info object class DiagMeta5]
+    } $out
+    tbcx::load $out
+} -result ::oo::class
+
+test diag.c6 {C6: metaclass create produces a new class} -body {
+    set out [makeFile "" diag.c6-out.tbcx]
+    tbcx::save {
+        oo::class create DiagMeta6 {
+            superclass oo::class
+            self method create {name args} {
+                set cls [next $name {*}$args]
+                return $cls
+            }
+        }
+        DiagMeta6 create DiagAnimal6 {
+            method speak {} { return "..." }
+        }
+        return [info object class DiagAnimal6]
+    } $out
+    tbcx::load $out
+} -result ::DiagMeta6
+
+test diag.c7 {C7: metaclass-created class instantiation} -body {
+    set out [makeFile "" diag.c7-out.tbcx]
+    tbcx::save {
+        oo::class create DiagMeta7 {
+            superclass oo::class
+            self method create {name args} {
+                set cls [next $name {*}$args]
+                return $cls
+            }
+        }
+        DiagMeta7 create DiagAnimal7 {
+            method speak {} { return "woof" }
+        }
+        set a [DiagAnimal7 new]
+        return [$a speak]
+    } $out
+    tbcx::load $out
+} -result woof
+
+# =====================================================================
+# GROUP D: 21-proposals "jumped interps"
+#
+# Failure: Tcl_EvalObj: compiled script jumped interps
+# Hypothesis chain:
+#   D1: basic save+load in same interp
+#   D2: save from file, load in same interp
+#   D3: save inline, load in same interp (the proposals pattern)
+#   D4: load in child interp (safe)
+#   D5: load in child interp (unsafe)
+#   D6: save in parent, load in child
+#   D7: namespace eval body in child interp
+# =====================================================================
+
+test diag.d1 {D1: inline save+load in current interp} -body {
+    set out [makeFile "" diag.d1-out.tbcx]
+    tbcx::save {
+        return 42
+    } $out
+    tbcx::load $out
+} -result 42
+
+test diag.d2 {D2: file save+load in current interp} -body {
+    set in  [makeFile { return 42 } diag.d2-in.tcl]
+    set out [makeFile "" diag.d2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 42
+
+test diag.d3 {D3: inline with namespace eval} -body {
+    set out [makeFile "" diag.d3-out.tbcx]
+    tbcx::save {
+        namespace eval ::diagd3 {
+            variable x 10
+        }
+        return $::diagd3::x
+    } $out
+    tbcx::load $out
+} -result 10
+
+test diag.d4 {D4: inline with proc + namespace eval} -body {
+    set out [makeFile "" diag.d4-out.tbcx]
+    tbcx::save {
+        namespace eval ::diagd4 {
+            variable v 1.0
+            proc get {} {
+                variable v
+                return $v
+            }
+        }
+        return [::diagd4::get]
+    } $out
+    tbcx::load $out
+} -result 1.0
+
+test diag.d5 {D5: load in child interp} -body {
+    set out [makeFile "" diag.d5-out.tbcx]
+    tbcx::save {
+        return "from-child"
+    } $out
+    set child [interp create]
+    $child eval [list lappend auto_path {*}$auto_path]
+    $child eval { package require tbcx }
+    set r [$child eval [list tbcx::load $out]]
+    interp delete $child
+    return $r
+} -result from-child
+
+test diag.d6 {D6: namespace eval body in child interp} -body {
+    set out [makeFile "" diag.d6-out.tbcx]
+    tbcx::save {
+        namespace eval ::diagd6 {
+            variable ver 2.0
+            proc get {} { variable ver; return $ver }
+        }
+        return [::diagd6::get]
+    } $out
+    set child [interp create]
+    $child eval [list lappend auto_path {*}$auto_path]
+    $child eval { package require tbcx }
+    set r [$child eval [list tbcx::load $out]]
+    interp delete $child
+    return $r
+} -result 2.0
+
+test diag.d7 {D7: proc + namespace eval in child interp} -body {
+    set out [makeFile "" diag.d7-out.tbcx]
+    tbcx::save {
+        namespace eval ::diagd7 {
+            variable v 1.0
+            variable name "tbcx"
+            proc info_get {} {
+                variable v; variable name
+                return [list $v $name]
+            }
+        }
+        return [::diagd7::info_get]
+    } $out
+    set child [interp create]
+    $child eval [list lappend auto_path {*}$auto_path]
+    $child eval { package require tbcx }
+    set r [$child eval [list tbcx::load $out]]
+    interp delete $child
+    return $r
+} -result {1.0 tbcx}
+
+test diag.d8 {D8: save+load entirely within child interp} -body {
+    set child [interp create]
+    $child eval [list lappend auto_path {*}$auto_path]
+    $child eval { package require tbcx }
+    set out [makeFile "" diag.d8-out.tbcx]
+    set r [$child eval [list apply {{out} {
+        tbcx::save {
+            namespace eval ::diagd8 {
+                variable x 99
+            }
+            return $::diagd8::x
+        } $out
+        tbcx::load $out
+    }} $out]]
+    interp delete $child
+    return $r
+} -result 99
+
+# =====================================================================
+# GROUP E: literal pool integrity (cross-cutting)
+#
+# These test that literals in proc bytecode pools aren't corrupted
+# by the save/serialize/load cycle - relevant to all failures.
+# =====================================================================
+
+test diag.e1 {E1: proc literal pool - string concat via strcat} -body {
+    set out [makeFile "" diag.e1-out.tbcx]
+    tbcx::save {
+        proc builder {prefix n} {
+            return "${prefix}_${n}"
+        }
+        return [builder hello 42]
+    } $out
+    tbcx::load $out
+} -result hello_42
+
+test diag.e2 {E2: proc literal pool - format inside proc} -body {
+    set out [makeFile "" diag.e2-out.tbcx]
+    tbcx::save {
+        proc fmt {n} {
+            return [format "value=%d" $n]
+        }
+        return [fmt 42]
+    } $out
+    tbcx::load $out
+} -result value=42
+
+test diag.e3 {E3: proc literal pool - format template with braces} -body {
+    set out [makeFile "" diag.e3-out.tbcx]
+    tbcx::save {
+        proc fmt_expr {n} {
+            return [format {expr {$x + %d}} $n]
+        }
+        return [fmt_expr 5]
+    } $out
+    tbcx::load $out
+} -result {expr {$x + 5}}
+
+test diag.e4 {E4: invokeStk with 4 args (proc command pattern)} -body {
+    set out [makeFile "" diag.e4-out.tbcx]
+    tbcx::save {
+        proc outer {n} {
+            set name "inner_$n"
+            set body "return $n"
+            proc $name {} $body
+        }
+        outer 77
+        return [inner_77]
+    } $out
+    tbcx::load $out
+} -result 77
+
+test diag.e5 {E5: string rep preservation through save/load} -body {
+    set out [makeFile "" diag.e5-out.tbcx]
+    tbcx::save {
+        proc check {} {
+            set template {expr {$x + %d}}
+            set filled [format $template 10]
+            # Verify both strings survived
+            return [list $template $filled]
+        }
+        return [check]
+    } $out
+    tbcx::load $out
+} -result {{expr {$x + %d}} {expr {$x + 10}}}
+
+cleanupTests
