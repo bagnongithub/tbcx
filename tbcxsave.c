@@ -2848,15 +2848,28 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
         {
             (void)ISCAN_POP();
         }
-        /* ---- Stack-producing (1 value) ---- */
+        /* ---- Stack-producing (1 value, no stack consumption) ---- */
         else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray") ||
-                 InstrIs(nm, "loadStk") || InstrIs(nm, "dup") ||
+                 InstrIs(nm, "dup") ||
                  InstrIs(nm, "over") || InstrIs(nm, "nsupvar") ||
                  InstrIs(nm, "upvar") || InstrIs(nm, "variable"))
         {
             ISCAN_PUSH(-1);
         }
-        /* ---- storeScalar/storeArray: pops val, stores, pushes val back ---- */
+        /* ---- loadStk: pops varname, pushes value ---- */
+        else if (InstrIs(nm, "loadStk"))
+        {
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- loadArrayStk: pops arrayname+index, pushes value ---- */
+        else if (InstrIs(nm, "loadArrayStk"))
+        {
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- storeScalar/storeArray: uses LVT, pops val, pushes val back ---- */
         else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
         {
             if (sp > 0) stk[sp - 1] = -1;
@@ -2867,6 +2880,45 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
+        }
+        /* ---- storeArrayStk: pops arrayname+index+val, pushes val ---- */
+        else if (InstrIs(nm, "storeArrayStk"))
+        {
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- incrStkImm: pops varname, pushes incremented value ---- */
+        else if (InstrIs(nm, "incrStkImm") || InstrIs(nm, "existStk"))
+        {
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- incrStk/lappendStk/appendStk: pops varname+value, pushes result ---- */
+        else if (InstrIs(nm, "incrStk") || InstrIs(nm, "lappendStk") ||
+                 InstrIs(nm, "appendStk"))
+        {
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- lappendListStk: pops varname+list, pushes result ---- */
+        else if (InstrIs(nm, "lappendListStk"))
+        {
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- unsetStk: pops varname, pushes nothing ---- */
+        else if (InstrIs(nm, "unsetStk"))
+        {
+            (void)ISCAN_POP();
+        }
+        /* ---- returnStk: pops options+value ---- */
+        else if (InstrIs(nm, "returnStk"))
+        {
+            sp = 0;
         }
         /* ---- strcat N, list N, concat N: pop N, push 1 ---- */
         else if (InstrIs(nm, "strcat") || InstrIs(nm, "list") ||
@@ -2902,7 +2954,7 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
                  InstrIs(nm, "uminus") || InstrIs(nm, "uplus") ||
                  InstrIs(nm, "not") || InstrIs(nm, "tryCvtToNumeric") ||
                  InstrIs(nm, "exprStk") || InstrIs(nm, "existScalar") ||
-                 InstrIs(nm, "existArray") || InstrIs(nm, "existStk") ||
+                 InstrIs(nm, "existArray") ||
                  InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray") ||
                  InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray") ||
                  InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray") ||
