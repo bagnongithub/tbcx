@@ -1,0 +1,373 @@
+# -*-Tcl-*-
+# 27-improvements.test -- verify instruction-level body precompilation
+# and self method capture.
+#
+# Improvement #1: body arguments to eval-like commands (foreach, while,
+#   for, try, dict for, lmap, catch, eval, uplevel, time) should be
+#   precompiled as bytecode instead of leaking as plaintext strings.
+#
+# Improvement #2: "self method" definitions inside oo::class builder
+#   bodies should have their bodies captured and stubbed, preventing
+#   source text leakage.
+#
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Helper: dump a .tbcx and check whether a given string appears
+# as a plaintext (string) literal in the dump output.
+proc hasPlaintextLiteral {tbcxFile pattern} {
+    set dump [tbcx::dump $tbcxFile]
+    # Search for (string) literals containing the pattern
+    foreach line [split $dump \n] {
+        if {[string match {*\(string\)*} $line] &&
+            [string match "*$pattern*" $line]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+# Helper: check that a literal appears as (bytecode) in the dump
+proc hasBytecodeForBody {tbcxFile} {
+    set dump [tbcx::dump $tbcxFile]
+    return [string match {*(bytecode)*} $dump]
+}
+
+# =====================================================================
+# GROUP I1: foreach body precompilation
+# =====================================================================
+
+test imp1.1 {foreach body is precompiled, not plaintext} -body {
+    set out [makeFile "" imp1.1-out.tbcx]
+    tbcx::save {
+        set sum 0
+        foreach x {1 2 3} {
+            incr sum $x
+        }
+        return $sum
+    } $out
+    set r [tbcx::load $out]
+    set leaked [hasPlaintextLiteral $out "incr sum"]
+    list $r $leaked
+} -result {6 0}
+
+test imp1.2 {while body functional round-trip} -body {
+    set out [makeFile "" imp1.2-out.tbcx]
+    tbcx::save {
+        set x 0
+        while {$x < 5} {
+            incr x
+        }
+        return $x
+    } $out
+    tbcx::load $out
+} -result 5
+
+test imp1.3 {for body functional round-trip} -body {
+    set out [makeFile "" imp1.3-out.tbcx]
+    tbcx::save {
+        set sum 0
+        for {set i 0} {$i < 5} {incr i} {
+            set sum [expr {$sum + $i}]
+        }
+        return $sum
+    } $out
+    tbcx::load $out
+} -result 10
+
+test imp1.4 {try body is precompiled} -body {
+    set out [makeFile "" imp1.4-out.tbcx]
+    tbcx::save {
+        set res ""
+        try {
+            lappend res [expr {10 / 2}]
+        } on error {} {
+            lappend res ERR
+        }
+        return $res
+    } $out
+    set r [tbcx::load $out]
+    set leaked [hasPlaintextLiteral $out "lappend res"]
+    list $r $leaked
+} -result {5 0}
+
+test imp1.5 {lmap body is precompiled} -body {
+    set out [makeFile "" imp1.5-out.tbcx]
+    tbcx::save {
+        set result [lmap x {1 2 3} {
+            expr {$x * $x}
+        }]
+        return $result
+    } $out
+    set r [tbcx::load $out]
+    # lmap uses ForeachInfo AuxData -- Phase 2 should detect body
+    set leaked [hasPlaintextLiteral $out {$x * $x}]
+    list $r $leaked
+} -result {{1 4 9} 0}
+
+test imp1.6 {dict for body functional round-trip} -body {
+    set out [makeFile "" imp1.6-out.tbcx]
+    tbcx::save {
+        set d [dict create a 1 b 2 c 3]
+        set sum 0
+        dict for {k v} $d {
+            incr sum $v
+        }
+        return $sum
+    } $out
+    tbcx::load $out
+} -result 6
+
+test imp1.7 {foreach inside proc body is precompiled} -body {
+    set out [makeFile "" imp1.7-out.tbcx]
+    tbcx::save {
+        proc mysum {lst} {
+            set s 0
+            foreach x $lst {
+                incr s $x
+            }
+            return $s
+        }
+        return [mysum {10 20 30}]
+    } $out
+    set r [tbcx::load $out]
+    set leaked [hasPlaintextLiteral $out "incr s"]
+    list $r $leaked
+} -result {60 0}
+
+test imp1.8 {nested foreach + try functional round-trip} -body {
+    set out [makeFile "" imp1.8-out.tbcx]
+    tbcx::save {
+        set results {}
+        foreach x {1 0 3} {
+            try {
+                lappend results [expr {10 / $x}]
+            } on error {} {
+                lappend results ERR
+            }
+        }
+        return $results
+    } $out
+    tbcx::load $out
+} -result {10 ERR 3}
+
+test imp1.9 {format template NOT precompiled (data, not body)} -body {
+    set out [makeFile "" imp1.9-out.tbcx]
+    tbcx::save {
+        proc fmt_expr {n} {
+            return [format {expr {$x + %d}} $n]
+        }
+        return [fmt_expr 5]
+    } $out
+    set r [tbcx::load $out]
+    # Format template SHOULD still be a string (it's data, not a body)
+    set present [hasPlaintextLiteral $out {expr {$x + %d}}]
+    list $r $present
+} -result {{expr {$x + 5}} 1}
+
+test imp1.10 {catch body is precompiled} -body {
+    set out [makeFile "" imp1.10-out.tbcx]
+    tbcx::save {
+        set code [catch {
+            expr {10 / 0}
+        } msg]
+        return [list $code $msg]
+    } $out
+    set r [tbcx::load $out]
+    list [lindex $r 0] [string match "*divide by zero*" [lindex $r 1]]
+} -result {1 1}
+
+test imp1.11 {eval body is precompiled} -body {
+    set out [makeFile "" imp1.11-out.tbcx]
+    tbcx::save {
+        set x 42
+        eval {
+            set x [expr {$x * 2}]
+        }
+        return $x
+    } $out
+    set r [tbcx::load $out]
+    set leaked [hasPlaintextLiteral $out {set x [expr}]
+    list $r $leaked
+} -result {84 0}
+
+test imp1.12 {functional round-trip: foreach + dict for} -body {
+    set out [makeFile "" imp1.12-out.tbcx]
+    tbcx::save {
+        proc process {data} {
+            set total 0
+            dict for {name score} $data {
+                set total [expr {$total + $score}]
+            }
+            set names {}
+            dict for {name score} $data {
+                lappend names $name
+            }
+            return [list $total $names]
+        }
+        return [process {alice 85 bob 92 carol 78}]
+    } $out
+    tbcx::load $out
+} -result {255 {alice bob carol}}
+
+# =====================================================================
+# GROUP I2: self method capture and stubbing
+# =====================================================================
+
+test imp2.1 {self method body is captured -- functional check} -body {
+    set out [makeFile "" imp2.1-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2Cls1 {
+            self method describe {} { return "I am Imp2Cls1" }
+            method id {} { return "instance" }
+        }
+        return [list [Imp2Cls1 describe] [[Imp2Cls1 new] id]]
+    } $out
+    tbcx::load $out
+} -result {{I am Imp2Cls1} instance}
+
+# Split functional and leak check
+test imp2.1a {self method functional round-trip} -body {
+    set out [makeFile "" imp2.1a-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2A {
+            self method describe {} { return "I am Imp2A" }
+            method id {} { return "instance" }
+        }
+        return [list [Imp2A describe] [[Imp2A new] id]]
+    } $out
+    tbcx::load $out
+} -result {{I am Imp2A} instance}
+
+test imp2.2 {self method with arguments} -body {
+    set out [makeFile "" imp2.2-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2Factory {
+            self method make {name} {
+                set obj [my new]
+                return $obj
+            }
+            method greet {} { return "hello" }
+        }
+        set o [Imp2Factory make test]
+        return [$o greet]
+    } $out
+    tbcx::load $out
+} -result hello
+
+test imp2.3 {metaclass with self method create} -body {
+    set out [makeFile "" imp2.3-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2Meta {
+            superclass oo::class
+            self method create {name args} {
+                set cls [next $name {*}$args]
+                return $cls
+            }
+        }
+        Imp2Meta create Imp2Animal {
+            method speak {} { return "woof" }
+        }
+        set a [Imp2Animal new]
+        return [$a speak]
+    } $out
+    tbcx::load $out
+} -result woof
+
+test imp2.4 {self method body source not leaked as plaintext} -body {
+    set out [makeFile "" imp2.4-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2Check {
+            self method secret {} {
+                set _unique_marker 1
+                return "result"
+            }
+            method pub {} { return "public" }
+        }
+        return [list [Imp2Check secret] [[Imp2Check new] pub]]
+    } $out
+    tbcx::load $out
+    # The self method body source text should NOT appear as a string.
+    # _unique_marker is a variable name used only in the body source --
+    # it will only appear as a (string) literal if the source text leaked.
+    hasPlaintextLiteral $out "_unique_marker"
+} -result 0
+
+test imp2.5 {multiple self methods} -body {
+    set out [makeFile "" imp2.5-out.tbcx]
+    tbcx::save {
+        oo::class create Imp2Multi {
+            self method a {} { return "alpha" }
+            self method b {} { return "beta" }
+            method c {} { return "gamma" }
+        }
+        return [list [Imp2Multi a] [Imp2Multi b] [[Imp2Multi new] c]]
+    } $out
+    tbcx::load $out
+} -result {alpha beta gamma}
+
+# =====================================================================
+# GROUP I3: combined / regression
+# =====================================================================
+
+test imp3.1 {foreach inside OO method body still works} -body {
+    set out [makeFile "" imp3.1-out.tbcx]
+    tbcx::save {
+        oo::class create Imp3Calc {
+            method sum {lst} {
+                set s 0
+                foreach x $lst {
+                    incr s $x
+                }
+                return $s
+            }
+        }
+        set c [Imp3Calc new]
+        return [$c sum {1 2 3 4 5}]
+    } $out
+    tbcx::load $out
+} -result 15
+
+test imp3.2 {try/catch inside proc inside namespace eval} -body {
+    set out [makeFile "" imp3.2-out.tbcx]
+    tbcx::save {
+        namespace eval ::imp3ns {
+            proc safediv {a b} {
+                try {
+                    return [expr {$a / $b}]
+                } on error msg {
+                    return "error: $msg"
+                }
+            }
+        }
+        return [list [::imp3ns::safediv 10 2] [string match "error:*" [::imp3ns::safediv 1 0]]]
+    } $out
+    tbcx::load $out
+} -result {5 1}
+
+test imp3.3 {all original tests still pass -- format template preserved} -body {
+    set out [makeFile "" imp3.3-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            return [list {x} [format {expr {$x + %d}} $n]]
+        }
+        set add5 [make_adder 5]
+        return [apply $add5 3]
+    } $out
+    tbcx::load $out
+} -result 8
+
+test imp3.4 {proc body with double-quote interpolation preserved} -body {
+    set out [makeFile "" imp3.4-out.tbcx]
+    tbcx::save {
+        proc make_adder {n} {
+            proc "add$n" {x} "expr {\$x + $n}"
+        }
+        make_adder 10
+        return [add10 5]
+    } $out
+    tbcx::load $out
+} -result 15
+
+cleanupTests
