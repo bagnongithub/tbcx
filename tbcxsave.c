@@ -2625,11 +2625,12 @@ static const BodyCmdRule sBodyCmds[] = {
     {NULL, 0}
 };
 
-/* "dict for" / "dict map" have body as last arg, but the command name
-   is "dict" with subcommand "for"/"map" as the second pushed value. */
+/* "dict for/map/update/with" have body as last arg, but the command name
+   is "dict" with subcommand as the second pushed value. */
 static int IsDictBodySubcmd(const char* sub)
 {
-    return (strcmp(sub, "for") == 0 || strcmp(sub, "map") == 0);
+    return (strcmp(sub, "for") == 0 || strcmp(sub, "map") == 0 ||
+            strcmp(sub, "update") == 0 || strcmp(sub, "with") == 0);
 }
 
 /* Return 1 if the string looks like a compilable script body.
@@ -2756,6 +2757,27 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
                 int base = sp - argc;
                 int cmdLitIdx = stk[base];
 
+                /* Helper macro: mark a literal index for precompilation */
+#define MARK_BODY(idx) do { \
+    int _bi = (idx); \
+    if (_bi >= 0 && _bi < numLits) { \
+        Tcl_Obj* _bo = bc->objArrayPtr[_bi]; \
+        if (_bo && _bo->typePtr != tbcxTyProcBody) { \
+            Tcl_Size _bl = 0; \
+            const char* _bs = Tbcx_GetStringFromObjSafe(_bo, &_bl); \
+            if (LooksLikeScriptBody(_bs, _bl)) { \
+                if (phase2marks) phase2marks[_bi] = 1; \
+                if (!TbcxGetByteCode(_bo)) { \
+                    int _isNew; \
+                    Tcl_HashEntry* _he = Tcl_CreateHashEntry( \
+                        &ctx->instrBodyLits, (const char*)_bo, &_isNew); \
+                    if (_isNew) Tcl_SetHashValue(_he, (void*)bc->nsPtr); \
+                } \
+            } \
+        } \
+    } \
+} while(0)
+
                 /* Resolve command name from literal pool */
                 if (cmdLitIdx >= 0 && cmdLitIdx < numLits && bc->objArrayPtr[cmdLitIdx])
                 {
@@ -2772,6 +2794,15 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
                             if (IsDictBodySubcmd(sub))
                                 bodyLitIdx = stk[base + argc - 1]; /* last arg */
                         }
+                    }
+                    /* FQN dict forms: ::tcl::dict::for, ::tcl::dict::map,
+                       ::tcl::dict::update, ::tcl::dict::with — body is last arg */
+                    else if (strncmp(cmdStr, "tcl::dict::", 11) == 0)
+                    {
+                        const char* sub = cmdStr + 11;
+                        if (strcmp(sub, "for") == 0 || strcmp(sub, "map") == 0 ||
+                            strcmp(sub, "update") == 0 || strcmp(sub, "with") == 0)
+                            bodyLitIdx = stk[base + argc - 1];
                     }
                     /* "self method NAME ARGS BODY" -- body is last arg */
                     else if (strcmp(cmdStr, "self") == 0 && argc >= 5)
@@ -2800,37 +2831,45 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
                         }
                     }
 
-                    /* Record the body literal for precompilation */
-                    if (bodyLitIdx >= 0 && bodyLitIdx < numLits)
+                    /* Mark the primary body literal */
+                    MARK_BODY(bodyLitIdx);
+
+                    /* try handler bodies: try BODY ?on|trap TYPE ?VARLIST? HANDLER?...
+                       Handler bodies follow on/trap keywords at variable positions.
+                       Tcl syntax: on TYPE HANDLER or on TYPE VARLIST HANDLER.
+                       Mark both possible handler positions — LooksLikeScriptBody
+                       inside MARK_BODY filters out non-body literals like varlist
+                       names ("msg", "error") safely. */
+                    if (strcmp(cmdStr, "try") == 0 && argc >= 4)
                     {
-                        Tcl_Obj* bodyObj = bc->objArrayPtr[bodyLitIdx];
-                        if (bodyObj && bodyObj->typePtr != tbcxTyProcBody)
+                        int pos = 2; /* skip "try" and BODY */
+                        while (pos < argc)
                         {
-                            Tcl_Size bl = 0;
-                            const char* bs = Tbcx_GetStringFromObjSafe(bodyObj, &bl);
-                            if (LooksLikeScriptBody(bs, bl))
+                            int kwIdx = stk[base + pos];
+                            if (kwIdx < 0 || kwIdx >= numLits || !bc->objArrayPtr[kwIdx])
+                                break;
+                            const char* kw = Tbcx_GetStringSafe(bc->objArrayPtr[kwIdx]);
+                            if (strcmp(kw, "on") == 0 || strcmp(kw, "trap") == 0)
                             {
-                                /* Mark in phase2marks[] (per-block index) —
-                                   bypasses WriteLiteral entirely in
-                                   WriteCompiledBlock, immune to stripActive
-                                   and type-based dispatch issues. */
-                                if (phase2marks)
-                                    phase2marks[bodyLitIdx] = 1;
-                                /* Also mark in instrBodyLits for the
-                                   WriteLit_Untyped path (non-stripped blocks
-                                   where the literal is still string-typed). */
-                                if (!TbcxGetByteCode(bodyObj))
-                                {
-                                    int isNew;
-                                    Tcl_HashEntry* he = Tcl_CreateHashEntry(
-                                        &ctx->instrBodyLits, (const char*)bodyObj, &isNew);
-                                    if (isNew)
-                                        Tcl_SetHashValue(he, (void*)bc->nsPtr);
-                                }
+                                /* on/trap TYPE ?VARLIST? HANDLER — mark both
+                                   pos+2 (3-word) and pos+3 (4-word) */
+                                if (pos + 2 < argc)
+                                    MARK_BODY(stk[base + pos + 2]);
+                                if (pos + 3 < argc)
+                                    MARK_BODY(stk[base + pos + 3]);
+                                pos += 4; /* advance past longest form */
                             }
+                            else if (strcmp(kw, "finally") == 0)
+                            {
+                                if (pos + 1 < argc)
+                                    MARK_BODY(stk[base + pos + 1]);
+                                break;
+                            }
+                            else break;
                         }
                     }
                 }
+#undef MARK_BODY
             }
 
             /* Pop argc, push result (-1) */
