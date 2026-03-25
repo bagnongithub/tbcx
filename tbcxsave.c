@@ -53,6 +53,16 @@ typedef struct TbcxCtx
        literals that have empty/invalidated string reps. */
     Tcl_HashTable emittedPtrs; /* ONE_WORD_KEYS: Tcl_Obj* -> 1 */
     int emittedPtrsInit;
+    /* Improvement #1: instruction-level body literal detection.
+       Maps Tcl_Obj* (literal pointer) -> Namespace* (compilation target).
+       Populated per-block by InstrScanBodyLiterals Phase 1 (invokeStk
+       analysis); checked by WriteLit_Untyped to precompile body arguments
+       to eval-like commands (try, catch, eval, uplevel, time, timerate,
+       dict for/map, self method).
+       Phase 2 (foreach/lmap bodies) uses a separate per-block index array
+       (phase2marks[]) to avoid Tcl_Obj* pointer sharing contamination. */
+    Tcl_HashTable instrBodyLits; /* ONE_WORD_KEYS: Tcl_Obj* -> Namespace* */
+    int instrBodyInit;
     /* Instrumentation for runaway detection */
     uint64_t totalLiterals; /* total WriteLiteral calls */
     uint64_t totalBlocks;   /* total WriteCompiledBlock calls */
@@ -97,6 +107,7 @@ typedef struct
 } ClsSet;
 
 #define DEF_F_FROM_BUILDER 0x01
+#define DEF_F_SELF_METHOD  0x02  /* self method (class-level, emitted differently in stubs) */
 #define DEF_KIND_PROC 0
 #define DEF_KIND_INST 1
 #define DEF_KIND_CLASS 2
@@ -1831,7 +1842,8 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
             int isNew;
             Tcl_CreateHashEntry(&ctx->emittedBodies, s, &isNew);
         }
-        W_U32(w, TBCX_LIT_BYTECODE);
+        W_U32(w, TBCX_LIT_BYTESRC);
+        W_LPString(w, s, n);
         Lit_Bytecode(w, ctx, compiled);
         return;
     }
@@ -1912,7 +1924,7 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                                 Tcl_CreateHashEntry(&ctx->emittedBodies, s, &isNew);
                             }
                             ctx->precompileDepth++;
-                            W_U32(w, TBCX_LIT_BYTECODE);
+                            W_U32(w, TBCX_LIT_BYTESRC); W_LPString(w, s, n);
                             Lit_Bytecode(w, ctx, copy);
                             ctx->precompileDepth--;
                             Tcl_DecrRefCount(copy);
@@ -1927,6 +1939,56 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                 }
             }
         } /* !alreadyEmitted */
+    }
+
+    /* Improvement #1: instruction-level body literal precompilation.
+       If InstrScanBodyLiterals marked this literal as a body argument
+       to an eval-like command (try, catch, eval, uplevel, etc.), compile
+       it now into bytecode.  This prevents the source from leaking as
+       plaintext in the .tbcx file.
+       Skip if already emitted (dedup) or if it doesn't look like a script. */
+    if (ctx && ctx->instrBodyInit && n >= 2)
+    {
+        Tcl_HashEntry* ihe = Tcl_FindHashEntry(&ctx->instrBodyLits, (const char*)obj);
+        if (ihe)
+        {
+            int alreadyEmitted = 0;
+            if (ctx->emittedInit)
+            {
+                int isNew;
+                Tcl_CreateHashEntry(&ctx->emittedBodies, s, &isNew);
+                if (!isNew)
+                    alreadyEmitted = 1;
+            }
+            if (!alreadyEmitted && ctx->precompileDepth < 3)
+            {
+                Namespace* targetNs = (Namespace*)Tcl_GetHashValue(ihe);
+                if (!targetNs)
+                    targetNs = (Namespace*)Tcl_GetGlobalNamespace(ctx->interp);
+                Tcl_Obj* copy = Tcl_DuplicateObj(obj);
+                Tcl_IncrRefCount(copy);
+                if (TclSetByteCodeFromAny(ctx->interp, copy, NULL, NULL) == TCL_OK)
+                {
+                    ByteCode* ibc = TbcxGetByteCode(copy);
+                    if (ibc)
+                    {
+                        ibc->nsPtr = targetNs;
+                        ibc->nsEpoch = targetNs->resolverEpoch;
+                        ctx->precompileDepth++;
+                        W_U32(w, TBCX_LIT_BYTESRC); W_LPString(w, s, n);
+                        Lit_Bytecode(w, ctx, copy);
+                        ctx->precompileDepth--;
+                        Tcl_DecrRefCount(copy);
+                        return;
+                    }
+                }
+                else
+                {
+                    Tcl_ResetResult(ctx->interp);
+                }
+                Tcl_DecrRefCount(copy);
+            }
+        }
     }
 
     /* Integer fidelity: Tcl's compiler sometimes stores integer
@@ -1974,24 +2036,50 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
 
     /* Fallback: emit as plain string.
      *
-     * KNOWN LIMITATION (S4): String literals that contain $var references
-     * (loop bodies, dict for/lmap bodies, try/catch handler bodies, eval
-     * bodies, expr bodies, format templates) reach this fallback and are
-     * stored as readable plaintext in the .tbcx file.  ~37 unique source
-     * strings leak across the test suite (~0.35% of 10,577 string literals).
+     * NOTE (S4, updated): Improvement #1 uses two-phase detection:
+     *   Phase 1: instruction-level invokeStk pattern analysis detects
+     *     body arguments to try, catch, eval, uplevel, time, timerate,
+     *     dict for/map, self method.  Marks stored in ctx->instrBodyLits
+     *     (Tcl_Obj* keys) and checked by WriteLit_Untyped.
+     *   Phase 2: per-block index-based detection for foreach/lmap bodies
+     *     compiled with specialized opcodes.  Marks stored in a local
+     *     phase2marks[] array (indexed by literal position, not Tcl_Obj*),
+     *     applied directly in WriteCompiledBlock before WriteLiteral.
+     *     This avoids cross-block Tcl_Obj* pointer sharing contamination.
      *
-     * These cannot be safely precompiled at the literal-pool level because
-     * the saver cannot distinguish body arguments (foreach body, try handler)
-     * from data arguments (format templates, proc body strings built by
-     * double-quote interpolation).  Both are `push` + `invokeStk` in
-     * bytecode.  Precompiling a data string destroys its string rep on
-     * load (TBCX_LIT_BYTECODE has empty string rep), breaking format/proc
-     * calls that depend on the original text.
-     *
-     * A future fix requires instruction-level analysis: walking the bytecode
-     * instructions to identify which literal indices are body arguments to
-     * eval-like commands (foreach, while, for, try, dict for, lmap) and
-     * precompiling only those. */
+     * Remaining leaks: while/for loop bodies (no foreach_start marker). */
+
+    /* Bug fix: strings with non-ASCII content (bytes >= 0x80 in UTF-8 rep)
+       may suffer from modified-UTF-8 round-trip issues on load.  In particular,
+       U+0000 is encoded as 0xC0 0x80 in Tcl's internal modified UTF-8, but
+       Tcl_NewStringObj may misinterpret this overlong sequence.  Strings where
+       all characters have code points <= 255 can be losslessly serialized as
+       TBCX_LIT_BYTEARR instead, avoiding the UTF-8 round-trip entirely. */
+    {
+        int hasHighByte = 0;
+        for (Tcl_Size i = 0; i < n && i < 4096; i++)
+        {
+            if ((unsigned char)s[i] >= 0x80) { hasHighByte = 1; break; }
+        }
+        if (hasHighByte)
+        {
+            /* Probe a copy as bytearray — succeeds iff all code points <= 255 */
+            Tcl_Obj* probe = Tcl_DuplicateObj(obj);
+            Tcl_IncrRefCount(probe);
+            Tcl_Size bLen = 0;
+            unsigned char* bytes = Tbcx_GetByteArrayFromObjSafe(probe, &bLen);
+            if (bytes && bLen > 0)
+            {
+                W_U32(w, TBCX_LIT_BYTEARR);
+                W_U32(w, (uint32_t)bLen);
+                W_Bytes(w, bytes, (size_t)bLen);
+                Tcl_DecrRefCount(probe);
+                return;
+            }
+            Tcl_DecrRefCount(probe);
+        }
+    }
+
     W_U32(w, TBCX_LIT_STRING);
     W_LPString(w, s, n);
 }
@@ -2206,7 +2294,10 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
             }
             else
             {
-                W_U32(w, TBCX_LIT_BYTECODE);
+                Tcl_Size _srcLen = 0;
+                const char* _srcStr = Tbcx_GetStringFromObjSafe(obj, &_srcLen);
+                W_U32(w, TBCX_LIT_BYTESRC);
+                W_LPString(w, _srcStr, _srcLen);
                 Lit_Bytecode(w, ctx, obj);
             }
         }
@@ -2261,8 +2352,13 @@ static void WriteLiteral(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
                             }
                         }
                     }
-                    W_U32(w, TBCX_LIT_BYTECODE);
-                    Lit_Bytecode(w, ctx, p->bodyPtr);
+                    {
+                        Tcl_Size _srcLen2 = 0;
+                        const char* _srcStr2 = Tbcx_GetStringFromObjSafe(p->bodyPtr, &_srcLen2);
+                        W_U32(w, TBCX_LIT_BYTESRC);
+                        W_LPString(w, _srcStr2, _srcLen2);
+                        Lit_Bytecode(w, ctx, p->bodyPtr);
+                    }
                     return;
                 }
             }
@@ -2496,6 +2592,406 @@ static Tcl_Obj* ResolveToBytecodeObj(Tcl_Obj* cand)
     return NULL;
 }
 
+/* ==========================================================================
+ * Improvement #1: Instruction-level body literal detection.
+ *
+ * Walks the bytecode instruction stream of a compiled block, looking for
+ * the pattern:  push cmd; push arg0; ... push argN; invokeStk (N+1)
+ * If `cmd` is a body-evaluating command (foreach, while, for, try, etc.),
+ * the body-argument literal is recorded in ctx->instrBodyLits so that
+ * WriteLit_Untyped can precompile it instead of emitting plaintext.
+ *
+ * Uses a forward-pass stack model: each stack slot records either a
+ * literal index (>=0) or -1 (non-literal / runtime value).  Only the
+ * ~20 most common instructions are modeled; unknown opcodes reset the
+ * stack conservatively.
+ * ========================================================================== */
+
+/* Body-argument position rules for eval-like commands.
+   bodyPos: 0 = last argument, N>0 = Nth arg (1-based from first non-cmd arg).
+   For "dict": subcmd-aware, handled specially. */
+typedef struct { const char* cmd; int bodyPos; } BodyCmdRule;
+static const BodyCmdRule sBodyCmds[] = {
+    {"foreach",  0},   /* last arg */
+    {"lmap",     0},   /* last arg */
+    {"for",      0},   /* last arg (4th of 4) */
+    {"while",    0},   /* last arg (2nd of 2) */
+    {"try",      1},   /* first arg */
+    {"catch",    1},   /* first arg */
+    {"eval",     1},   /* first arg */
+    {"uplevel",  0},   /* last arg */
+    {"time",     1},   /* first arg */
+    {"timerate", 1},   /* first arg */
+    {NULL, 0}
+};
+
+/* "dict for" / "dict map" have body as last arg, but the command name
+   is "dict" with subcommand "for"/"map" as the second pushed value. */
+static int IsDictBodySubcmd(const char* sub)
+{
+    return (strcmp(sub, "for") == 0 || strcmp(sub, "map") == 0);
+}
+
+/* Return 1 if the string looks like a compilable script body.
+   Strict test: requires BOTH a command indicator ($varname or [cmd])
+   AND a word separator (space/tab/newline).  This excludes data strings,
+   format templates (which ARE pushed), strcat fragments, etc.
+   Examples:
+     "incr sum $x"      → $x + space → YES
+     "set a [expr ...]"  → [expr + space → YES
+     "a\tb\nc"           → no $var or [cmd] → NO
+     "  hello  "         → no $var or [cmd] → NO
+     "expr {$x + %d}"   → $x + space → YES (but is pushed, so Phase 2 skips)
+     "$x"                → $x but no space → NO */
+static int LooksLikeScriptBody(const char* s, Tcl_Size n)
+{
+    if (n < 4) return 0;
+    int hasCmdIndicator = 0;
+    int hasWordSep = 0;
+    Tcl_Size limit = (n < 300) ? n : 300;
+    for (Tcl_Size i = 0; i < limit; i++)
+    {
+        char c = s[i];
+        /* $varname: $ followed by letter or underscore or :: */
+        if (c == '$' && i + 1 < n)
+        {
+            char nx = s[i + 1];
+            if ((nx >= 'a' && nx <= 'z') || (nx >= 'A' && nx <= 'Z') ||
+                nx == '_' || nx == ':')
+                hasCmdIndicator = 1;
+        }
+        /* [command] */
+        if (c == '[')
+            hasCmdIndicator = 1;
+        /* Word separator */
+        if (c == ' ' || c == '\t' || c == '\n')
+            hasWordSep = 1;
+        if (hasCmdIndicator && hasWordSep)
+            return 1;
+    }
+    return 0;
+}
+
+/* Check if instruction name starts with given prefix. */
+static int InstrIs(const char* name, const char* prefix)
+{
+    while (*prefix)
+    {
+        if (*name != *prefix) return 0;
+        name++; prefix++;
+    }
+    return 1;
+}
+
+static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
+{
+    if (!bc || !ctx || !ctx->instrBodyInit)
+        return;
+    if (!bc->codeStart || bc->numCodeBytes <= 0)
+        return;
+    if (!bc->objArrayPtr || bc->numLitObjects <= 0)
+        return;
+
+    const InstructionDesc* instTable = (const InstructionDesc*)TclGetInstructionTable();
+    const unsigned char* code = bc->codeStart;
+    Tcl_Size codeLen = bc->numCodeBytes;
+    Tcl_Size numLits = bc->numLitObjects;
+
+    /* Track which literals are pushed by ANY instruction.  Literals that
+       are never pushed are "dead references" -- source text kept for error
+       reporting by Tcl's compiler for inline-compiled bodies (foreach,
+       while, for, lmap, dict for).  These should also be precompiled. */
+    char* pushed = NULL;
+    if (numLits <= 4096)
+    {
+        pushed = (char*)Tcl_Alloc((size_t)numLits);
+        memset(pushed, 0, (size_t)numLits);
+    }
+
+    /* Stack model: each slot is a literal index or -1 (non-literal). */
+#define ISCAN_MAX 128
+    int stk[ISCAN_MAX];
+    int sp = 0;
+#define ISCAN_PUSH(v) do { if (sp < ISCAN_MAX) stk[sp++] = (v); } while(0)
+#define ISCAN_POP()   (sp > 0 ? stk[--sp] : -1)
+
+    Tcl_Size pc = 0;
+    while (pc < codeLen)
+    {
+        unsigned int opcode = code[pc];
+        if (opcode > LAST_INST_OPCODE) { pc++; sp = 0; continue; }
+
+        const InstructionDesc* desc = &instTable[opcode];
+        if (pc + desc->numBytes > codeLen) break;
+
+        const char* nm = desc->name;
+        const unsigned char* op = code + pc + 1;
+
+        /* ---- push1 / push4 ---- */
+        if (InstrIs(nm, "push"))
+        {
+            int litIdx = -1;
+            /* Tcl 9.1 changed literal operands from OPERAND_UINT to
+               OPERAND_LIT.  Use numBytes to infer operand size — this
+               is robust across all Tcl versions. */
+            if (desc->numBytes == 2)       /* push1: 1-byte operand */
+                litIdx = op[0];
+            else if (desc->numBytes == 5)  /* push4: 4-byte operand */
+                litIdx = (int)((op[0] << 24) | (op[1] << 16) | (op[2] << 8) | op[3]);
+            if (pushed && litIdx >= 0 && litIdx < numLits)
+                pushed[litIdx] = 1;
+            ISCAN_PUSH(litIdx);
+        }
+        /* ---- invokeStk1 / invokeStk4 ---- */
+        else if (InstrIs(nm, "invokeStk"))
+        {
+            int argc = 0;
+            if (desc->numBytes == 2)       /* invokeStk1: 1-byte count */
+                argc = op[0];
+            else if (desc->numBytes == 5)  /* invokeStk4: 4-byte count */
+                argc = (int)((op[0] << 24) | (op[1] << 16) | (op[2] << 8) | op[3]);
+
+            if (argc >= 2 && sp >= argc)
+            {
+                int base = sp - argc;
+                int cmdLitIdx = stk[base];
+
+                /* Resolve command name from literal pool */
+                if (cmdLitIdx >= 0 && cmdLitIdx < numLits && bc->objArrayPtr[cmdLitIdx])
+                {
+                    const char* cmdStr = CmdCore(Tbcx_GetStringSafe(bc->objArrayPtr[cmdLitIdx]));
+                    int bodyLitIdx = -1;
+
+                    /* "dict for"/"dict map" -- subcmd is second pushed value */
+                    if (strcmp(cmdStr, "dict") == 0 && argc >= 3)
+                    {
+                        int subIdx = stk[base + 1];
+                        if (subIdx >= 0 && subIdx < numLits && bc->objArrayPtr[subIdx])
+                        {
+                            const char* sub = Tbcx_GetStringSafe(bc->objArrayPtr[subIdx]);
+                            if (IsDictBodySubcmd(sub))
+                                bodyLitIdx = stk[base + argc - 1]; /* last arg */
+                        }
+                    }
+                    /* "self method NAME ARGS BODY" -- body is last arg */
+                    else if (strcmp(cmdStr, "self") == 0 && argc >= 5)
+                    {
+                        int subIdx = stk[base + 1];
+                        if (subIdx >= 0 && subIdx < numLits && bc->objArrayPtr[subIdx])
+                        {
+                            const char* sub = Tbcx_GetStringSafe(bc->objArrayPtr[subIdx]);
+                            if (strcmp(sub, "method") == 0)
+                                bodyLitIdx = stk[base + argc - 1]; /* last arg */
+                        }
+                    }
+                    else
+                    {
+                        /* Check standard body-evaluating commands */
+                        for (const BodyCmdRule* r = sBodyCmds; r->cmd; r++)
+                        {
+                            if (strcmp(cmdStr, r->cmd) == 0)
+                            {
+                                if (r->bodyPos == 0)
+                                    bodyLitIdx = stk[base + argc - 1]; /* last arg */
+                                else if (base + r->bodyPos < sp)
+                                    bodyLitIdx = stk[base + r->bodyPos]; /* 1-based position */
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Record the body literal for precompilation */
+                    if (bodyLitIdx >= 0 && bodyLitIdx < numLits)
+                    {
+                        Tcl_Obj* bodyObj = bc->objArrayPtr[bodyLitIdx];
+                        if (bodyObj && bodyObj->typePtr != tbcxTyProcBody)
+                        {
+                            Tcl_Size bl = 0;
+                            const char* bs = Tbcx_GetStringFromObjSafe(bodyObj, &bl);
+                            if (LooksLikeScriptBody(bs, bl))
+                            {
+                                /* Mark in phase2marks[] (per-block index) —
+                                   bypasses WriteLiteral entirely in
+                                   WriteCompiledBlock, immune to stripActive
+                                   and type-based dispatch issues. */
+                                if (phase2marks)
+                                    phase2marks[bodyLitIdx] = 1;
+                                /* Also mark in instrBodyLits for the
+                                   WriteLit_Untyped path (non-stripped blocks
+                                   where the literal is still string-typed). */
+                                if (!TbcxGetByteCode(bodyObj))
+                                {
+                                    int isNew;
+                                    Tcl_HashEntry* he = Tcl_CreateHashEntry(
+                                        &ctx->instrBodyLits, (const char*)bodyObj, &isNew);
+                                    if (isNew)
+                                        Tcl_SetHashValue(he, (void*)bc->nsPtr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Pop argc, push result (-1) */
+            sp -= argc;
+            if (sp < 0) sp = 0;
+            ISCAN_PUSH(-1);
+        }
+        /* ---- Stack-neutral: startCommand, nop ---- */
+        else if (InstrIs(nm, "startCommand") || InstrIs(nm, "nop"))
+        {
+            /* no stack effect */
+        }
+        /* ---- Pop ---- */
+        else if (InstrIs(nm, "pop"))
+        {
+            (void)ISCAN_POP();
+        }
+        /* ---- Stack-producing (1 value) ---- */
+        else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray") ||
+                 InstrIs(nm, "loadStk") || InstrIs(nm, "dup") ||
+                 InstrIs(nm, "over") || InstrIs(nm, "nsupvar") ||
+                 InstrIs(nm, "upvar") || InstrIs(nm, "variable"))
+        {
+            ISCAN_PUSH(-1);
+        }
+        /* ---- storeScalar/storeArray: pops val, stores, pushes val back ---- */
+        else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
+        {
+            if (sp > 0) stk[sp - 1] = -1;
+        }
+        /* ---- storeStk: pops name+val, pushes val ---- */
+        else if (InstrIs(nm, "storeStk"))
+        {
+            (void)ISCAN_POP();
+            (void)ISCAN_POP();
+            ISCAN_PUSH(-1);
+        }
+        /* ---- strcat N, list N, concat N: pop N, push 1 ---- */
+        else if (InstrIs(nm, "strcat") || InstrIs(nm, "list") ||
+                 InstrIs(nm, "concat") || InstrIs(nm, "lappendList"))
+        {
+            int cnt = 0;
+            /* Use numBytes to infer operand size (robust across Tcl versions) */
+            if (desc->numBytes == 2)
+                cnt = op[0];
+            else if (desc->numBytes == 5)
+                cnt = (int)((op[0] << 24) | (op[1] << 16) | (op[2] << 8) | op[3]);
+            sp -= cnt;
+            if (sp < 0) sp = 0;
+            ISCAN_PUSH(-1);
+        }
+        /* ---- returnImm / done / jump: reset ---- */
+        else if (InstrIs(nm, "return") || InstrIs(nm, "done") ||
+                 InstrIs(nm, "jump"))
+        {
+            sp = 0;
+        }
+        /* ---- Arithmetic / comparison / misc: pop some, push 1 ---- */
+        else if (InstrIs(nm, "add") || InstrIs(nm, "sub") ||
+                 InstrIs(nm, "mult") || InstrIs(nm, "div") ||
+                 InstrIs(nm, "mod") || InstrIs(nm, "eq") ||
+                 InstrIs(nm, "neq") || InstrIs(nm, "lt") ||
+                 InstrIs(nm, "gt") || InstrIs(nm, "le") ||
+                 InstrIs(nm, "ge") || InstrIs(nm, "land") ||
+                 InstrIs(nm, "lor") || InstrIs(nm, "lnot") ||
+                 InstrIs(nm, "bitnot") || InstrIs(nm, "lshift") ||
+                 InstrIs(nm, "rshift") || InstrIs(nm, "bitand") ||
+                 InstrIs(nm, "bitor") || InstrIs(nm, "bitxor") ||
+                 InstrIs(nm, "uminus") || InstrIs(nm, "uplus") ||
+                 InstrIs(nm, "not") || InstrIs(nm, "tryCvtToNumeric") ||
+                 InstrIs(nm, "exprStk") || InstrIs(nm, "existScalar") ||
+                 InstrIs(nm, "existArray") || InstrIs(nm, "existStk") ||
+                 InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray") ||
+                 InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray") ||
+                 InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray") ||
+                 InstrIs(nm, "incrScalarImm") ||
+                 InstrIs(nm, "lindexMulti") || InstrIs(nm, "lsetFlat"))
+        {
+            /* Conservative: these consume 1-2 and produce 1. Just mark non-lit. */
+            if (sp > 0) stk[sp - 1] = -1;
+        }
+        /* ---- Unknown: reset stack (conservative) ---- */
+        else
+        {
+            sp = 0;
+        }
+
+        pc += desc->numBytes;
+    }
+
+    /* ---- Phase 2: Per-block unpushed body literal detection ----
+     *
+     * Tcl 9 compiles foreach/lmap with specialized opcodes (foreach_start,
+     * foreach_step).  The body is compiled inline but the source text
+     * remains in the literal pool for error reporting only.  These source
+     * literals are never referenced by a push instruction.
+     *
+     * CRITICAL: Phase 2 marks are stored in the caller-provided
+     * `phase2marks[]` array indexed by literal position — NOT in
+     * ctx->instrBodyLits (which is keyed by Tcl_Obj*).  This prevents
+     * cross-block contamination from Tcl_Obj pointer sharing.
+     *
+     * Guard: only activates when this block contains foreach_start
+     * instructions (detected by instruction name scanning).
+     *
+     * Safety: pushed[] excludes all data literals (format templates,
+     * strcat fragments, string args). LooksLikeScriptBody() rejects
+     * non-script data. */
+    if (pushed && phase2marks)
+    {
+        /* Detect foreach_start instructions */
+        int hasForeachInstr = 0;
+        {
+            Tcl_Size pc2 = 0;
+            while (pc2 < codeLen)
+            {
+                unsigned int op2 = code[pc2];
+                if (op2 > LAST_INST_OPCODE) { pc2++; continue; }
+                const InstructionDesc* d2 = &instTable[op2];
+                if (pc2 + d2->numBytes > codeLen) break;
+                if (InstrIs(d2->name, "foreach_start"))
+                {
+                    hasForeachInstr = 1;
+                    break;
+                }
+                pc2 += d2->numBytes;
+            }
+        }
+
+        if (hasForeachInstr)
+        {
+            for (Tcl_Size i = 0; i < numLits; i++)
+            {
+                if (pushed[i])
+                    continue; /* pushed = data, not dead body text */
+                Tcl_Obj* lit = bc->objArrayPtr[i];
+                if (!lit)
+                    continue;
+                if (lit->typePtr == tbcxTyProcBody)
+                    continue;
+                /* Don't skip bytecode-typed literals — Tcl's foreach
+                   compiler may have shimmered the body literal to bytecode
+                   type during inline compilation.  Per-block index marks
+                   prevent cross-block contamination. */
+                Tcl_Size sl = 0;
+                const char* ss = Tbcx_GetStringFromObjSafe(lit, &sl);
+                if (LooksLikeScriptBody(ss, sl))
+                {
+                    phase2marks[i] = 1;
+                }
+            }
+        }
+    }
+    if (pushed)
+        Tcl_Free(pushed);
+
+#undef ISCAN_MAX
+#undef ISCAN_PUSH
+#undef ISCAN_POP
+}
+
 static void WriteCompiledBlock(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
 {
     ByteCode* bc = NULL;
@@ -2562,18 +3058,108 @@ static void WriteCompiledBlock(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
     W_Bytes(w, bc->codeStart, (size_t)bc->numCodeBytes);
 
     /* 2) literal pool */
+    /* Improvement #1: scan instructions to identify body-argument literals
+       BEFORE emitting the pool.
+       Phase 1: populates ctx->instrBodyLits (Tcl_Obj* keys) for invokeStk
+       body arguments.  Cleared at blockDepth==1 to prevent cross-block leak.
+       Phase 2: populates phase2marks[] (per-block index array) for unpushed
+       foreach/lmap body literals.  Index-based — immune to Tcl_Obj* sharing. */
+    char* phase2marks = NULL;
+    if (ctx && ctx->instrBodyInit)
+    {
+        if (ctx->blockDepth == 1)
+        {
+            Tcl_DeleteHashTable(&ctx->instrBodyLits);
+            Tcl_InitHashTable(&ctx->instrBodyLits, TCL_ONE_WORD_KEYS);
+        }
+        if (bc->numLitObjects > 0)
+        {
+            phase2marks = (char*)Tcl_Alloc((size_t)bc->numLitObjects);
+            memset(phase2marks, 0, (size_t)bc->numLitObjects);
+        }
+        InstrScanBodyLiterals(bc, ctx, phase2marks);
+    }
     W_U32(w, (uint32_t)bc->numLitObjects);
     for (Tcl_Size i = 0; i < bc->numLitObjects; i++)
     {
         Tcl_Obj* lit = bc->objArrayPtr[i];
-        WriteLiteral(w, ctx, lit);
+        /* Phase 2: if this literal index was marked as an unpushed loop
+           body by InstrScanBodyLiterals, precompile it directly.  This
+           bypasses WriteLiteral entirely — no Tcl_Obj* pointer lookup
+           means no cross-block contamination. */
+        int emittedP2 = 0;
+        if (phase2marks && phase2marks[i] && ctx && ctx->precompileDepth < 3)
+        {
+            /* Check if literal is already bytecode-typed (Tcl's foreach
+               compiler may have shimmered it during inline compilation) */
+            ByteCode* existingBC = TbcxGetByteCode(lit);
+            if (existingBC)
+            {
+                /* Already compiled — emit with source text for cross-interp safety */
+                Tcl_Size _p2sLen = 0;
+                const char* _p2sStr = Tbcx_GetStringFromObjSafe(lit, &_p2sLen);
+                ctx->precompileDepth++;
+                W_U32(w, TBCX_LIT_BYTESRC);
+                W_LPString(w, _p2sStr, _p2sLen);
+                Lit_Bytecode(w, ctx, lit);
+                ctx->precompileDepth--;
+                emittedP2 = 1;
+            }
+            else
+            {
+                Tcl_Size sl2 = 0;
+                const char* ss2 = Tbcx_GetStringFromObjSafe(lit, &sl2);
+                /* Dedup check */
+                int alreadyDone = 0;
+                if (ctx->emittedInit)
+                {
+                    int isNew;
+                    Tcl_CreateHashEntry(&ctx->emittedBodies, ss2, &isNew);
+                    if (!isNew)
+                        alreadyDone = 1;
+                }
+                if (!alreadyDone && sl2 >= 2)
+                {
+                    Namespace* targetNs = bc->nsPtr ? bc->nsPtr
+                        : (Namespace*)Tcl_GetGlobalNamespace(ctx->interp);
+                    Tcl_Obj* copy = Tcl_DuplicateObj(lit);
+                    Tcl_IncrRefCount(copy);
+                    if (TclSetByteCodeFromAny(ctx->interp, copy, NULL, NULL) == TCL_OK)
+                    {
+                        ByteCode* ibc = TbcxGetByteCode(copy);
+                        if (ibc)
+                        {
+                            ibc->nsPtr = targetNs;
+                            ibc->nsEpoch = targetNs->resolverEpoch;
+                            ctx->precompileDepth++;
+                            W_U32(w, TBCX_LIT_BYTESRC);
+                            W_LPString(w, ss2, sl2);
+                            Lit_Bytecode(w, ctx, copy);
+                            ctx->precompileDepth--;
+                            emittedP2 = 1;
+                        }
+                    }
+                    else
+                    {
+                        Tcl_ResetResult(ctx->interp);
+                    }
+                    Tcl_DecrRefCount(copy);
+                }
+            }
+        }
+        if (!emittedP2)
+            WriteLiteral(w, ctx, lit);
         if (w->err)
         {
+            if (phase2marks)
+                Tcl_Free(phase2marks);
             if (ctx)
                 ctx->blockDepth--;
             return;
         }
     }
+    if (phase2marks)
+        Tcl_Free(phase2marks);
 
     /* 3) AuxData array */
     W_U32(w, (uint32_t)bc->numAuxDataItems);
@@ -3144,7 +3730,7 @@ static void CaptureClassBody(Tcl_Interp* ip,
                             Tcl_DecrRefCount(body);
                     }
                 }
-                /* "private { script }" — recurse into the block to capture
+                /* "private { script }" -- recurse into the block to capture
                    methods/ctors/dtors defined in private context. */
                 else if (strcmp(kw, "private") == 0 && p.numWords >= 2)
                 {
@@ -3156,6 +3742,53 @@ static void CaptureClassBody(Tcl_Interp* ip,
                         const char* bkStr = Tbcx_GetStringFromObjSafe(block, &bkLen);
                         CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1);
                         Tcl_DecrRefCount(block);
+                    }
+                }
+                /* Improvement #2: "self method NAME ARGS BODY" -- capture
+                   the body so it can be stubbed, preventing source leakage. */
+                else if (strcmp(kw, "self") == 0 && p.numWords >= 5)
+                {
+                    const Tcl_Token* wSub = NextWord(w0);
+                    Tcl_Obj* subCmd = WordLiteralObj(wSub);
+                    if (subCmd)
+                    {
+                        const char* subStr = Tbcx_GetStringSafe(subCmd);
+                        if (strcmp(subStr, "method") == 0)
+                        {
+                            const Tcl_Token* wN = NextWord(wSub);
+                            /* Args and body are the last two words */
+                            const Tcl_Token* t = w0;
+                            for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                                t = NextWord(t);
+                            const Tcl_Token* wA = t;
+                            const Tcl_Token* wB = NextWord(wA);
+                            Tcl_Obj* mname = WordLiteralObj(wN);
+                            Tcl_Obj* args = WordLiteralObj(wA);
+                            Tcl_Obj* body = WordLiteralObj(wB);
+                            if (mname && args && body)
+                            {
+                                DefRec r;
+                                memset(&r, 0, sizeof(r));
+                                r.kind = DEF_KIND_CLASS;
+                                r.cls = clsFqn;
+                                Tcl_IncrRefCount(r.cls);
+                                r.name = mname;
+                                r.args = args;
+                                r.body = body;
+                                r.ns = curNs;
+                                Tcl_IncrRefCount(r.ns);
+                                r.flags = flags | DEF_F_SELF_METHOD;
+                                DV_Push(defs, r);
+                                CS_Add(classes, clsFqn);
+                            }
+                            else
+                            {
+                                if (mname) Tcl_DecrRefCount(mname);
+                                if (args)  Tcl_DecrRefCount(args);
+                                if (body)  Tcl_DecrRefCount(body);
+                            }
+                        }
+                        Tcl_DecrRefCount(subCmd);
                     }
                 }
                 Tcl_DecrRefCount(cmd);
@@ -3199,9 +3832,26 @@ static void StubLinesForClass(Tcl_Interp* ip, Tcl_DString* out, DefVec* defs, Tc
                 if (cmd)
                 {
                     const char* kw = CmdCore(Tbcx_GetStringSafe(cmd));
-                    /* Only emit declarative, order-independent keywords. */
-                    if (strcmp(kw, "variable") == 0 || strcmp(kw, "superclass") == 0 || strcmp(kw, "mixin") == 0 ||
-                        strcmp(kw, "filter") == 0 || strcmp(kw, "forward") == 0 || strcmp(kw, "self") == 0)
+                    /* Only emit declarative, order-independent keywords.
+                       Improvement #2: skip "self method ..." -- these are
+                       captured in DefVec and emitted with stubbed bodies
+                       in pass 2.  Other self commands (self mixin, etc.)
+                       are still emitted verbatim. */
+                    int isCapturedSelf = 0;
+                    if (strcmp(kw, "self") == 0 && p.numWords >= 5)
+                    {
+                        const Tcl_Token* wSub = NextWord(w0);
+                        Tcl_Obj* subObj = WordLiteralObj(wSub);
+                        if (subObj)
+                        {
+                            if (strcmp(Tbcx_GetStringSafe(subObj), "method") == 0)
+                                isCapturedSelf = 1;
+                            Tcl_DecrRefCount(subObj);
+                        }
+                    }
+                    if (!isCapturedSelf &&
+                        (strcmp(kw, "variable") == 0 || strcmp(kw, "superclass") == 0 || strcmp(kw, "mixin") == 0 ||
+                        strcmp(kw, "filter") == 0 || strcmp(kw, "forward") == 0 || strcmp(kw, "self") == 0))
                     {
                         /* Extract the raw command text from the source and
                            wrap it in oo::define cls <raw command>. */
@@ -3259,10 +3909,28 @@ static void StubLinesForClass(Tcl_Interp* ip, Tcl_DString* out, DefVec* defs, Tc
 
         if (r->kind == DEF_KIND_INST || r->kind == DEF_KIND_CLASS)
         {
-            Tcl_DStringAppendElement(&ln, (r->kind == DEF_KIND_CLASS) ? "classmethod" : "method");
-            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
-            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-            Tcl_DStringAppendElement(&ln, "");
+            if (r->flags & DEF_F_SELF_METHOD)
+            {
+                /* Improvement #2 / Option A: emit as flat oo::objdefine form
+                   so the existing CmdOOShimObjDef can intercept and substitute
+                   the precompiled body.  This avoids the builder-body string
+                   approach that left the body empty (breaking metaclass create). */
+                Tcl_DStringFree(&ln); /* discard the "oo::define CLS" prefix */
+                Tcl_DStringInit(&ln);
+                Tcl_DStringAppendElement(&ln, "oo::objdefine");
+                Tcl_DStringAppendElement(&ln, cls);
+                Tcl_DStringAppendElement(&ln, "method");
+                Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
+                Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
+                Tcl_DStringAppendElement(&ln, "");
+            }
+            else
+            {
+                Tcl_DStringAppendElement(&ln, (r->kind == DEF_KIND_CLASS) ? "classmethod" : "method");
+                Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
+                Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
+                Tcl_DStringAppendElement(&ln, "");
+            }
         }
         else if (r->kind == DEF_KIND_CTOR)
         {
@@ -4919,6 +5587,8 @@ static int EmitTbcxStream(Tcl_Obj* scriptObj, TbcxOut* w)
     ctx.emittedInit = 1;
     Tcl_InitHashTable(&ctx.emittedPtrs, TCL_ONE_WORD_KEYS);
     ctx.emittedPtrsInit = 1;
+    Tcl_InitHashTable(&ctx.instrBodyLits, TCL_ONE_WORD_KEYS);
+    ctx.instrBodyInit = 1;
 
     DefVec defs;
     DV_Init(&defs);
@@ -5124,8 +5794,15 @@ done_classes: ;
             /* classFqn */
             s = Tbcx_GetStringFromObjSafe(defs.v[i].cls, &ln);
             W_LPString(w, s, ln);
-            /* wire kind 0..3 expected by loader (inst=0, class=1, ctor=2, dtor=3) */
-            W_U8(w, (uint8_t)(defs.v[i].kind - DEF_KIND_INST));
+            /* wire kind 0..4 expected by loader (inst=0, class=1, ctor=2, dtor=3, self=4) */
+            {
+                uint8_t wireKind = (uint8_t)(defs.v[i].kind - DEF_KIND_INST);
+                /* Improvement #2: self methods get wire kind 4 (TBCX_METH_SELF)
+                   so the load side installs them via oo::objdefine, not oo::define. */
+                if (defs.v[i].flags & DEF_F_SELF_METHOD)
+                    wireKind = 4; /* TBCX_METH_SELF */
+                W_U8(w, wireKind);
+            }
             /* name (empty for ctor/dtor) */
             if (defs.v[i].kind == DEF_KIND_CTOR || defs.v[i].kind == DEF_KIND_DTOR)
             {
@@ -5160,6 +5837,8 @@ cleanup:
         Tcl_DeleteHashTable(&ctx.emittedBodies);
     if (ctx.emittedPtrsInit)
         Tcl_DeleteHashTable(&ctx.emittedPtrs);
+    if (ctx.instrBodyInit)
+        Tcl_DeleteHashTable(&ctx.instrBodyLits);
     return rc;
 }
 

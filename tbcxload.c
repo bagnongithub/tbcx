@@ -353,8 +353,8 @@ static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr)
         return;
     Interp* iPtr = (Interp*)ip;
     /* Release the previous interpHandle (if any) before preserving the new
-       one.  Without this, stale handles can accumulate and — in nested
-       child interpreters — reference freed interp structures. */
+       one.  Without this, stale handles can accumulate and -- in nested
+       child interpreters -- reference freed interp structures. */
     if (bcPtr->interpHandle)
         TclHandleRelease(bcPtr->interpHandle);
     bcPtr->interpHandle = TclHandlePreserve(iPtr->handle);
@@ -563,6 +563,34 @@ static int DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(nameOpt);
         Tcl_DecrRefCount(sub);
+        Tcl_DecrRefCount(argv0);
+        return rc;
+    }
+
+    /* Self methods: install via oo::objdefine CLS method NAME ARGS BODY.
+       Semantically equivalent to "self method" inside a builder body. */
+    if (kind == TBCX_METH_SELF)
+    {
+        if (!os->hasObjDefine)
+        {
+            Tcl_DecrRefCount(argv0);
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: oo::objdefine shim not available for self method", -1));
+            return TCL_ERROR;
+        }
+        Tcl_Obj* objDefCmd = Tcl_NewStringObj(os->origNameObjDef, -1);
+        Tcl_IncrRefCount(objDefCmd);
+        Tcl_Obj* sub = Tcl_NewStringObj("method", -1);
+        Tcl_IncrRefCount(sub);
+        Tcl_IncrRefCount(nameOpt);
+        Tcl_IncrRefCount(argsOpt);
+        Tcl_IncrRefCount(bodyOpt);
+        Tcl_Obj* av[6] = {objDefCmd, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
+        rc = Tcl_EvalObjv(ip, 6, av, 0);
+        Tcl_DecrRefCount(bodyOpt);
+        Tcl_DecrRefCount(argsOpt);
+        Tcl_DecrRefCount(nameOpt);
+        Tcl_DecrRefCount(sub);
+        Tcl_DecrRefCount(objDefCmd);
         Tcl_DecrRefCount(argv0);
         return rc;
     }
@@ -1274,6 +1302,25 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
             nameO = objv[objc - 3];
             if (MethodKeyBuf(&keyDs, objFqn, kind, nameO))
                 hasKey = 1;
+            /* Fallback: for "method" in oo::objdefine context, the saver
+               may have stored it as TBCX_METH_SELF (kind=4).  Try that key
+               if the INST key has no match. */
+            if (strcmp(subc, "method") == 0 && hasKey &&
+                !Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs)))
+            {
+                Tcl_DString selfDs;
+                if (MethodKeyBuf(&selfDs, objFqn, TBCX_METH_SELF, nameO))
+                {
+                    if (Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&selfDs)))
+                    {
+                        /* Rebuild keyDs with the SELF key */
+                        Tcl_DStringFree(&keyDs);
+                        MethodKeyBuf(&keyDs, objFqn, TBCX_METH_SELF, nameO);
+                        kind = TBCX_METH_SELF;
+                    }
+                    Tcl_DStringFree(&selfDs);
+                }
+            }
         }
         else if (strcmp(subc, "constructor") == 0 && objc >= 5)
         {
@@ -2763,6 +2810,80 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                the empty string, losing all compiled content. */
             Tcl_Obj* bc = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL, 1, dumpOnly);
             Tcl_DecrRefCount(nsObj);
+            return bc;
+        }
+        case TBCX_LIT_BYTESRC:
+        {
+            /* source text + nsFQN + compiled block.
+               The source text becomes the Tcl_Obj's string rep so Tcl can
+               recompile from source when evaluated in a different interpreter
+               (e.g. interp eval) or after a compile-epoch bump (ProcShim).
+               PRECOMPILED is NOT set — this allows Tcl to gracefully
+               recompile instead of erroring with "jumped interps". */
+            char* srcStr = NULL;
+            uint32_t srcLen = 0;
+            if (!Tbcx_R_LPString(r, &srcStr, &srcLen))
+                return NULL;
+            char* nsStr = NULL;
+            uint32_t nsLen = 0;
+            if (!Tbcx_R_LPString(r, &nsStr, &nsLen))
+            {
+                Tcl_Free(srcStr);
+                return NULL;
+            }
+            Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
+            Tcl_IncrRefCount(nsObj);
+            Tcl_Free(nsStr);
+            {
+                Tcl_Size nsObjLen = 0;
+                const char* nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
+                if (!nsObjStr ||
+                    Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "bytesrc literal namespace", 1) != TCL_OK)
+                {
+                    Tcl_DecrRefCount(nsObj);
+                    Tcl_Free(srcStr);
+                    return NULL;
+                }
+            }
+            Namespace* nsPtr;
+            if (dumpOnly)
+                nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
+            else
+                nsPtr = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
+            if (!nsPtr)
+            {
+                if (dumpOnly)
+                    nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
+                else
+                {
+                    R_Error(r, "tbcx: namespace creation failed for bytesrc literal");
+                    Tcl_DecrRefCount(nsObj);
+                    Tcl_Free(srcStr);
+                    return NULL;
+                }
+            }
+            uint32_t dummyNL = 0;
+            /* setPrecompiled=0: BYTESRC literals have source text, so Tcl
+               CAN recompile from the string rep.  Without PRECOMPILED, Tcl
+               will recompile on compile-epoch mismatch (after ProcShim bumps
+               the epoch) or interpHandle mismatch (child interp / interp eval).
+               This is correct — the bytecode is a cache, the source is the
+               ground truth.  With PRECOMPILED=1, Tcl would error with
+               "compiled script jumped interps" on interpHandle mismatch
+               instead of gracefully recompiling. */
+            Tcl_Obj* bc = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL, 0, dumpOnly);
+            Tcl_DecrRefCount(nsObj);
+            if (bc && srcLen > 0)
+            {
+                /* Replace the empty string rep with the preserved source text.
+                   The bytecode internal rep is untouched.  When evaluated in a
+                   different interpreter (interp eval), Tcl detects the interp
+                   mismatch and recompiles from this source text, avoiding the
+                   "compiled script jumped interps" error. */
+                Tcl_InvalidateStringRep(bc);
+                Tcl_InitStringRep(bc, srcStr, (Tcl_Size)srcLen);
+            }
+            Tcl_Free(srcStr);
             return bc;
         }
         case TBCX_LIT_LAMBDA_BC:

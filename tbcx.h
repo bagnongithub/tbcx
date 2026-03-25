@@ -40,6 +40,7 @@
 #define TBCX_LIT_WIDEUINT 8u
 #define TBCX_LIT_LAMBDA_BC 9u
 #define TBCX_LIT_BYTECODE 10u
+#define TBCX_LIT_BYTESRC 11u   /* bytecode + source text (enables cross-interp recompilation) */
 
 #define TBCX_AUX_JT_STR 0u
 #define TBCX_AUX_JT_NUM 1u
@@ -50,6 +51,7 @@
 #define TBCX_METH_CLASS 1u
 #define TBCX_METH_CTOR 2u
 #define TBCX_METH_DTOR 3u
+#define TBCX_METH_SELF 4u  /* self method (class-level, installed via oo::objdefine) */
 
 /* Indexed proc marker prefix.  The save side emits stub bodies of the
    form "\x01TBCX<decimal-index>" so that the load-side ProcShim can
