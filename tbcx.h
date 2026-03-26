@@ -51,7 +51,7 @@
 #define TBCX_METH_CLASS 1u
 #define TBCX_METH_CTOR 2u
 #define TBCX_METH_DTOR 3u
-#define TBCX_METH_SELF 4u /* self method (class-level, installed via oo::objdefine) */
+#define TBCX_METH_SELF 4u /* self method (class-level, installed via oo::define builder body) */
 
 /* Indexed proc marker prefix.  The save side emits stub bodies of the
    form "\x01TBCX<decimal-index>" so that the load-side ProcShim can

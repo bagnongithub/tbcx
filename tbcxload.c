@@ -2775,11 +2775,13 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                 }
             }
             uint32_t dummyNL = 0;
-            /* setPrecompiled=1: TBCX literal bytecodes have no source text
-               (string rep is "").  They MUST be marked precompiled so Tcl
-               skips compile-epoch validation — otherwise ProcShim/OOShim
-               installation bumps the epoch and Tcl would recompile from
-               the empty string, losing all compiled content. */
+            /* Backward compatibility: TBCX_LIT_BYTECODE is no longer emitted
+               by the save side (replaced by TBCX_LIT_BYTESRC which preserves
+               source text).  Kept for loading files created by older versions.
+               setPrecompiled=1: these literals have no source text (string rep
+               is "").  They MUST be marked precompiled so Tcl skips compile-
+               epoch validation — otherwise ProcShim/OOShim epoch bumps would
+               trigger recompilation from the empty string, losing all content. */
             Tcl_Obj* bc = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL, 1, dumpOnly);
             Tcl_DecrRefCount(nsObj);
             return bc;

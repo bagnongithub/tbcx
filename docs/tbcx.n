@@ -55,12 +55,18 @@ One of:
 .RS
 .IP \(bu 2
 Performs a single\-pass capture and rewrite of the script, extracting \fBproc\fR, \fBnamespace eval\fR,
-\fBoo::class create\fR, and \fBoo::define\fR/\fBoo::objdefine\fR definitions while producing a
-rewritten script with method bodies replaced by stubs.
+\fBoo::class create\fR, \fBoo::define\fR/\fBoo::objdefine\fR, and \fBself method\fR definitions while
+producing a rewritten script with method bodies replaced by stubs.
 .IP \(bu 2
-Pre\-compiles namespace eval body literals and other script\-body patterns (try, foreach, while, for, catch, if/elseif/else).
+Pre\-compiles namespace eval body literals and other script\-body patterns (try/on/trap/finally, foreach, while, for, catch, if/elseif/else, dict for/map/update/with).
 .IP \(bu 2
-Serializes the header, top\-level block, Procs table, Classes catalog (advisory), and Methods table.
+Performs two\-phase instruction\-level body detection: Phase 1 analyzes \fBinvokeStk\fR operand stack patterns to find body arguments; Phase 2 identifies unpushed literals from inline\-compiled \fBforeach\fR/\fBlmap\fR loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instruction types.
+.IP \(bu 2
+Detects bytearray literals (bytes \[>=] 0x80) and emits them as \fBTBCX_LIT_BYTEARR\fR to prevent UTF\-8 corruption.
+.IP \(bu 2
+Body literals are emitted as \fBTBCX_LIT_BYTESRC\fR (source text + compiled bytecode) enabling cross\-interpreter recompilation.
+.IP \(bu 2
+Serializes the header, top\-level block, Procs table, Classes catalog (advisory), and Methods table (including kind 4 for self methods).
 .IP \(bu 2
 Lambda literals (\fBapply\fR forms) are compiled and serialized as lambda\-bytecode literals.
 .IP \(bu 2
@@ -134,7 +140,9 @@ Installs a temporary \fBProcShim\fR that intercepts the \fBproc\fR command to su
 precompiled bodies when the name and argument signature match.
 .IP \(bu 2
 Installs a temporary \fBOOShim\fR that intercepts \fBoo::define\fR and \fBoo::objdefine\fR
-to substitute precompiled method/constructor/destructor bodies.
+to substitute precompiled method/constructor/destructor bodies. Self methods (kind 4,
+\fBTBCX_METH_SELF\fR) are installed via \fBoo::define\fR with a \fBself method\fR builder
+body to preserve metaclass inheritance for subclasses.
 .IP \(bu 2
 Registers precompiled lambdas in a persistent per\-interpreter \fBApplyShim\fR that
 recovers the compiled representation if type shimmer evicts it.
@@ -263,7 +271,7 @@ Magic (0x58434254) + format version (91) + producing Tcl version; size/count met
 (4) Methods (class, kind, name, args, compiled block).
 .TP
 .B Literal kinds
-boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict (insertion order preserved), embedded bytecode,
+boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
 and \fBlambda\-bytecode\fR literals for use with \fBapply\fR.
 .TP
 .B AuxData families

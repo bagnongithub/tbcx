@@ -4117,6 +4117,11 @@ static void StubLinesForClass(Tcl_Interp* ip, Tcl_DString* out, DefVec* defs, Tc
         {
             if (r->flags & DEF_F_SELF_METHOD)
             {
+                /* Self methods: emit as flat oo::objdefine stub in the
+                   rewritten script for CmdOOShimObjDef interception.
+                   The load-side DefOO TBCX_METH_SELF handler re-installs
+                   via oo::define { self method ... } to preserve metaclass
+                   inheritance for subclasses. */
                 Tcl_DStringFree(&ln); /* discard the "oo::define CLS" prefix */
                 Tcl_DStringInit(&ln);
                 Tcl_DStringAppendElement(&ln, "oo::objdefine");
@@ -6000,7 +6005,8 @@ done_classes: ;
             {
                 uint8_t wireKind = (uint8_t)(defs.v[i].kind - DEF_KIND_INST);
                 /* self methods get wire kind 4 (TBCX_METH_SELF)
-                   so the load side installs them via oo::objdefine, not oo::define. */
+                   so the load side installs them via oo::define { self method },
+                   preserving metaclass inheritance for subclasses. */
                 if (defs.v[i].flags & DEF_F_SELF_METHOD)
                     wireKind = 4; /* TBCX_METH_SELF */
                 W_U8(w, wireKind);

@@ -136,11 +136,19 @@
         <dd>
           <ul>
             <li>Performs a single-pass capture and rewrite of the script, extracting <b>proc</b>,
-                <b>namespace eval</b>, <b>oo::class create</b>, and <b>oo::define</b>/<b>oo::objdefine</b>
-                definitions while producing a rewritten script with method bodies replaced by stubs.</li>
+                <b>namespace eval</b>, <b>oo::class create</b>, <b>oo::define</b>/<b>oo::objdefine</b>,
+                and <b>self method</b> definitions while producing a rewritten script with method bodies replaced by stubs.</li>
             <li>Pre-compiles namespace eval body literals and other script-body patterns
-                (try, foreach, while, for, catch, if/elseif/else).</li>
-            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and Methods table.</li>
+                (try/on/trap/finally, foreach, while, for, catch, if/elseif/else, dict for/map/update/with).</li>
+            <li>Performs two-phase instruction-level body detection: Phase 1 analyzes <b>invokeStk</b>
+                operand stack patterns; Phase 2 identifies unpushed literals from inline-compiled
+                <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instructions.</li>
+            <li>Detects bytearray literals (bytes &ge; 0x80) and emits them as <b>TBCX_LIT_BYTEARR</b>
+                to prevent UTF-8 encoding corruption.</li>
+            <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
+                enabling cross-interpreter recompilation.</li>
+            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and Methods table
+                (including kind 4 for self methods).</li>
             <li>Lambda literals (<b>apply</b> forms) are compiled and serialized as lambda-bytecode literals.</li>
             <li>Conflicting proc definitions across if/else branches are handled via indexed markers,
                 enabling position-based matching at load time.</li>
@@ -198,7 +206,9 @@ try {
             <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command to substitute
                 precompiled bodies when the name and argument signature match.</li>
             <li>Installs a temporary <b>OOShim</b> that intercepts <b>oo::define</b> and <b>oo::objdefine</b>
-                to substitute precompiled method/constructor/destructor bodies.</li>
+                to substitute precompiled method/constructor/destructor bodies. Self methods (kind 4,
+                <b>TBCX_METH_SELF</b>) are installed via <b>oo::define { self method }</b> to preserve
+                metaclass inheritance for subclasses.</li>
             <li>Registers precompiled lambdas in a persistent per-interpreter <b>ApplyShim</b> that
                 recovers the compiled representation if type shimmer evicts it.</li>
             <li>Executes the precompiled top-level block with <b>TCL_EVAL_GLOBAL</b>.
@@ -276,7 +286,7 @@ try {
             (4) Methods (class, kind, name, args, compiled block).</dd>
         <dt>Literal kinds</dt>
         <dd>boolean, (wide)int/uint, double, bignum, string, bytearray, list,
-            dict (insertion order preserved), embedded bytecode,
+            dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
             and <b>lambda-bytecode</b> literals for use with <b>apply</b>.</dd>
         <dt>AuxData families</dt>
         <dd>jump tables (string or numeric), dictupdate, and NewForeachInfo.</dd>
