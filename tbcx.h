@@ -40,7 +40,7 @@
 #define TBCX_LIT_WIDEUINT 8u
 #define TBCX_LIT_LAMBDA_BC 9u
 #define TBCX_LIT_BYTECODE 10u
-#define TBCX_LIT_BYTESRC 11u   /* bytecode + source text (enables cross-interp recompilation) */
+#define TBCX_LIT_BYTESRC 11u /* bytecode + source text (enables cross-interp recompilation) */
 
 #define TBCX_AUX_JT_STR 0u
 #define TBCX_AUX_JT_NUM 1u
@@ -51,7 +51,7 @@
 #define TBCX_METH_CLASS 1u
 #define TBCX_METH_CTOR 2u
 #define TBCX_METH_DTOR 3u
-#define TBCX_METH_SELF 4u  /* self method (class-level, installed via oo::objdefine) */
+#define TBCX_METH_SELF 4u /* self method (class-level, installed via oo::objdefine) */
 
 /* Indexed proc marker prefix.  The save side emits stub bodies of the
    form "\x01TBCX<decimal-index>" so that the load-side ProcShim can
@@ -162,13 +162,15 @@ static inline const char* Tbcx_GetStringFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o
     const char* s;
     if (!o)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetStringFromObj(o, len);
     if (!s)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
     }
     return s;
@@ -179,13 +181,15 @@ static inline const char* Tbcx_GetStringStrict(Tcl_Interp* ip, Tcl_Obj* o)
     const char* s;
     if (!o)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetString(o);
     if (!s)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
     }
     return s;
@@ -196,13 +200,15 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_
     unsigned char* p;
     if (!o)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object (NULL Tcl_Obj)", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     p = Tcl_GetByteArrayFromObj(o, len);
     if (!p)
     {
-        if (ip) Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object", -1));
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object", -1));
         return NULL;
     }
     return p;
@@ -211,20 +217,24 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_
 /* Validate a key string for use with namespace/hash APIs.
  * Rejects embedded NULs and optionally requires absolute namespace form.
  * Returns TCL_OK on success, TCL_ERROR with interp result set on failure. */
-static inline int
-Tbcx_ValidateKeyString(Tcl_Interp *ip, const char *s, Tcl_Size len,
-                       const char *what, int requireAbsoluteNs)
+static inline int Tbcx_ValidateKeyString(Tcl_Interp* ip, const char* s, Tcl_Size len, const char* what, int requireAbsoluteNs)
 {
-    if (!s) {
-        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing %s", what));
+    if (!s)
+    {
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing %s", what));
         return TCL_ERROR;
     }
-    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL) {
-        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
+    {
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
         return TCL_ERROR;
     }
-    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':')) {
-        if (ip) Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
+    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':'))
+    {
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
         return TCL_ERROR;
     }
     return TCL_OK;
@@ -255,34 +265,10 @@ static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
     return irPtr ? (ByteCode*)irPtr->twoPtrValue.ptr1 : NULL;
 }
 
-/* ---- Tcl-internal API audit (proposal #1) ----
- *
- * The following Tcl-internal symbols are used through the STUBS TABLE
- * (tclIntDecls.h) and resolve at RUNTIME through function pointers.
- * They are safe in stubs-linked builds — unlike compile-time macros:
- *
- *   TclHandlePreserve, TclHandleRelease  — interp handle management
- *   TclRenameCommand                     — shim installation/removal
- *   TclUpdateReturnInfo                  — TCL_RETURN handling
- *   TclProcDeleteProc                    — proc cleanup
- *   TclSetByteCodeFromAny                — force compilation
- *   TclGetAuxDataType                    — aux data type lookup
- *   TclBN_mp_*                           — bignum operations
- *
- * The ONE symbol that was NOT safe was ByteCodeGetInternalRep — a
- * compile-time MACRO that resolved &tclByteCodeType at link time.
- * It has been fully replaced by TbcxGetByteCode() above.
- *
- * Struct field access (Interp*, Command*, Proc*, ByteCode*, etc.) is
- * unavoidable — TBCX must manipulate Tcl internals by design.  These
- * are stable across Tcl 9.1.x patch releases.  Any Tcl 9.2+ migration
- * should audit these fields against the new tclInt.h.
- */
-
 /* Flags for TbcxFixupByteCode cache handling strategy. */
-#define TBCX_FIXUP_CACHE_KEEP   0  /* Preserve + fix LocalCache (methods, lambdas) */
-#define TBCX_FIXUP_CACHE_DROP   1  /* NULL out LocalCache (procs — Tcl rebuilds) */
-#define TBCX_FIXUP_CACHE_NONE   2  /* Don't touch LocalCache */
+#define TBCX_FIXUP_CACHE_KEEP 0 /* Preserve + fix LocalCache (methods, lambdas) */
+#define TBCX_FIXUP_CACHE_DROP 1 /* NULL out LocalCache (procs — Tcl rebuilds) */
+#define TBCX_FIXUP_CACHE_NONE 2 /* Don't touch LocalCache */
 extern const Tcl_ObjType* tbcxTyDict;
 extern const Tcl_ObjType* tbcxTyDouble;
 extern const Tcl_ObjType* tbcxTyInt;
@@ -329,41 +315,18 @@ Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
 void Tbcx_FreeLocals(CompiledLocal* first);
 int Tbcx_ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
 int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
-
 void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
 int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n);
 int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
 int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
 int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
 int Tbcx_R_U8(TbcxIn* r, uint8_t* v);
-
 void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
 int Tbcx_W_Flush(TbcxOut* w);
-
-Tcl_Obj*
-Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
+Tcl_Obj* Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
 int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
-
 void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
-
-/* Proposal #3: Centralized ByteCode fixup.
- * Links a ByteCode to its Proc, refreshes epochs, propagates procPtr to
- * literal-pool bytecodes, and handles LocalCache per the cacheMode flag.
- * Every code path that sets bc->procPtr should use this instead of
- * calling RefreshBC + FixLiteralPoolProcPtr + TbcxFixLocalCacheExtras
- * individually — prevents forgetting a step. */
-void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
-                        Namespace* ns, int cacheMode);
-
-/* Proposal #4: Post-load verification pass.
- * Walks all ByteCode objects reachable from topBC and verifies invariants:
- *   - procPtr is non-NULL on proc/method/lambda bodies
- *   - PRECOMPILED flag is set
- *   - interpHandle matches the loading interp
- * Returns TCL_OK if all checks pass, TCL_ERROR with diagnostic in interp
- * result if a violation is found.  Call after LoadTbcxStream execution
- * but before returning to the caller.
- * In release builds, violations are logged but don't abort the load. */
+void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip, Namespace* ns, int cacheMode);
 int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label);
 
 #endif

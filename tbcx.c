@@ -352,11 +352,6 @@ DLLEXPORT int tbcx_Init(Tcl_Interp* interp)
  * Thread:     must be called on the interp-owning thread.
  * ========================================================================== */
 
-/* SafeInit: do NOT expose any commands that perform filesystem I/O.
-   The original code exposed tbcx::dump here, but dump opens arbitrary
-   filesystem paths via Tcl_FSOpenFileChannel, reintroducing file-read
-   capability into safe interpreters.  Parent interpreters that need
-   controlled dump access can use [interp alias] or [interp expose]. */
 DLLEXPORT int tbcx_SafeInit(Tcl_Interp* ip)
 {
     if (Tcl_InitStubs(ip, "9.1", 0) == NULL)

@@ -53,7 +53,7 @@ typedef struct TbcxCtx
        literals that have empty/invalidated string reps. */
     Tcl_HashTable emittedPtrs; /* ONE_WORD_KEYS: Tcl_Obj* -> 1 */
     int emittedPtrsInit;
-    /* Improvement #1: instruction-level body literal detection.
+    /* Instruction-level body literal detection.
        Maps Tcl_Obj* (literal pointer) -> Namespace* (compilation target).
        Populated per-block by InstrScanBodyLiterals Phase 1 (invokeStk
        analysis); checked by WriteLit_Untyped to precompile body arguments
@@ -1100,7 +1100,7 @@ static void PrecompileLiteralPool(TbcxCtx* ctx, ByteCode* top)
         if (sLen < 2)
             continue;
 
-        /* P1 only: check tracked namespace eval body map */
+        /* check tracked namespace eval body map */
         Tcl_HashEntry* he = Tcl_FindHashEntry(&ctx->nsEvalBodies, s);
         if (!he && sLen > 4)
         {
@@ -1671,7 +1671,7 @@ static void WriteLocalNames(TbcxOut* w, ByteCode* bc, uint32_t numLocals)
         return;
     if (bc && bc->procPtr && bc->procPtr->numCompiledLocals > 0)
     {
-        /* F3 fix: overflow-safe multiply — n from numCompiledLocals */
+        /* overflow-safe multiply — n from numCompiledLocals */
         size_t tmpBytes;
         if (!tbcx_checked_mul((size_t)n, sizeof(Tcl_Obj*), &tmpBytes))
         {
@@ -1941,7 +1941,7 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
         } /* !alreadyEmitted */
     }
 
-    /* Improvement #1: instruction-level body literal precompilation.
+    /* Instruction-level body literal precompilation.
        If InstrScanBodyLiterals marked this literal as a body argument
        to an eval-like command (try, catch, eval, uplevel, etc.), compile
        it now into bytecode.  This prevents the source from leaking as
@@ -2034,27 +2034,6 @@ static void WriteLit_Untyped(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* obj)
         }
     }
 
-    /* Fallback: emit as plain string.
-     *
-     * NOTE (S4, updated): Improvement #1 uses two-phase detection:
-     *   Phase 1: instruction-level invokeStk pattern analysis detects
-     *     body arguments to try, catch, eval, uplevel, time, timerate,
-     *     dict for/map, self method.  Marks stored in ctx->instrBodyLits
-     *     (Tcl_Obj* keys) and checked by WriteLit_Untyped.
-     *   Phase 2: per-block index-based detection for foreach/lmap bodies
-     *     compiled with specialized opcodes.  Marks stored in a local
-     *     phase2marks[] array (indexed by literal position, not Tcl_Obj*),
-     *     applied directly in WriteCompiledBlock before WriteLiteral.
-     *     This avoids cross-block Tcl_Obj* pointer sharing contamination.
-     *
-     * Remaining leaks: while/for loop bodies (no foreach_start marker). */
-
-    /* Bug fix: strings with non-ASCII content (bytes >= 0x80 in UTF-8 rep)
-       may suffer from modified-UTF-8 round-trip issues on load.  In particular,
-       U+0000 is encoded as 0xC0 0x80 in Tcl's internal modified UTF-8, but
-       Tcl_NewStringObj may misinterpret this overlong sequence.  Strings where
-       all characters have code points <= 255 can be losslessly serialized as
-       TBCX_LIT_BYTEARR instead, avoiding the UTF-8 round-trip entirely. */
     {
         int hasHighByte = 0;
         for (Tcl_Size i = 0; i < n && i < 4096; i++)
@@ -2593,8 +2572,6 @@ static Tcl_Obj* ResolveToBytecodeObj(Tcl_Obj* cand)
 }
 
 /* ==========================================================================
- * Improvement #1: Instruction-level body literal detection.
- *
  * Walks the bytecode instruction stream of a compiled block, looking for
  * the pattern:  push cmd; push arg0; ... push argN; invokeStk (N+1)
  * If `cmd` is a body-evaluating command (foreach, while, for, try, etc.),
@@ -2698,6 +2675,185 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
     Tcl_Size codeLen = bc->numCodeBytes;
     Tcl_Size numLits = bc->numLitObjects;
 
+    /* ---- Build opcode dispatch table (once per call) ----
+       Maps each opcode → handler enum.  Replaces 70+ InstrIs string
+       comparisons per instruction with a single array lookup. */
+    enum {
+        OP_UNKNOWN = 0,
+        OP_PUSH,          /* push1/push4 */
+        OP_INVOKE_STK,    /* invokeStk1/invokeStk4 */
+        OP_NOP,           /* startCommand, nop, beginCatch, endCatch, verifyDict, foreach_*, dict update, expandStart, unsetScalar */
+        OP_POP,           /* pop, lmap_collect */
+        OP_PUSH1_NOPOP,   /* loadScalar, loadArray, dup, over, nsupvar, upvar, variable, currentNamespace, tclooClass, infoLevelNumber, pushResult, pushReturnCode, pushReturnOpts, expandStkTop */
+        OP_LOAD_STK,      /* loadStk: pop 1, push 1 */
+        OP_LOAD_ARR_STK,  /* loadArrayStk: pop 2, push 1 */
+        OP_STORE_LVT,     /* storeScalar, storeArray: clobber TOS */
+        OP_STORE_STK,     /* storeStk: pop 2, push 1 */
+        OP_STORE_ARR_STK, /* storeArrayStk: pop 3, push 1 */
+        OP_SWAP,          /* swap: exchange top 2 */
+        OP_INCR_STK_IMM,  /* incrStkImm, existStk: pop 1, push 1 */
+        OP_INCR_STK,      /* incrStk, lappendStk, appendStk: pop 2, push 1 */
+        OP_LAPPEND_LST_STK, /* lappendListStk: pop 2, push 1 */
+        OP_UNSET_STK,     /* unsetStk: pop 1 */
+        OP_RETURN_STK,    /* returnStk: reset */
+        OP_STRCAT_N,      /* strcat, list, concat, lappendList: pop N, push 1 */
+        OP_RESET,         /* return, done, jump, invokeExpanded, invokeReplace, tailcall, yield, reverse, dictFirst, dictNext, uplevel */
+        OP_ARITH,         /* arithmetic, comparison, string ops, list ops, dict ops, scalar/array variable ops: clobber TOS */
+    };
+    unsigned char opMap[256];
+    memset(opMap, OP_UNKNOWN, sizeof(opMap));
+    for (unsigned i = 0; i <= LAST_INST_OPCODE; i++)
+    {
+        const char* nm = instTable[i].name;
+        if (!nm) continue;
+
+        /* Order matters for prefix matching — check longer names first.
+           Use exact first-character dispatch to minimize strcmp calls. */
+        switch (nm[0]) {
+        case 'p':
+            if (InstrIs(nm, "push"))            { opMap[i] = (nm[4]=='R' ? OP_PUSH1_NOPOP : /* pushResult/pushReturnCode/pushReturnOpts */
+                                                               nm[4]=='\0' || nm[4]=='1' || nm[4]=='4' ? OP_PUSH : OP_PUSH1_NOPOP); }
+            else if (InstrIs(nm, "pop"))         opMap[i] = OP_POP;
+            break;
+        case 'i':
+            if (InstrIs(nm, "invokeStk"))        opMap[i] = OP_INVOKE_STK;
+            else if (InstrIs(nm, "invokeExpanded") || InstrIs(nm, "invokeReplace"))
+                                                 opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "incrStkImm"))  opMap[i] = OP_INCR_STK_IMM;
+            else if (InstrIs(nm, "incrStk"))     opMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray"))
+                                                 opMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "isEmpty") || InstrIs(nm, "infoLevelNumber"))
+                                                 opMap[i] = (nm[1]=='n' ? OP_PUSH1_NOPOP : OP_ARITH); /* infoLevelNumber=push, isEmpty=arith */
+            break;
+        case 'l':
+            if (InstrIs(nm, "loadStk"))          opMap[i] = OP_LOAD_STK;
+            else if (InstrIs(nm, "loadArrayStk"))opMap[i] = OP_LOAD_ARR_STK;
+            else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray"))
+                                                 opMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "lappendListStk"))
+                                                 opMap[i] = OP_LAPPEND_LST_STK;
+            else if (InstrIs(nm, "lappendStk"))  opMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "lappendList")) opMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray"))
+                                                 opMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "list"))        opMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "lindexMulti") || InstrIs(nm, "listLength") ||
+                     InstrIs(nm, "listIndexImm") || InstrIs(nm, "listRangeImm") ||
+                     InstrIs(nm, "lreplace") || InstrIs(nm, "lsetFlat") ||
+                     InstrIs(nm, "land") || InstrIs(nm, "lor") || InstrIs(nm, "lnot") ||
+                     InstrIs(nm, "lt") || InstrIs(nm, "le") || InstrIs(nm, "lshift"))
+                                                 opMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "lmap_collect"))opMap[i] = OP_POP;
+            break;
+        case 's':
+            if (InstrIs(nm, "storeStk"))         opMap[i] = OP_STORE_STK;
+            else if (InstrIs(nm, "storeArrayStk"))
+                                                 opMap[i] = OP_STORE_ARR_STK;
+            else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
+                                                 opMap[i] = OP_STORE_LVT;
+            else if (InstrIs(nm, "startCommand"))opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "strcat"))      opMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "swap"))        opMap[i] = OP_SWAP;
+            else if (InstrIs(nm, "sub") ||
+                     InstrIs(nm, "streq") || InstrIs(nm, "strlen") ||
+                     InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") ||
+                     InstrIs(nm, "strclass") || InstrIs(nm, "strfind") ||
+                     InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") ||
+                     InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") ||
+                     InstrIs(nm, "strcaseLower") || InstrIs(nm, "strcaseUpper"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'a':
+            if (InstrIs(nm, "appendStk"))        opMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "add") || InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'b':
+            if (InstrIs(nm, "beginCatch"))       opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "bitand") || InstrIs(nm, "bitor") || InstrIs(nm, "bitxor") ||
+                     InstrIs(nm, "bitnot"))      opMap[i] = OP_ARITH;
+            break;
+        case 'c':
+            if (InstrIs(nm, "concat"))           opMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "currentNamespace"))
+                                                 opMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'd':
+            if (InstrIs(nm, "done"))             opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "dup"))         opMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "div") || InstrIs(nm, "dictGet") || InstrIs(nm, "dictPut") ||
+                     InstrIs(nm, "dictSet") || InstrIs(nm, "dictExists"))
+                                                 opMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "dictFirst") || InstrIs(nm, "dictNext"))
+                                                 opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "dictUpdateStart") || InstrIs(nm, "dictUpdateEnd"))
+                                                 opMap[i] = OP_NOP;
+            break;
+        case 'e':
+            if (InstrIs(nm, "endCatch"))         opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "expandStkTop"))opMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "expandStart")) opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "existStk"))    opMap[i] = OP_INCR_STK_IMM;
+            else if (InstrIs(nm, "existScalar") || InstrIs(nm, "existArray") ||
+                     InstrIs(nm, "eq") || InstrIs(nm, "expon") || InstrIs(nm, "exprStk"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'f':
+            if (InstrIs(nm, "foreach_start") || InstrIs(nm, "foreach_step") || InstrIs(nm, "foreach_end"))
+                                                 opMap[i] = OP_NOP;
+            break;
+        case 'g':
+            if (InstrIs(nm, "gt") || InstrIs(nm, "ge"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'j':
+            if (InstrIs(nm, "jump"))             opMap[i] = OP_RESET;
+            break;
+        case 'm':
+            if (InstrIs(nm, "mult") || InstrIs(nm, "mod"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'n':
+            if (InstrIs(nm, "nop"))              opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "not") || InstrIs(nm, "neq") || InstrIs(nm, "numericType"))
+                                                 opMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "nsupvar"))     opMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'o':
+            if (InstrIs(nm, "over"))             opMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'r':
+            if (InstrIs(nm, "returnStk"))        opMap[i] = OP_RETURN_STK;
+            else if (InstrIs(nm, "return"))       opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "reverse"))     opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "rshift") || InstrIs(nm, "regexp"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 't':
+            if (InstrIs(nm, "tailcall"))         opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "tclooClass"))  opMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "tryCvtToNumeric"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'u':
+            if (InstrIs(nm, "unsetStk"))         opMap[i] = OP_UNSET_STK;
+            else if (InstrIs(nm, "unsetScalar")) opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "uplevel"))     opMap[i] = OP_RESET;
+            else if (InstrIs(nm, "upvar"))       opMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "uminus") || InstrIs(nm, "uplus"))
+                                                 opMap[i] = OP_ARITH;
+            break;
+        case 'v':
+            if (InstrIs(nm, "verifyDict"))       opMap[i] = OP_NOP;
+            else if (InstrIs(nm, "variable"))    opMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'y':
+            if (InstrIs(nm, "yield"))            opMap[i] = OP_RESET;
+            break;
+        }
+    }
+
     /* Track which literals are pushed by ANY instruction.  Literals that
        are never pushed are "dead references" -- source text kept for error
        reporting by Tcl's compiler for inline-compiled bodies (foreach,
@@ -2725,31 +2881,29 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
         const InstructionDesc* desc = &instTable[opcode];
         if (pc + desc->numBytes > codeLen) break;
 
-        const char* nm = desc->name;
         const unsigned char* op = code + pc + 1;
 
-        /* ---- push1 / push4 ---- */
-        if (InstrIs(nm, "push"))
+        switch (opMap[opcode]) {
+
+        case OP_PUSH:
         {
             int litIdx = -1;
-            /* Tcl 9.1 changed literal operands from OPERAND_UINT to
-               OPERAND_LIT.  Use numBytes to infer operand size — this
-               is robust across all Tcl versions. */
-            if (desc->numBytes == 2)       /* push1: 1-byte operand */
+            if (desc->numBytes == 2)
                 litIdx = op[0];
-            else if (desc->numBytes == 5)  /* push4: 4-byte operand */
+            else if (desc->numBytes == 5)
                 litIdx = (int)((op[0] << 24) | (op[1] << 16) | (op[2] << 8) | op[3]);
             if (pushed && litIdx >= 0 && litIdx < numLits)
                 pushed[litIdx] = 1;
             ISCAN_PUSH(litIdx);
+            break;
         }
-        /* ---- invokeStk1 / invokeStk4 ---- */
-        else if (InstrIs(nm, "invokeStk"))
+
+        case OP_INVOKE_STK:
         {
             int argc = 0;
-            if (desc->numBytes == 2)       /* invokeStk1: 1-byte count */
+            if (desc->numBytes == 2)
                 argc = op[0];
-            else if (desc->numBytes == 5)  /* invokeStk4: 4-byte count */
+            else if (desc->numBytes == 5)
                 argc = (int)((op[0] << 24) | (op[1] << 16) | (op[2] << 8) | op[3]);
 
             if (argc >= 2 && sp >= argc)
@@ -2876,95 +3030,81 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
             sp -= argc;
             if (sp < 0) sp = 0;
             ISCAN_PUSH(-1);
+            break;
         }
-        /* ---- Stack-neutral: startCommand, nop ---- */
-        else if (InstrIs(nm, "startCommand") || InstrIs(nm, "nop"))
-        {
-            /* no stack effect */
-        }
-        /* ---- Pop ---- */
-        else if (InstrIs(nm, "pop"))
-        {
+
+        case OP_NOP:
+            break;
+
+        case OP_POP:
             (void)ISCAN_POP();
-        }
-        /* ---- Stack-producing (1 value, no stack consumption) ---- */
-        else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray") ||
-                 InstrIs(nm, "dup") ||
-                 InstrIs(nm, "over") || InstrIs(nm, "nsupvar") ||
-                 InstrIs(nm, "upvar") || InstrIs(nm, "variable"))
-        {
+            break;
+
+        case OP_PUSH1_NOPOP:
             ISCAN_PUSH(-1);
-        }
-        /* ---- loadStk: pops varname, pushes value ---- */
-        else if (InstrIs(nm, "loadStk"))
-        {
+            break;
+
+        case OP_LOAD_STK:
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- loadArrayStk: pops arrayname+index, pushes value ---- */
-        else if (InstrIs(nm, "loadArrayStk"))
-        {
+            break;
+
+        case OP_LOAD_ARR_STK:
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- storeScalar/storeArray: uses LVT, pops val, pushes val back ---- */
-        else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
-        {
+            break;
+
+        case OP_STORE_LVT:
             if (sp > 0) stk[sp - 1] = -1;
-        }
-        /* ---- storeStk: pops name+val, pushes val ---- */
-        else if (InstrIs(nm, "storeStk"))
-        {
+            break;
+
+        case OP_STORE_STK:
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- storeArrayStk: pops arrayname+index+val, pushes val ---- */
-        else if (InstrIs(nm, "storeArrayStk"))
-        {
+            break;
+
+        case OP_STORE_ARR_STK:
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- incrStkImm: pops varname, pushes incremented value ---- */
-        else if (InstrIs(nm, "incrStkImm") || InstrIs(nm, "existStk"))
-        {
+            break;
+
+        case OP_SWAP:
+            if (sp >= 2)
+            {
+                int tmp = stk[sp - 1];
+                stk[sp - 1] = stk[sp - 2];
+                stk[sp - 2] = tmp;
+            }
+            break;
+
+        case OP_INCR_STK_IMM:
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- incrStk/lappendStk/appendStk: pops varname+value, pushes result ---- */
-        else if (InstrIs(nm, "incrStk") || InstrIs(nm, "lappendStk") ||
-                 InstrIs(nm, "appendStk"))
-        {
+            break;
+
+        case OP_INCR_STK:
+        case OP_LAPPEND_LST_STK:
             (void)ISCAN_POP();
             (void)ISCAN_POP();
             ISCAN_PUSH(-1);
-        }
-        /* ---- lappendListStk: pops varname+list, pushes result ---- */
-        else if (InstrIs(nm, "lappendListStk"))
-        {
+            break;
+
+        case OP_UNSET_STK:
             (void)ISCAN_POP();
-            (void)ISCAN_POP();
-            ISCAN_PUSH(-1);
-        }
-        /* ---- unsetStk: pops varname, pushes nothing ---- */
-        else if (InstrIs(nm, "unsetStk"))
-        {
-            (void)ISCAN_POP();
-        }
-        /* ---- returnStk: pops options+value ---- */
-        else if (InstrIs(nm, "returnStk"))
-        {
+            break;
+
+        case OP_RETURN_STK:
+        case OP_RESET:
             sp = 0;
-        }
-        /* ---- strcat N, list N, concat N: pop N, push 1 ---- */
-        else if (InstrIs(nm, "strcat") || InstrIs(nm, "list") ||
-                 InstrIs(nm, "concat") || InstrIs(nm, "lappendList"))
+            break;
+
+        case OP_STRCAT_N:
         {
             int cnt = 0;
-            /* Use numBytes to infer operand size (robust across Tcl versions) */
             if (desc->numBytes == 2)
                 cnt = op[0];
             else if (desc->numBytes == 5)
@@ -2972,41 +3112,16 @@ static void InstrScanBodyLiterals(ByteCode* bc, TbcxCtx* ctx, char* phase2marks)
             sp -= cnt;
             if (sp < 0) sp = 0;
             ISCAN_PUSH(-1);
+            break;
         }
-        /* ---- returnImm / done / jump: reset ---- */
-        else if (InstrIs(nm, "return") || InstrIs(nm, "done") ||
-                 InstrIs(nm, "jump"))
-        {
-            sp = 0;
-        }
-        /* ---- Arithmetic / comparison / misc: pop some, push 1 ---- */
-        else if (InstrIs(nm, "add") || InstrIs(nm, "sub") ||
-                 InstrIs(nm, "mult") || InstrIs(nm, "div") ||
-                 InstrIs(nm, "mod") || InstrIs(nm, "eq") ||
-                 InstrIs(nm, "neq") || InstrIs(nm, "lt") ||
-                 InstrIs(nm, "gt") || InstrIs(nm, "le") ||
-                 InstrIs(nm, "ge") || InstrIs(nm, "land") ||
-                 InstrIs(nm, "lor") || InstrIs(nm, "lnot") ||
-                 InstrIs(nm, "bitnot") || InstrIs(nm, "lshift") ||
-                 InstrIs(nm, "rshift") || InstrIs(nm, "bitand") ||
-                 InstrIs(nm, "bitor") || InstrIs(nm, "bitxor") ||
-                 InstrIs(nm, "uminus") || InstrIs(nm, "uplus") ||
-                 InstrIs(nm, "not") || InstrIs(nm, "tryCvtToNumeric") ||
-                 InstrIs(nm, "exprStk") || InstrIs(nm, "existScalar") ||
-                 InstrIs(nm, "existArray") ||
-                 InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray") ||
-                 InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray") ||
-                 InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray") ||
-                 InstrIs(nm, "incrScalarImm") ||
-                 InstrIs(nm, "lindexMulti") || InstrIs(nm, "lsetFlat"))
-        {
-            /* Conservative: these consume 1-2 and produce 1. Just mark non-lit. */
+
+        case OP_ARITH:
             if (sp > 0) stk[sp - 1] = -1;
-        }
-        /* ---- Unknown: reset stack (conservative) ---- */
-        else
-        {
+            break;
+
+        default: /* OP_UNKNOWN */
             sp = 0;
+            break;
         }
 
         pc += desc->numBytes;
@@ -3149,7 +3264,7 @@ static void WriteCompiledBlock(TbcxOut* w, TbcxCtx* ctx, Tcl_Obj* bcObj)
     W_Bytes(w, bc->codeStart, (size_t)bc->numCodeBytes);
 
     /* 2) literal pool */
-    /* Improvement #1: scan instructions to identify body-argument literals
+    /* scan instructions to identify body-argument literals
        BEFORE emitting the pool.
        Phase 1: populates ctx->instrBodyLits (Tcl_Obj* keys) for invokeStk
        body arguments.  Cleared at blockDepth==1 to prevent cross-block leak.
@@ -4002,10 +4117,6 @@ static void StubLinesForClass(Tcl_Interp* ip, Tcl_DString* out, DefVec* defs, Tc
         {
             if (r->flags & DEF_F_SELF_METHOD)
             {
-                /* Improvement #2 / Option A: emit as flat oo::objdefine form
-                   so the existing CmdOOShimObjDef can intercept and substitute
-                   the precompiled body.  This avoids the builder-body string
-                   approach that left the body empty (breaking metaclass create). */
                 Tcl_DStringFree(&ln); /* discard the "oo::define CLS" prefix */
                 Tcl_DStringInit(&ln);
                 Tcl_DStringAppendElement(&ln, "oo::objdefine");
@@ -5888,7 +5999,7 @@ done_classes: ;
             /* wire kind 0..4 expected by loader (inst=0, class=1, ctor=2, dtor=3, self=4) */
             {
                 uint8_t wireKind = (uint8_t)(defs.v[i].kind - DEF_KIND_INST);
-                /* Improvement #2: self methods get wire kind 4 (TBCX_METH_SELF)
+                /* self methods get wire kind 4 (TBCX_METH_SELF)
                    so the load side installs them via oo::objdefine, not oo::define. */
                 if (defs.v[i].flags & DEF_F_SELF_METHOD)
                     wireKind = 4; /* TBCX_METH_SELF */

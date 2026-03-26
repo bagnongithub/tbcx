@@ -385,7 +385,7 @@ static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr)
  * so Tcl's TclCleanupByteCode will correctly decrement when the inner
  * ByteCode is freed.
  *
- * Thread safety (Proposal #8): procPtr->refCount is manipulated without
+ * Thread safety: procPtr->refCount is manipulated without
  * a mutex.  This is safe because:
  *   (a) Proc structs created by TBCX are per-interp, never shared;
  *   (b) all tbcx::load operations run on the interp-owning thread;
@@ -395,7 +395,7 @@ static void FixLiteralPoolProcPtr(ByteCode* bcPtr)
 {
     if (!bcPtr || !bcPtr->procPtr || bcPtr->numLitObjects <= 0 || !bcPtr->objArrayPtr)
         return;
-    /* Proposal #8: verify we're on the interp-owning thread */
+    /* verify we're on the interp-owning thread */
     assert(bcPtr->procPtr->iPtr != NULL &&
            "FixLiteralPoolProcPtr: procPtr->iPtr must be non-NULL");
     Tcl_Obj** litObjv = bcPtr->objArrayPtr;
@@ -567,47 +567,40 @@ static int DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_
         return rc;
     }
 
-    /* Self methods: install via oo::objdefine CLS method NAME ARGS BODY.
-       Semantically equivalent to "self method" inside a builder body. */
+    /* Self methods: install via oo::define CLS { self method NAME ARGS BODY }.
+       Using oo::define with a builder body containing "self method" properly
+       sets up the metaclass inheritance chain so subclass class-objects
+       inherit the method.  oo::objdefine only adds to the object without
+       updating the class hierarchy — causing "unknown method" in subclasses.
+
+       We pass the actual body source text and let TclOO compile it normally.
+       For TBCX_LIT_BYTESRC literals the source is preserved in the string
+       rep; for procbody objects Tcl shimmers to produce it.  This avoids
+       accessing internal Object struct members (which vary across Tcl
+       versions).  Self methods are rare so the recompilation cost is
+       negligible. */
     if (kind == TBCX_METH_SELF)
     {
-        if (!os->hasObjDefine)
-        {
-            Tcl_DecrRefCount(argv0);
-            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: oo::objdefine shim not available for self method", -1));
-            return TCL_ERROR;
-        }
-        Tcl_Obj* objDefCmd = Tcl_NewStringObj(os->origNameObjDef, -1);
-        Tcl_IncrRefCount(objDefCmd);
-        Tcl_Obj* sub = Tcl_NewStringObj("method", -1);
-        Tcl_IncrRefCount(sub);
-        Tcl_IncrRefCount(nameOpt);
-        Tcl_IncrRefCount(argsOpt);
-        Tcl_IncrRefCount(bodyOpt);
-        Tcl_Obj* av[6] = {objDefCmd, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
-        rc = Tcl_EvalObjv(ip, 6, av, 0);
-        Tcl_DecrRefCount(bodyOpt);
-        Tcl_DecrRefCount(argsOpt);
-        Tcl_DecrRefCount(nameOpt);
-        Tcl_DecrRefCount(sub);
-        Tcl_DecrRefCount(objDefCmd);
+        Tcl_DString script;
+        Tcl_DStringInit(&script);
+        Tcl_DStringAppend(&script, "self method ", -1);
+        Tcl_DStringAppendElement(&script, Tbcx_GetStringSafe(nameOpt));
+        Tcl_DStringAppendElement(&script, Tbcx_GetStringSafe(argsOpt));
+        Tcl_DStringAppendElement(&script, Tbcx_GetStringSafe(bodyOpt));
+
+        Tcl_Obj* scriptObj = Tcl_NewStringObj(Tcl_DStringValue(&script),
+                                               Tcl_DStringLength(&script));
+        Tcl_IncrRefCount(scriptObj);
+        Tcl_DStringFree(&script);
+
+        Tcl_Obj* av[3] = {argv0, clsFqn, scriptObj};
+        rc = Tcl_EvalObjv(ip, 3, av, 0);
+
+        Tcl_DecrRefCount(scriptObj);
         Tcl_DecrRefCount(argv0);
         return rc;
     }
 
-    /* Constructors/Destructors: TclOO's constructor and destructor creation
-       paths do NOT honor the procbody internal rep — they always recompile
-       from the body's string rep.
-
-       Fix: create the ctor/dtor normally (with an empty body) so TclOO
-       establishes proper dispatch context — in particular, 'next' inside
-       a constructor routes through the constructor chain (not the method
-       chain).  Then locate the Proc that TclOO created and swap its bodyPtr
-       with the precompiled bytecode.
-
-       Previous approach (hidden method + wrapper) broke 'next' because the
-       precompiled body ran as a method, where 'next' looks for the next
-       *method* — not the next constructor. */
     int hasPrecompiled = (bodyOpt && bodyOpt->typePtr == tbcxTyProcBody) ? 1 : 0;
     if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && hasPrecompiled)
     {
@@ -655,12 +648,7 @@ static int DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_
 
         /* Step 2: Locate the Proc that TclOO just created and swap its
            bodyPtr with the precompiled bytecode.  This preserves the full
-           TclOO constructor/destructor dispatch chain.
-
-           Uses the public TclOO API (Tcl_GetObjectFromObj, Tcl_GetObjectAsClass)
-           which goes through tclOOStubsPtr — initialized in tbcx_Init via
-           TclOOInitializeStubs.  Internal struct access (Class*, Method*,
-           ProcedureMethod*) uses tclOOInt.h as throughout tbcx. */
+           TclOO constructor/destructor dispatch chain. */
         if (preProc && preProc->bodyPtr)
         {
             Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, clsFqn);
@@ -1731,15 +1719,6 @@ static ByteCode* TbcxByteCode(Tcl_Obj* objPtr, const Tcl_ObjType* typePtr, const
     Tcl_StoreInternalRep(objPtr, typePtr, &ir);
     if (setPrecompiled)
     {
-        /* Set the flag directly on codePtr.  Previous code extracted the
-           ByteCode back from the Tcl_Obj via ByteCodeGetInternalRep, but
-           that macro may use &tclByteCodeType (Tcl's internal symbol)
-           which can differ from the typePtr obtained via Tcl_GetObjType
-           in stubs builds.  If the extraction returned NULL, the
-           PRECOMPILED flag was silently never set — causing Tcl to
-           recompile from the empty string rep ("") when epoch checks
-           fail, discarding all precompiled content and leaving
-           procPtr=NULL on the replacement ByteCode. */
         codePtr->flags |= TCL_BYTECODE_PRECOMPILED;
     }
     return codePtr;
@@ -1948,9 +1927,7 @@ static void FixCompiledLocalNames(Proc* procPtr, LocalCache* lc)
         memcpy(repl, cl, offsetof(CompiledLocal, name));
         memcpy(repl->name, nm, (size_t)nameLen);
         repl->name[nameLen] = '\0';
-        /* F7 fix: Tcl's CompiledLocal.nameLength is int — guard the narrowing cast */
         repl->nameLength = (nameLen > INT_MAX) ? INT_MAX : (int)nameLen;
-
         /* Splice replacement into the linked list using tracked predecessor
            (O(1) instead of the previous O(n) predecessor search). */
         repl->nextPtr = cl->nextPtr;
@@ -1979,10 +1956,7 @@ void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
 {
     if (!bc)
         return;
-    /* Proposal #8: Proc structs created by TBCX are per-interp.
-       Assert we have a valid interp context for refCount safety. */
     assert(ip != NULL && "TbcxFixupByteCode requires non-NULL interp");
-    /* S3: verify we're on the interp-owning thread in debug builds */
 #ifndef NDEBUG
     {
         Interp* _iPtr = (Interp*)ip;
@@ -2033,8 +2007,6 @@ void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip,
 
 
 /* ==========================================================================
- * Proposal #4: Post-load verification pass
- *
  * Walks a ByteCode and its literal pool, checking invariants.  Returns
  * TCL_OK if all checks pass.  On failure, sets the interp result with
  * a diagnostic and returns TCL_ERROR.
@@ -2170,7 +2142,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
+    Tcl_IncrRefCount(bodyBC); 
     /* Build Proc + compiled locals from argsObj */
     Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
@@ -2184,7 +2156,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
         if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK)
         {
             Tcl_DecrRefCount(bodyBC); /* Proc's reference */
-            Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+            Tcl_DecrRefCount(bodyBC); /* local reference  */
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -2221,7 +2193,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
         Tcl_DecrRefCount(procBodyObj);
-        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* local reference */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2238,7 +2210,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     {
         Tcl_DecrRefCount(pair);
         Tcl_DecrRefCount(procBodyObj);
-        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* local reference */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2250,7 +2222,7 @@ static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
     if (oldPair)
         Tcl_DecrRefCount(oldPair);
     Tcl_DecrRefCount(procBodyObj);
-    Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+    Tcl_DecrRefCount(bodyBC); /* local reference */
     Tcl_DecrRefCount(nameObj);
     Tcl_DecrRefCount(clsFqn);
     Tcl_DecrRefCount(argsObj);
@@ -2498,7 +2470,7 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         Tcl_Free((char*)procPtr);
         return NULL;
     }
-    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
+    Tcl_IncrRefCount(bodyBC); /* own immediately — don't leave at refcount 0 */
     procPtr->bodyPtr = bodyBC;
     Tcl_IncrRefCount(bodyBC); /* Proc's own reference */
     {
@@ -2518,7 +2490,7 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         if (bc2)
             bc2->procPtr = NULL;
         Tcl_DecrRefCount(bodyBC); /* Proc's reference */
-        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* local reference  */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
         Tcl_Free((char*)procPtr);
         Tcl_DecrRefCount(nsObj);
@@ -2550,7 +2522,7 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
     if (!dumpOnly)
     {
         RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
-        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* local reference */
     }
     else
     {
@@ -2559,7 +2531,7 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
         if (bc2)
             bc2->procPtr = NULL;
         Tcl_DecrRefCount(bodyBC); /* Proc's reference */
-        Tcl_DecrRefCount(bodyBC); /* local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* local reference  */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
         Tcl_Free((char*)procPtr);
     }
@@ -3800,7 +3772,7 @@ static int CmdProcShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const o
                         return rc;
                     }
 
-                    /* P3: Capture handler pointers for future direct installs */
+                    /* Capture handler pointers for future direct installs */
                     if (!ps->haveDispatch)
                     {
                         ps->procDispatchObj = cmdPtr->objProc2;
@@ -3978,8 +3950,6 @@ static int CmdApplyShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const 
 {
     ApplyShim* as = (ApplyShim*)cd;
 
-    /* Proposal #17: fast-path bypass when no TBCX lambdas are registered.
-       Avoids hash lookup overhead for every [apply] call in the interp. */
     if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda)
     {
         Tcl_Obj* lambda = objv[1];
@@ -4554,8 +4524,7 @@ static void TopLocals_Begin(Tcl_Interp* ip, ByteCode* bcPtr, TbcxTopFrameSave* s
         return;
     }
     /* Allocate compiled locals and directly link each slot to the target Var
-     * in the global namespace (no extra compilation, no upvar command call).
-     * F2 fix: overflow-safe multiply — n derives from wire data. */
+     * in the global namespace (no extra compilation, no upvar command call). */
     {
         size_t varBytes;
         if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes))
@@ -4630,16 +4599,11 @@ static void TopLocals_End(Tcl_Interp* ip, TbcxTopFrameSave* sv)
     f->localCachePtr = sv->oldCache;
 }
 
-/* Proposal #12: Maximum reentrancy depth for tbcx::load.
- * Prevents unbounded recursion if a loaded script calls tbcx::load.
- * The shim save/restore chain handles reentrancy correctly, but
- * excessive depth risks stack overflow.  Limit to 8 levels. */
 #define TBCX_MAX_LOAD_DEPTH 8
 #define TBCX_LOAD_DEPTH_KEY "tbcx::loadDepth"
 
 static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
 {
-    /* Proposal #12: reentrancy depth check */
     intptr_t depth = 0;
     {
         void* dv = Tcl_GetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL);
@@ -4799,7 +4763,6 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
             TbcxFixupByteCode(top, topProc, ip, curNs, TBCX_FIXUP_CACHE_NONE);
         }
 
-        /* Proposal #4: verify invariants before execution */
         if (top)
             TbcxVerifyLoadedBC(top, ip, "top-level");
 
@@ -4809,14 +4772,6 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
 
         TopLocals_End(ip, &_sv);
 
-        /* Detach and free the temporary Proc.
-         *
-         * F0 fix: FixLiteralPoolProcPtr propagated topProc to inner
-         * TBCX_LIT_BYTECODE literals in the top-level block (each
-         * incremented topProc->refCount).  We must NULL out those
-         * borrowed references BEFORE freeing topProc — otherwise
-         * Tcl_DecrRefCount(topBC) → TclCleanupByteCode on inner BCs
-         * would access freed memory via litBC->procPtr->refCount--. */
         if (topProc)
         {
             if (top && top->numLitObjects > 0 && top->objArrayPtr)
@@ -4855,7 +4810,6 @@ cleanup:
         DelOOShim(ip, &ooshim);
     if (shimInited)
         DelProcShim(ip, &shim);
-    /* Proposal #12: restore reentrancy depth */
     Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void*)depth);
     return rc;
 }
