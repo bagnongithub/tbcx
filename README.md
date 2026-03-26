@@ -39,8 +39,14 @@ puts [tbcx::dump ./hello.tbcx]
   - Top-level bytecode (with literals, AuxData, exception ranges, local names)
   - All discovered `proc`s, each as precompiled bytecode
   - TclOO classes (including superclass lists) and methods/constructors/destructors as precompiled bytecode
+  - **Self methods** (`self method` inside `oo::define`) serialized with kind `TBCX_METH_SELF`; loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses
   - Lambda literals (`apply {args body ?ns?}` forms) compiled and serialized as lambda‑bytecode literals
   - Bodies found in `namespace eval $ns { ... }` and other script-body contexts (compiled and bound to the correct namespace)
+  - **Instruction-level body detection** (Phase 1): analyzes `invokeStk` patterns to identify and precompile bodies for `eval`, `uplevel`, `try`/`on`/`trap`/`finally`, `catch`, `foreach`, `while`, `for`, `if`/`elseif`/`else`, `time`, `timerate`, `dict for`/`map`/`update`/`with` (including FQN `::tcl::dict::*` forms), and `self method`
+  - **Unpushed literal detection** (Phase 2): identifies dead-reference body literals from Tcl 9.1's inline-compiled `foreach`/`lmap` loops (compiled to `foreach_start` opcodes) and precompiles them
+  - **O(1) opcode dispatch**: instruction scanner uses a 256-entry `opMap[]` lookup table covering all 120 Tcl 9.1 instruction types, replacing per-instruction string comparisons
+  - **Bytearray detection**: strings with bytes ≥ 0x80 are probed and emitted as `TBCX_LIT_BYTEARR` to avoid UTF-8 encoding corruption on round-trip
+  - **Cross-interpreter support**: body literals are emitted as `TBCX_LIT_BYTESRC` (bytecode + preserved source text); loaded with `setPrecompiled=0` so Tcl can gracefully recompile from source in child interpreters or after epoch bumps
 - **Load**: Read a `.tbcx`, create procs, classes and methods, patch bytecode with the current interpreter/namespace, and execute the top level.
 - **Dump**: Pretty-print / disassemble `.tbcx` contents (header, literals, AuxData summaries, exception ranges, full instruction streams).
 - **Safe interp support**: `tbcx_SafeInit` exposes only `tbcx::dump` (read‑only) in safe interpreters.
@@ -93,19 +99,23 @@ Explicitly purge stale entries from the per‑interpreter lambda shimmer‑recov
 
 `tbcx::save` compiles the given script and **captures** definitions in a single pass:
 
-- **Capture and rewrite**: `CaptureAndRewriteScript` walks the script's token tree once, extracting `proc`, `namespace eval`, `oo::class create`, `oo::define` (method/constructor/destructor), and `oo::objdefine` forms. It simultaneously produces a **rewritten** script where captured method/constructor/destructor bodies are replaced with indexed stubs, ensuring the top-level bytecode doesn't redundantly contain their full source.
-- **Namespace body scanning**: The rewritten script and captured definition bodies are scanned (`ScanScriptBodiesRec`) for nested script-body patterns — `namespace eval`, `try`/`on`/`trap`/`finally`, `foreach`, `while`, `for`, `catch`, `if`/`elseif`/`else`, `uplevel`, `eval`, `dict for`/`with`, `lsort -command` — building a mapping from body text to namespace FQN.
+- **Capture and rewrite**: `CaptureAndRewriteScript` walks the script's token tree once, extracting `proc`, `namespace eval`, `oo::class create`, `oo::define` (method/constructor/destructor/self method), and `oo::objdefine` forms. It simultaneously produces a **rewritten** script where captured method/constructor/destructor bodies are replaced with indexed stubs, ensuring the top-level bytecode doesn't redundantly contain their full source.
+- **Namespace body scanning**: The rewritten script and captured definition bodies are scanned (`ScanScriptBodiesRec`) for nested script-body patterns — `namespace eval`, `try`/`on`/`trap`/`finally`, `foreach`, `while`, `for`, `catch`, `if`/`elseif`/`else`, `uplevel`, `eval`, `dict for`/`map`/`update`/`with`, `lsort -command` — building a mapping from body text to namespace FQN.
 - **Pre‑compilation**: Matched namespace eval body literals in the top-level literal pool are compiled into a **side table** (never modifying the pool itself) so they serialize as bytecode rather than source text.
+- **Instruction scanning** (`InstrScanBodyLiterals`): Two-phase bytecode analysis runs on each compiled block:
+  - **Phase 1** (invokeStk analysis): Models the operand stack using a 256-entry `opMap[]` dispatch table (built once per call from instruction names, O(1) per instruction). Tracks literal indices through `push`/`loadStk`/`storeStk`/`swap` etc. to identify which literal is the command argument for each `invokeStk` call. Marks body literals for `eval`, `try`/`on`/`trap`/`finally`, `catch`, `foreach`, `while`, `for`, `if`, `uplevel`, `time`, `timerate`, `dict for`/`map`/`update`/`with` (including FQN `::tcl::dict::*`), and `self method`.
+  - **Phase 2** (unpushed literal detection): For blocks containing `foreach_start` opcodes, identifies literal pool entries that are never referenced by any `push` instruction — these are dead body-text references kept by Tcl's compiler for error reporting. Marks them for precompilation via `LooksLikeScriptBody()` filtering.
+- **Bytearray detection**: `WriteLit_Untyped` probes string literals for bytes ≥ 0x80; if all code points ≤ 255, emits as `TBCX_LIT_BYTEARR` to prevent UTF-8 encoding corruption on round-trip.
 - **Serialize**: Emit:
   - A **header** (magic, format version, Tcl version, code length, exception/literal/AuxData/local counts, max stack depth).
-  - The **top-level compiled block** (code bytes, literals, AuxData, exception ranges, locals epilogue). Captured proc bodies are stripped during this phase.
+  - The **top-level compiled block** (code bytes, literals, AuxData, exception ranges, locals epilogue). Captured proc bodies are stripped during this phase. Body literals are emitted as `TBCX_LIT_BYTESRC` (source text + compiled bytecode).
   - A table of **procs**: name FQN, namespace, argument spec, then the separately compiled body block.
-  - **Classes** (FQN + superclass count), then **methods** (class FQN, kind, name, argument spec, compiled body block).
+  - **Classes** (FQN + superclass count), then **methods** (class FQN, kind 0–4, name, argument spec, compiled body block). Self methods use kind 4 (`TBCX_METH_SELF`).
   - A final flush of any buffered output.
 
 **Runaway protection**: The serializer tracks total literal calls, block calls, recursion depth, and output bytes. If any limit is exceeded (2M literals, 256K blocks, depth 64, or 256 MB output), serialization aborts with a diagnostic error.
 
-Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, embedded bytecode**.
+Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, bytesrc** (bytecode + source text for cross-interp recompilation). Legacy **bytecode** (tag 10, no source text) is accepted on load but no longer emitted.
 
 Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachInfo**.
 
@@ -115,9 +125,9 @@ Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachIn
 
 `tbcx::load` reads the header, validates magic/format/Tcl‑version compatibility, then deserializes sections:
 
-1. **Top-level block**: Deserialized and marked `TCL_BYTECODE_PRECOMPILED` so Tcl skips compile-epoch checks and executes the bytecode directly.
+1. **Top-level block**: Deserialized and marked `TCL_BYTECODE_PRECOMPILED` so Tcl skips compile-epoch checks and executes the bytecode directly. `TBCX_LIT_BYTESRC` literals within the block are loaded with `setPrecompiled=0` and their source text restored as string rep, allowing Tcl to recompile from source when needed (e.g. cross-interpreter evaluation or epoch mismatch). Legacy `TBCX_LIT_BYTECODE` literals (no source text) are loaded with `setPrecompiled=1` for backward compatibility.
 2. **Procs**: A temporary **ProcShim** intercepts the `proc` command (both `objProc2` and `nreProc2` dispatch paths). When the top-level block evaluates a `proc` call matching a saved definition (by FQN + argument signature, or by indexed marker for conflicting definitions), the shim substitutes the precompiled body. Unmatched `proc` calls pass through to Tcl's original handler.
-3. **Classes and methods**: An **OOShim** temporarily renames `oo::define` (and `oo::objdefine` when available) to intercept method/constructor/destructor installations. Matching definitions receive precompiled bodies; constructors and destructors are handled specially to preserve TclOO's dispatch chain (e.g. `next` routing through the constructor chain).
+3. **Classes and methods**: An **OOShim** temporarily renames `oo::define` (and `oo::objdefine` when available) to intercept method/constructor/destructor installations. Matching definitions receive precompiled bodies; constructors and destructors use a create-then-swap pattern (placeholder body `";"` → TclOO builds dispatch → bytecode swap) to preserve `next` routing through the constructor chain. **Self methods** (kind 4) are installed via `oo::define CLASS { self method NAME ARGS BODY }` — this uses the renamed original `oo::define` command, which properly sets up the metaclass inheritance chain so subclass class-objects inherit the method.
 4. **Lambda recovery**: An **ApplyShim** is installed as persistent per-interpreter `AssocData`. When a precompiled lambda's `lambdaExpr` internal rep gets evicted by shimmer, the shim detects the missing rep on the next `[apply]` call and re-installs the precompiled `Proc*` from its registry before forwarding to Tcl's real `[apply]`.
 5. **Top-level execution**: The precompiled top-level block is evaluated via `Tcl_EvalObjEx` with `TCL_EVAL_GLOBAL`. Compiled locals for the top-level frame are set up by linking named variables to existing globals (via `TopLocals_Begin`/`TopLocals_End`). `TCL_RETURN` is handled the same way `source` does — converting it to `TCL_OK` with the return value as the result.
 6. **Cleanup**: The ProcShim and OOShim are removed (original command handlers restored). The ApplyShim persists for the interpreter's lifetime to support lambda shimmer recovery.
@@ -161,7 +171,8 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | 7 | WIDEINT | signed 64-bit as u64 |
 | 8 | WIDEUINT | unsigned 64-bit as u64 |
 | 9 | LAMBDA_BC | ns FQN, args, compiled block, body source text |
-| 10 | BYTECODE | ns FQN + compiled block |
+| 10 | BYTECODE | ns FQN + compiled block (legacy — no longer emitted, kept for backward-compatible loading) |
+| 11 | BYTESRC | source text (LPString) + ns FQN + compiled block (current default; enables cross-interp recompilation) |
 
 **AuxData tags** (u32):
 | Tag | Kind | Payload |
@@ -170,6 +181,15 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | 1 | JT_NUM | u32 count; u64 key + u32 offset per entry |
 | 2 | DICTUPD | u32 length; local indices |
 | 3 | NEWFORE | u32 numLists, u32 loopCtTemp, u32 firstValueTemp, u32 numLists (dup), then per-list var indices |
+
+**Method kinds** (u8):
+| Kind | Name | Description |
+|------|------|-------------|
+| 0 | INST | Instance method |
+| 1 | CLASS | Class method (classmethod) |
+| 2 | CTOR | Constructor |
+| 3 | DTOR | Destructor |
+| 4 | SELF | Self method (installed via `oo::define { self method }` for metaclass inheritance) |
 
 **LPString**: a u32 byte-length followed by that many raw bytes (no NUL terminator on disk).
 
@@ -206,7 +226,7 @@ make test
 - **Security**: Loading a `.tbcx` executes code (top-level) and installs commands/classes. Only load artifacts you trust.
 - **Compatibility**: `TBCX_FORMAT` is `91` (Tcl 9.1). Different formats are rejected during load. An exact major.minor Tcl version match is required.
 - **AuxData coverage**: The saver asserts that all AuxData items in a block are of known kinds (jump tables, dict-update, NewForeachInfo). Unknown kinds cause the save to abort.
-- **OO coverage**: Supports `oo::class create`, `oo::define` (method/classmethod/constructor/destructor plus declarative keywords like variable/superclass/mixin/filter/forward), and `oo::objdefine`. Builder-form class bodies are expanded into multi-word stubs for correct load-time reconstruction.
+- **OO coverage**: Supports `oo::class create`, `oo::define` (method/classmethod/constructor/destructor/self method plus declarative keywords like variable/superclass/mixin/filter/forward), and `oo::objdefine`. Builder-form class bodies are expanded into multi-word stubs for correct load-time reconstruction. Self methods (`self method` inside `oo::define`) are serialized with kind 4 (`TBCX_METH_SELF`) and loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses.
 - **Lambda shimmer recovery**: Precompiled lambdas are registered in a persistent per-interpreter ApplyShim. If the `lambdaExpr` internal rep is evicted by shimmer, the shim transparently re-installs it on the next `[apply]` call.
 - **Conflicting proc definitions**: When multiple branches define a proc with the same name (e.g. `if {$cond} {proc p ...} else {proc p ...}`), the saver emits indexed markers so the loader matches by position rather than by FQN alone.
 - **Endianness**: Host endianness is detected at runtime; streams are always little-endian on disk.
