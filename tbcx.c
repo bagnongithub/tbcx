@@ -11,6 +11,11 @@
 #define PKG_TBCX "tbcx"
 #define PKG_TBCX_VER "1.0"
 
+/* Runtime type pointers — initialized once under tbcxTypeMutex, thereafter
+ * immutable.  Read-safety on weakly-ordered architectures is guaranteed by
+ * the memory_order_acquire load of tbcxTypesLoaded that gates Phase 2 of
+ * TbcxInitTypes: any thread that observes tbcxTypesLoaded==1 also sees all
+ * preceding stores to these pointers (memory_order_release at publish). */
 const Tcl_ObjType* tbcxTyBignum = NULL;
 const Tcl_ObjType* tbcxTyBoolean = NULL;
 const Tcl_ObjType* tbcxTyByteArray = NULL;
@@ -51,10 +56,11 @@ TCL_DECLARE_MUTEX(tbcxTypeMutex);
  * Extern Declarations
  * ========================================================================== */
 
-EXTERN int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
-EXTERN int Tbcx_LoadObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
-EXTERN int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
-EXTERN int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
+/* Forward declarations for command implementations in other TUs */
+extern int Tbcx_SaveObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
+extern int Tbcx_LoadObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
+extern int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
+extern int Tbcx_GcObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
 
 /* ==========================================================================
  * Forward Declarations

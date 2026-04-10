@@ -2,7 +2,7 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Mar 13, 2026'>
+  <meta name='date' content='Apr 10, 2026'>
   <meta name='generator' content='tbcx 1.0'>
   <style>
     :root{
@@ -49,6 +49,7 @@
     .deflist dt { font-weight: 600; margin-top: 14px; }
     .deflist dd { margin: 6px 0 10px 0; }
     ul { margin: 10px 0 10px 20px; }
+    ol.param-list { margin: 10px 0 10px 20px; }
     .indent { margin-left: 20px; border-left: 3px solid var(--border); padding-left: 12px; }
     .footer { margin-top: 40px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px; }
     .back-to-top { position: fixed; bottom: 16px; right: 16px; border: 1px solid var(--border); padding: 8px 10px; border-radius: 20px; background: #fff; box-shadow: 0 2px 12px var(--shadow); font-size: 14px;}
@@ -57,7 +58,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Mar 13, 2026</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Apr 10, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -70,6 +71,9 @@
             <li><a href='#file-format-overview'>FILE FORMAT (OVERVIEW)</a></li>
             <li><a href='#lambda-support'>LAMBDA SUPPORT</a></li>
             <li><a href='#semantics-and-performance'>SEMANTICS AND PERFORMANCE</a></li>
+            <li><a href='#precompilation-boundary'>PRECOMPILATION BOUNDARY</a></li>
+            <li><a href='#oo-support'>OO SUPPORT</a></li>
+            <li><a href='#multi-interpreter-and-thread-support'>MULTI-INTERPRETER AND THREAD SUPPORT</a></li>
             <li><a href='#limits'>LIMITS</a></li>
             <li><a href='#diagnostics'>DIAGNOSTICS</a></li>
             <li><a href='#security'>SECURITY</a></li>
@@ -87,14 +91,17 @@
           </ul>
         </nav>
       </section>
-      <h2 id='name'>NAME</h2><p>tbcx - serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs,
-        OO methods, and lambdas)</p><h2 id='synopsis'>SYNOPSIS</h2><pre>
-        <code>
-          tbcx::save in out
-          tbcx::load in
-          tbcx::dump filename
-          tbcx::gc</code>
-      </pre>
+
+      <h2 id='name'>NAME</h2>
+      <p>tbcx &mdash; serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs,
+        OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.</p>
+
+      <h2 id='synopsis'>SYNOPSIS</h2>
+      <pre><code>tbcx::save in out
+tbcx::load in
+tbcx::dump filename
+tbcx::gc</code></pre>
+
       <h2 id='description'>DESCRIPTION</h2>
       <p>
         The <b>tbcx</b> extension provides four commands that enable an efficient
@@ -109,9 +116,10 @@
         Loading installs these into the current interpreter and executes the top-level
         block with <b>TCL_EVAL_GLOBAL</b>.</p>
       <p>
-        In safe interpreters, only <b>tbcx::dump</b> (read-only) is exposed. The
-        <b>tbcx::save</b> and <b>tbcx::load</b> commands perform file I/O and are
-        not available unless explicitly exposed by the caller.</p>
+        In safe interpreters, <b>tbcx_SafeInit</b> provides the package and type
+        infrastructure but does <b>not</b> register any <b>tbcx::*</b> commands.
+        A parent interpreter may selectively grant access with
+        <b>interp alias</b> or <b>interp expose</b>.</p>
 
       <h2 id='commands'>COMMANDS</h2>
 
@@ -120,16 +128,16 @@
       <dl class='deflist'>
         <dt>Parameters</dt>
         <dd>
-          <p><i>in</i> &mdash; One of:</p>
-          <ul>
-            <li><i>String</i> &mdash; a Tcl string value containing the script text.</li>
-            <li><i>Readable channel</i> &mdash; an open channel; the caller controls its encoding settings (the command does not alter them).</li>
-            <li><i>Readable path</i> &mdash; a filesystem path to a script file; it is opened in text mode (default UTF-8), read, and closed by <b>tbcx::save</b>.</li>
-          </ul>
+          <p><i>in</i> &mdash; Resolved in this order:</p>
+          <ol class='param-list'>
+            <li><i>Open channel name</i> &mdash; if the value names an existing open channel, it is read as text (the caller controls encoding; TBCX does not alter it).</li>
+            <li><i>Readable file path</i> &mdash; if the value is a path to a readable file, it is opened in text mode (default UTF-8), read, and closed by <b>tbcx::save</b>.</li>
+            <li><i>Literal script text</i> &mdash; otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file-open error.</li>
+          </ol>
           <p><i>out</i> &mdash; One of:</p>
           <ul>
-            <li><i>Writable channel</i> &mdash; an open channel; binary mode is enforced. The channel is <i>not</i> closed.</li>
-            <li><i>Writable path</i> &mdash; a filesystem path for the new <code>.tbcx</code> file; it is created/truncated and closed on return.</li>
+            <li><i>Writable channel</i> &mdash; an open channel; binary mode (<code>-translation binary -eofchar {}</code>) is enforced. The caller&rsquo;s channel settings are mutated and <i>not</i> restored. The channel is <i>not</i> closed.</li>
+            <li><i>Writable path</i> &mdash; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.</li>
           </ul>
         </dd>
         <dt>Behavior</dt>
@@ -139,10 +147,14 @@
                 <b>namespace eval</b>, <b>oo::class create</b>, <b>oo::define</b>/<b>oo::objdefine</b>,
                 and <b>self method</b> definitions while producing a rewritten script with method bodies replaced by stubs.</li>
             <li>Pre-compiles namespace eval body literals and other script-body patterns
-                (try/on/trap/finally, foreach, while, for, catch, if/elseif/else, dict for/map/update/with).</li>
+                (<b>try</b>/<b>on</b>/<b>trap</b>/<b>finally</b>, <b>foreach</b>, <b>lmap</b>,
+                <b>while</b>, <b>for</b>, <b>catch</b>, <b>if</b>/<b>elseif</b>/<b>else</b>,
+                <b>eval</b>, <b>uplevel</b>, <b>time</b>, <b>timerate</b>,
+                <b>dict for</b>/<b>map</b>/<b>update</b>/<b>with</b>,
+                <b>lsort -command</b>, and <b>self method</b> bodies inside <b>oo::define</b>).</li>
             <li>Performs two-phase instruction-level body detection: Phase 1 analyzes <b>invokeStk</b>
                 operand stack patterns; Phase 2 identifies unpushed literals from inline-compiled
-                <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instructions.</li>
+                <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all Tcl 9.1 instructions.</li>
             <li>Detects bytearray literals (bytes &ge; 0x80) and emits them as <b>TBCX_LIT_BYTEARR</b>
                 to prevent UTF-8 encoding corruption.</li>
             <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
@@ -157,27 +169,27 @@
         <dt>Returns</dt>
         <dd>The output object: either the normalized path written, or the writable channel handle.</dd>
         <dt>Errors</dt>
-        <dd>Typical errors include: unreadable input; unwritable output; version/format mismatch;
+        <dd>Typical errors include: unreadable input; unwritable output;
             unknown/unsupported AuxData; size limit exceeded; runaway serialization
             (too many literals, blocks, excessive recursion depth, or output too large);
             short read/write.</dd>
         <dt>Notes</dt>
         <dd>
           <ul>
-            <li>Input channels retain their encoding settings; output channels are set to binary mode.</li>
+            <li>Input channels retain their encoding settings; output channels are set to binary mode (and not restored).</li>
             <li>The produced artifact targets Tcl 9.1 (format version 91); other versions are rejected at load time.</li>
           </ul>
         </dd>
       </dl>
       <p><b>Examples</b></p>
-      <pre><code># Save from path -> path
+      <pre><code># Save from path &rarr; path
 set path [tbcx::save ./app.tcl ./app.tbcx]
 
-# Save from string value -> path
+# Save from string value &rarr; path
 set script {proc hi {} {puts Hello}; hi}
 tbcx::save $script ./hello.tbcx
 
-# Save from channel -> channel
+# Save from channel &rarr; channel
 set in  [open ./lib/foo.tcl r]
 set out [open ./foo.tbcx w]
 fconfigure $out -translation binary -eofchar {}
@@ -213,7 +225,7 @@ try {
                 recovers the compiled representation if type shimmer evicts it.</li>
             <li>Executes the precompiled top-level block with <b>TCL_EVAL_GLOBAL</b>.
                 A top-level <b>return</b> is handled identically to <b>source</b>.</li>
-            <li>Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter's lifetime.</li>
+            <li>Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter&rsquo;s lifetime.</li>
           </ul>
         </dd>
         <dt>Returns</dt>
@@ -264,7 +276,9 @@ try {
             entries for lambdas that are no longer referenced (except by the registry itself)
             accumulate. This command purges those stale entries immediately.
             Stale entries are also purged lazily on each <b>tbcx::load</b> call, so explicit
-            use of <b>tbcx::gc</b> is typically unnecessary except in long-running interpreters.</dd>
+            use of <b>tbcx::gc</b> is typically unnecessary except in long-running interpreters.
+            <p><b>tbcx::gc</b> is a no-op if no ApplyShim has been installed yet (i.e. before
+            any <b>tbcx::load</b> call), and it is safe to call multiple times.</p></dd>
         <dt>Parameters</dt>
         <dd>None.</dd>
         <dt>Returns</dt>
@@ -282,8 +296,8 @@ try {
         <dt>Sections (order)</dt>
         <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue);
             (2) Procs (FQN, ns, arg spec, compiled block);
-            (3) Classes (advisory catalog; actual creation occurs at load time);
-            (4) Methods (class, kind, name, args, compiled block).</dd>
+            (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top-level script);
+            (4) Methods (class, kind 0&ndash;4, name, args, compiled block).</dd>
         <dt>Literal kinds</dt>
         <dd>boolean, (wide)int/uint, double, bignum, string, bytearray, list,
             dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
@@ -313,12 +327,42 @@ try {
         functionally indistinguishable from <b>source</b> of the original script, with the
         benefit of faster startup due to avoided parsing/compilation.</p>
 
+      <h2 id='precompilation-boundary'>PRECOMPILATION BOUNDARY</h2>
+      <p>
+        TBCX precompiles bodies and lambdas only when they are present in statically
+        identifiable literal positions (script-body arguments to commands like
+        <b>foreach</b>, <b>while</b>, <b>try</b>, <b>eval</b>, etc., or lambda literals
+        for <b>apply</b>). Strings assembled at runtime &mdash; for example with
+        <b>format</b>, string interpolation, or <b>list</b> construction &mdash; still
+        round-trip correctly, but they remain ordinary data and compile at execution time
+        when Tcl evaluates them.</p>
+
+      <h2 id='oo-support'>OO SUPPORT</h2>
+      <p>
+        TBCX preserves normal TclOO class/object construction semantics by executing the
+        rewritten top-level script, while substituting precompiled bodies for recognized
+        <b>oo::define</b> / <b>oo::objdefine</b> method forms. Tested scenarios include
+        class methods, self methods, per-object methods, private methods, inheritance
+        (including diamond), mixins, filters, forwards, abstract/singleton metaclasses,
+        method rename/delete/export changes, metaclasses with <b>self method</b>, and
+        <b>next</b>-based constructor chaining.</p>
+
+      <h2 id='multi-interpreter-and-thread-support'>MULTI-INTERPRETER AND THREAD SUPPORT</h2>
+      <p>
+        Artifacts are designed to load into interpreters other than the originating one.
+        The bundled tests cover child interpreters and threaded scenarios.
+        Interpreter-specific state such as the ApplyShim lambda registry remains
+        per-interpreter.</p>
+
       <h2 id='limits'>LIMITS</h2>
       <p>
         Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
         string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
         total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
         Exceeding any limit produces an error.</p>
+      <p>
+        Nested or reentrant <b>tbcx::load</b> calls are capped at depth 8 per interpreter
+        to prevent runaway recursive loading.</p>
 
       <h2 id='diagnostics'>DIAGNOSTICS</h2>
       <p>
@@ -329,7 +373,9 @@ try {
 
       <h2 id='security'>SECURITY</h2>
       <p>Loading executes code. Only load artifacts you trust.
-         Safe interpreters receive only <b>tbcx::dump</b> (read-only).</p>
+         Safe interpreters receive no <b>tbcx::*</b> commands by default; use
+         <b>interp alias</b> or <b>interp expose</b> from a parent interpreter to
+         grant selective access.</p>
 
       <h2 id='see-also'>SEE ALSO</h2>
       <p>source(n), TclOO(n)</p>

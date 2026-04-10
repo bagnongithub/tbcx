@@ -39,8 +39,7 @@
 #define TBCX_LIT_WIDEINT 7u
 #define TBCX_LIT_WIDEUINT 8u
 #define TBCX_LIT_LAMBDA_BC 9u
-#define TBCX_LIT_BYTECODE 10u
-#define TBCX_LIT_BYTESRC 11u /* bytecode + source text (enables cross-interp recompilation) */
+#define TBCX_LIT_BYTESRC 10u
 
 #define TBCX_AUX_JT_STR 0u
 #define TBCX_AUX_JT_NUM 1u
@@ -52,6 +51,7 @@
 #define TBCX_METH_CTOR 2u
 #define TBCX_METH_DTOR 3u
 #define TBCX_METH_SELF 4u /* self method (class-level, installed via oo::define builder body) */
+#define TBCX_METH_NONE 0xFFu /* sentinel: no method kind identified */
 
 /* Indexed proc marker prefix.  The save side emits stub bodies of the
    form "\x01TBCX<decimal-index>" so that the load-side ProcShim can
@@ -133,19 +133,22 @@ static inline const char* Tbcx_GetStringSafe(Tcl_Obj* objPtr)
 
 static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
 {
-    static unsigned char emptyByte = 0;
+    /* const: sentinel byte must never be written through the returned pointer.
+     * Cast to non-const on return to match Tcl_GetByteArrayFromObj signature;
+     * callers that only need the bytes for reading are safe. */
+    static const unsigned char emptyByte = 0;
     unsigned char* p;
 
     if (lenPtr)
         *lenPtr = 0;
     if (!objPtr)
-        return &emptyByte;
+        return (unsigned char*)&emptyByte;
     p = Tcl_GetByteArrayFromObj(objPtr, lenPtr);
     if (!p)
     {
         if (lenPtr)
             *lenPtr = 0;
-        return &emptyByte;
+        return (unsigned char*)&emptyByte;
     }
     return p;
 }
@@ -269,6 +272,7 @@ static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
 #define TBCX_FIXUP_CACHE_KEEP 0 /* Preserve + fix LocalCache (methods, lambdas) */
 #define TBCX_FIXUP_CACHE_DROP 1 /* NULL out LocalCache (procs — Tcl rebuilds) */
 #define TBCX_FIXUP_CACHE_NONE 2 /* Don't touch LocalCache */
+
 extern const Tcl_ObjType* tbcxTyDict;
 extern const Tcl_ObjType* tbcxTyDouble;
 extern const Tcl_ObjType* tbcxTyInt;
@@ -328,5 +332,15 @@ int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
 void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
 void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip, Namespace* ns, int cacheMode);
 int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label);
+
+/* Checked multiplication for allocation sizes.  Returns 1 on success
+ * (result stored in *out), 0 if the multiplication would overflow size_t. */
+static inline int tbcx_checked_mul(size_t a, size_t b, size_t* out)
+{
+    if (a != 0 && b > SIZE_MAX / a)
+        return 0;
+    *out = a * b;
+    return 1;
+}
 
 #endif

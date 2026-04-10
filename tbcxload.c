@@ -24,16 +24,6 @@
 
 #include "tbcx.h"
 
-/* Checked multiplication for allocation sizes.  Returns 1 on success
- * (result stored in *out), 0 if the multiplication would overflow size_t. */
-static inline int tbcx_checked_mul(size_t a, size_t b, size_t* out)
-{
-    if (a != 0 && b > SIZE_MAX / a)
-        return 0;
-    *out = a * b;
-    return 1;
-}
-
 /* ==========================================================================
  * File-local globals
  * ========================================================================== */
@@ -367,7 +357,7 @@ static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr)
  * literals in its literal pool that currently have procPtr=NULL.
  *
  * The saver's P1/P2 optimizations precompile body literals (namespace eval,
- * while, for, foreach, try, if bodies) as separate TBCX_LIT_BYTECODE objects
+ * while, for, foreach, try, if bodies) as separate TBCX_LIT_BYTESRC objects
  * in the literal pool.  These inner bytecodes are created with procPtr=NULL
  * because their enclosing proc context is not known at literal-read time.
  *
@@ -514,19 +504,23 @@ static int MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj*
     Tcl_DStringAppend(ds, fqn, fqnLen);
     Tcl_DStringAppend(ds, "\x1F", 1);
     {
-        /* Format kind as decimal via Tcl_ObjPrintf (Tcl 9.1 forbids raw snprintf). */
-        Tcl_Obj* kindObj = Tcl_ObjPrintf("%u", (unsigned)kind);
-        Tcl_IncrRefCount(kindObj);
-        Tcl_Size kindLen = 0;
-        const char* kindStr = Tcl_GetStringFromObj(kindObj, &kindLen);
-        if (!kindStr)
+        /* kind is always 0–4 (TBCX_METH_*); format as a single ASCII digit
+         * without a Tcl_Obj round-trip.  Falls back to two digits for values
+         * up to 99, which covers any future extension. */
+        char kindBuf[4];
+        int kindLen;
+        if (kind < 10)
         {
-            Tcl_DecrRefCount(kindObj);
-            Tcl_DStringFree(ds);
-            return 0;
+            kindBuf[0] = '0' + (char)kind;
+            kindLen = 1;
         }
-        Tcl_DStringAppend(ds, kindStr, kindLen);
-        Tcl_DecrRefCount(kindObj);
+        else
+        {
+            kindBuf[0] = '0' + (char)(kind / 10);
+            kindBuf[1] = '0' + (char)(kind % 10);
+            kindLen = 2;
+        }
+        Tcl_DStringAppend(ds, kindBuf, kindLen);
     }
     Tcl_DStringAppend(ds, "\x1F", 1);
     if (name)
@@ -834,7 +828,7 @@ static void OOShim_IdentifyMethod(const char* subc,
                                   Tcl_Obj** tmpEmptyArgsOut,
                                   int* hasKeyOut)
 {
-    *kindOut = 0xFF;
+    *kindOut = TBCX_METH_NONE;
     *bodyIdxOut = -1;
     *runtimeArgsOut = NULL;
     *nameOOut = NULL;
@@ -1006,7 +1000,7 @@ static int CmdOOShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const obj
     Tcl_Obj* runtimeArgs = NULL;  /* args provided by the user at runtime */
     Tcl_Obj* tmpEmptyArgs = NULL; /* temp "" for destructor short form */
     Tcl_Size bodyIdx = -1;        /* index of body word in argv */
-    uint8_t kind = 0xFF;          /* TBCX_METH_* */
+    uint8_t kind = TBCX_METH_NONE;          /* TBCX_METH_* */
 
     /* Identify the OO subcommand and look up a precompiled pair. */
     OOShim_IdentifyMethod(subc, objc, objv, clsFqn, &keyDs, &kind, &bodyIdx, &runtimeArgs, &nameO, &tmpEmptyArgs, &hasKey);
@@ -1281,7 +1275,7 @@ static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* con
         int hasKey = 0;
         Tcl_Obj* nameO = NULL;
         Tcl_Size bodyIdx = -1;
-        uint8_t kind = 0xFF;
+        uint8_t kind = TBCX_METH_NONE;
 
         if ((strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) && objc >= 6)
         {
@@ -2272,29 +2266,9 @@ static Tcl_Obj* ReadLit_Bignum(TbcxIn* r)
             R_Error(r, "tbcx: bignum init");
             return NULL;
         }
-#if defined(MP_HAS_FROM_UBIN)
-        unsigned char* be = (unsigned char*)Tcl_AttemptAlloc(magLen);
-        if (!be)
-        {
-            R_Error(r, "tbcx: allocation failed (bignum)");
-            return NULL;
-        }
-        for (uint32_t i = 0; i < magLen; i++)
-            be[i] = le[magLen - 1 - i];
-        mrc = TclBN_mp_from_ubin(&z, be, magLen);
-        Tcl_Free((char*)be);
-#elif defined(MP_HAS_READ_UNSIGNED_BIN)
-        unsigned char* be = (unsigned char*)Tcl_AttemptAlloc(magLen);
-        if (!be)
-        {
-            R_Error(r, "tbcx: allocation failed (bignum)");
-            return NULL;
-        }
-        for (uint32_t i = 0; i < magLen; i++)
-            be[i] = le[magLen - 1 - i];
-        mrc = TclBN_mp_read_unsigned_bin(&z, be, magLen);
-        Tcl_Free((char*)be);
-#else
+        /* Import LE magnitude bytes into mp_int via repeated shift+add.
+         * Tcl 9.1's stubs table does not expose mp_from_ubin, so we use
+         * the portable TclBN_mp_mul_2d + TclBN_mp_add_d path. */
         for (int i = (int)magLen - 1; i >= 0; i--)
         {
             if ((mrc = TclBN_mp_mul_2d(&z, 8, &z)) != MP_OKAY)
@@ -2302,7 +2276,6 @@ static Tcl_Obj* ReadLit_Bignum(TbcxIn* r)
             if ((mrc = TclBN_mp_add_d(&z, le[i], &z)) != MP_OKAY)
                 break;
         }
-#endif
         if (mrc != MP_OKAY)
         {
             Tcl_Free((char*)le);
@@ -2704,13 +2677,7 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                     R_Error(r, "tbcx: wideuint init");
                     return NULL;
                 }
-#if defined(MP_HAS_READ_UNSIGNED_BIN)
-                unsigned char be[8];
-                for (int i = 0; i < 8; i++)
-                    be[i] = (unsigned char)((u >> (8 * (7 - i))) & 0xFF);
-                mrc = TclBN_mp_read_unsigned_bin(&z, be, 8);
-#else
-                /* Portable fallback: build from 8 bytes with shift/add so we can
+                /* Portable path: build from 8 bytes with shift/add so we can
                    keep checking mp_err on each TomMath call. */
                 for (int i = 7; i >= 0; i--)
                 {
@@ -2721,7 +2688,6 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                     if (mrc != MP_OKAY)
                         break;
                 }
-#endif
                 if (mrc != MP_OKAY)
                 {
                     TclBN_mp_clear(&z);
@@ -2731,60 +2697,6 @@ static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
                 Tcl_Obj* o = Tcl_NewBignumObj(&z);
                 return o;
             }
-        }
-        case TBCX_LIT_BYTECODE:
-        {
-            /* nsFQN string then compiled block */
-            char* nsStr = NULL;
-            uint32_t nsLen = 0;
-            if (!Tbcx_R_LPString(r, &nsStr, &nsLen))
-                return NULL;
-            Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
-            Tcl_IncrRefCount(nsObj);
-            Tcl_Free(nsStr);
-
-            /* Validate namespace: reject embedded NUL, require absolute form */
-            {
-                Tcl_Size nsObjLen = 0;
-                const char* nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
-                if (!nsObjStr ||
-                    Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "bytecode literal namespace", 1) != TCL_OK)
-                {
-                    Tcl_DecrRefCount(nsObj);
-                    return NULL;
-                }
-            }
-
-            Namespace* nsPtr;
-            if (dumpOnly)
-                nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
-            else
-                nsPtr = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
-            if (!nsPtr)
-            {
-                if (dumpOnly)
-                {
-                    /* dump mode: fallback to global is acceptable */
-                    nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
-                }
-                else
-                {
-                    R_Error(r, "tbcx: namespace creation failed for literal bytecode");
-                    Tcl_DecrRefCount(nsObj);
-                    return NULL;
-                }
-            }
-            uint32_t dummyNL = 0;
-            /* Backward compatibility: TBCX_LIT_BYTECODE is no longer emitted
-               by the save side (replaced by TBCX_LIT_BYTESRC which preserves
-               source text).  Kept for loading files created by older versions.
-               setPrecompiled=1: these literals have no source text (string rep
-               is "").  They MUST be marked precompiled so Tcl skips compile-
-               epoch validation — otherwise ProcShim/OOShim epoch bumps would
-               trigger recompilation from the empty string, losing all content. */
-            Tcl_Obj* bc = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL, 1, dumpOnly);
-            Tcl_DecrRefCount(nsObj);
-            return bc;
         }
         case TBCX_LIT_BYTESRC:
         {
@@ -4710,6 +4622,11 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
         uint32_t nSup = 0;
         if (!Tbcx_R_U32(&r, &nSup))
             goto cleanup;
+        if (nSup > 1024u)
+        {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: nSuperclasses %u exceeds limit 1024", nSup));
+            goto cleanup;
+        }
         for (uint32_t s = 0; s < nSup; s++)
         {
             char* su = NULL;
@@ -4748,7 +4665,7 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
         /* Create a minimal Proc and attach to the top-level ByteCode so
            that codePtr->procPtr is never NULL during TEBCresume.
            Also propagate via FixLiteralPoolProcPtr to any precompiled
-           literal-pool bytecodes (TBCX_LIT_BYTECODE). */
+           literal-pool bytecodes (TBCX_LIT_BYTESRC). */
         Proc* topProc = NULL;
         if (top && !top->procPtr)
         {
@@ -4786,6 +4703,8 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
                     if (litBC && litBC->procPtr == topProc)
                     {
                         litBC->procPtr = NULL;
+                        assert(topProc->refCount > 0 &&
+                               "topProc refCount underflow in literal pool fixup");
                         topProc->refCount--;
                     }
                 }
@@ -4794,6 +4713,8 @@ static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch)
                 top->procPtr = NULL;
             Tcl_DecrRefCount(topProc->bodyPtr);
             topProc->bodyPtr = NULL;
+            assert(topProc->refCount > 0 &&
+                   "topProc refCount underflow before free");
             topProc->refCount--;
             Tcl_Free((char*)topProc);
         }

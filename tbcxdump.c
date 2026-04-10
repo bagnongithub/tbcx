@@ -9,7 +9,7 @@
  * ========================================================================== */
 
 static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n);
-static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, int maxChars);
+static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, Tcl_Size maxChars);
 static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title);
 static void DumpAuxArray(AuxData* auxArr, uint32_t numAux, Tcl_Obj* dst);
 static void DumpBCDetails(Tcl_Obj* bcObj, Tcl_Obj* dst);
@@ -53,7 +53,7 @@ static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n)
 
 /* Append a short preview of a literal value for inline annotation.
    Output is capped at maxChars to keep disassembly readable. */
-static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, int maxChars)
+static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, Tcl_Size maxChars)
 {
     if (!lit)
     {
@@ -94,13 +94,13 @@ static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, int maxChars)
     else
     {
         Tcl_AppendToObj(dst, "\"", 1);
-        AppendEscaped(dst, s, (Tcl_Size)maxChars);
+        AppendEscaped(dst, s, maxChars);
         Tcl_AppendToObj(dst, "...\"", -1);
     }
 }
 
 /* Helper: look up local variable name from ByteCode, returns "" for unnamed. */
-static const char* LocalName(ByteCode* bc, int idx, Tcl_Size* outLen)
+static const char* LocalName(ByteCode* bc, Tcl_Size idx, Tcl_Size* outLen)
 {
     static const char empty[] = "";
     if (outLen)
@@ -184,7 +184,7 @@ static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title)
         /* Decode operands — offset past the 1-byte opcode */
         const unsigned char* op = code + pc + 1;
         int opOff = 0;         /* byte offset into operand area */
-        int lvtIdx = -1;       /* LVT index for variable annotation */
+        Tcl_Size lvtIdx = -1;  /* LVT index for variable annotation */
         int jumpTarget = -1;   /* computed jump target for offset annotation */
         int firstUintVal = -1; /* first UINT operand value (for push detection) */
 
@@ -238,7 +238,7 @@ static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title)
                 {
                     unsigned val = op[opOff];
                     Tcl_AppendPrintfToObj(dst, " %%v%u", val);
-                    lvtIdx = (int)val;
+                    lvtIdx = (Tcl_Size)val;
                     opOff += 1;
                     break;
                 }
@@ -247,7 +247,7 @@ static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title)
                     uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
                                    ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
                     Tcl_AppendPrintfToObj(dst, " %%v%u", val);
-                    lvtIdx = (int)val;
+                    lvtIdx = (Tcl_Size)val;
                     opOff += 4;
                     break;
                 }
@@ -327,6 +327,11 @@ static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title)
 
 static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
 {
+    if (!lit)
+    {
+        Tcl_AppendToObj(dst, "(null)", -1);
+        return TCL_OK;
+    }
     const Tcl_ObjType* ty = lit->typePtr;
     /* In Tcl 9.1 the integer types were unified: tbcxTyBignum == tbcxTyInt.
        Probe with WideInt first to label small integers correctly. */
@@ -766,6 +771,11 @@ static int DumpClassesSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
             Tcl_DecrRefCount(clsObj);
             return TCL_ERROR;
         }
+        if (nSup > 1024u)
+        {
+            Tcl_DecrRefCount(clsObj);
+            return TCL_ERROR;
+        }
         for (uint32_t s = 0; s < nSup; s++)
         {
             char* su = NULL;
@@ -835,6 +845,7 @@ static int DumpMethodsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
                             : (kind == TBCX_METH_CLASS) ? "::classmethod "
                             : (kind == TBCX_METH_CTOR)  ? "::constructor "
                             : (kind == TBCX_METH_DTOR)  ? "::destructor "
+                            : (kind == TBCX_METH_SELF)  ? "::self method "
                                                         : "::(unknown) ";
         Tcl_AppendPrintfToObj(out, " %s", kname);
         Tcl_AppendObjToObj(out, nameObj);

@@ -1,6 +1,6 @@
 .TH tbcx 3 "Mar 13, 2026" "tbcx 1.0" "Tcl Bytecode eXchange"
 .SH NAME
-tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas)
+tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.
 .SH SYNOPSIS
 .nf
 \fBtbcx::save\fR \fIin out\fR
@@ -19,9 +19,10 @@ Artifacts store the compiled top\-level, precompiled \fBproc\fR bodies, TclOO me
 bodies, and \fBlambda\fR literals for use with \fBapply\fR. Loading installs these into the current
 interpreter and executes the top\-level block with \fBTCL_EVAL_GLOBAL\fR.
 .PP
-In safe interpreters, only \fBtbcx::dump\fR (read-only) is exposed. The
-\fBtbcx::save\fR and \fBtbcx::load\fR commands perform file I/O and are not
-available unless explicitly exposed by the caller.
+In safe interpreters, \fBtbcx_SafeInit\fR provides the package and type
+infrastructure but does \fBnot\fR register any \fBtbcx::*\fR commands.
+A parent interpreter may selectively grant access with
+\fBinterp alias\fR or \fBinterp expose\fR.
 
 .SH COMMANDS
 .SS "tbcx::save in out"
@@ -32,23 +33,23 @@ Compile a script and write a \fB.tbcx\fR artifact.
 .B Parameters
 .TP
 .I in
-One of:
+Resolved in this order:
 .RS
-.IP \(bu 2
-\fIString\fR \- a Tcl string value containing the script text.
-.IP \(bu 2
-\fIReadable channel\fR \- an open channel; the caller controls its encoding settings (the command does not alter them).
-.IP \(bu 2
-\fIReadable path\fR \- a filesystem path to a script file; it is opened in text mode (default UTF\-8), read, and closed by \fBtbcx::save\fR.
+.IP "1." 3
+\fIOpen channel name\fR \- if the value names an existing open channel, it is read as text (the caller controls encoding; TBCX does not alter it).
+.IP "2." 3
+\fIReadable file path\fR \- if the value is a path to a readable file, it is opened in text mode (default UTF\-8), read, and closed by \fBtbcx::save\fR.
+.IP "3." 3
+\fILiteral script text\fR \- otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file\-open error.
 .RE
 .TP
 .I out
 One of:
 .RS
 .IP \(bu 2
-\fIWritable channel\fR \- an open channel; the command enforces binary mode and does \fInot\fR close the channel.
+\fIWritable channel\fR \- an open channel; binary mode (\fC\-translation binary \-eofchar {}\fR) is enforced. The caller's channel settings are mutated and \fInot\fR restored. The channel is \fInot\fR closed.
 .IP \(bu 2
-\fIWritable path\fR \- a filesystem path for the new \fB.tbcx\fR file; it is created/truncated and closed on return.
+\fIWritable path\fR \- a filesystem path; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.
 .RE
 .PP
 .B Behavior
@@ -58,7 +59,7 @@ Performs a single\-pass capture and rewrite of the script, extracting \fBproc\fR
 \fBoo::class create\fR, \fBoo::define\fR/\fBoo::objdefine\fR, and \fBself method\fR definitions while
 producing a rewritten script with method bodies replaced by stubs.
 .IP \(bu 2
-Pre\-compiles namespace eval body literals and other script\-body patterns (try/on/trap/finally, foreach, while, for, catch, if/elseif/else, dict for/map/update/with).
+Pre\-compiles namespace eval body literals and other script\-body patterns (\fBtry\fR/\fBon\fR/\fBtrap\fR/\fBfinally\fR, \fBforeach\fR, \fBlmap\fR, \fBwhile\fR, \fBfor\fR, \fBcatch\fR, \fBif\fR/\fBelseif\fR/\fBelse\fR, \fBeval\fR, \fBuplevel\fR, \fBtime\fR, \fBtimerate\fR, \fBdict for\fR/\fBmap\fR/\fBupdate\fR/\fBwith\fR, \fBlsort \-command\fR, and \fBself method\fR bodies inside \fBoo::define\fR).
 .IP \(bu 2
 Performs two\-phase instruction\-level body detection: Phase 1 analyzes \fBinvokeStk\fR operand stack patterns to find body arguments; Phase 2 identifies unpushed literals from inline\-compiled \fBforeach\fR/\fBlmap\fR loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instruction types.
 .IP \(bu 2
@@ -80,7 +81,7 @@ The output object: either the normalized path written, or the writable channel h
 .PP
 .B Errors
 .RS
-Typical errors include: unreadable input; unwritable output; version/format mismatch; unknown/unsupported AuxData;
+Typical errors include: unreadable input; unwritable output; unknown/unsupported AuxData;
 size limit exceeded (code, literals, AuxData, exception ranges, strings); runaway serialization
 (too many literals, blocks, excessive recursion depth, or output too large); short read/write.
 The interpreter result contains a descriptive message.
@@ -243,6 +244,9 @@ accumulate. This command purges those stale entries immediately.
 Stale entries are also purged lazily on each \fBtbcx::load\fR call, so explicit
 use of \fBtbcx::gc\fR is typically unnecessary except in long\-running interpreters
 that load many \fB.tbcx\fR files and want to reclaim memory sooner.
+.PP
+\fBtbcx::gc\fR is a no\-op if no ApplyShim has been installed yet (i.e. before
+any \fBtbcx::load\fR call), and it is safe to call multiple times.
 .RE
 .PP
 .B Parameters
@@ -267,7 +271,7 @@ Magic (0x58434254) + format version (91) + producing Tcl version; size/count met
 .B Sections (order)
 (1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue);
 (2) Procs (FQN, ns, arg spec, compiled block);
-(3) Classes (advisory catalog; actual creation occurs at load time);
+(3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top\-level script);
 (4) Methods (class, kind, name, args, compiled block).
 .TP
 .B Literal kinds
@@ -298,12 +302,42 @@ precompiled proc/method bodies and rehydrates lambda literals. The intent is to 
 functionally indistinguishable from \fBsource\fR of the original script, with the benefit
 of faster startup due to avoided parsing/compilation.
 
+.SH PRECOMPILATION BOUNDARY
+.PP
+TBCX precompiles bodies and lambdas only when they are present in
+statically identifiable literal positions (script\-body arguments to
+commands like \fBforeach\fR, \fBwhile\fR, \fBtry\fR, \fBeval\fR, etc., or
+lambda literals for \fBapply\fR). Strings assembled at runtime \(em for
+example with \fBformat\fR, string interpolation, or \fBlist\fR construction
+\(em still round\-trip correctly, but they remain ordinary data and compile
+at execution time when Tcl evaluates them.
+
+.SH OO SUPPORT
+.PP
+TBCX preserves normal TclOO class/object construction semantics by
+executing the rewritten top\-level script, while substituting precompiled
+bodies for recognized \fBoo::define\fR / \fBoo::objdefine\fR method forms.
+Tested scenarios include class methods, self methods, per\-object methods,
+private methods, inheritance (including diamond), mixins, filters, forwards,
+abstract/singleton metaclasses, method rename/delete/export changes,
+metaclasses with \fBself method\fR, and \fBnext\fR\-based constructor chaining.
+
+.SH MULTI\-INTERPRETER AND THREAD SUPPORT
+.PP
+Artifacts are designed to load into interpreters other than the
+originating one. The bundled tests cover child interpreters and threaded
+scenarios. Interpreter\-specific state such as the ApplyShim lambda
+registry remains per\-interpreter.
+
 .SH LIMITS
 .PP
 Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
 string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
 total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
 Exceeding any limit produces an error.
+.PP
+Nested or reentrant \fBtbcx::load\fR calls are capped at depth 8 per
+interpreter to prevent runaway recursive loading.
 
 .SH DIAGNOSTICS
 .PP
@@ -314,7 +348,9 @@ Representative messages include: "bad header", "incompatible Tcl version", "shor
 .SH SECURITY
 .PP
 Loading executes code. Only load artifacts you trust.
-Safe interpreters receive only \fBtbcx::dump\fR (read-only).
+Safe interpreters receive no \fBtbcx::*\fR commands by default; use
+\fBinterp alias\fR or \fBinterp expose\fR from a parent interpreter to
+grant selective access.
 
 .SH SEE ALSO
 source(n), TclOO(n)

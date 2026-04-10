@@ -1,10 +1,10 @@
-# TBCX — Precompiled Tcl 9.1+ Bytecode (save / load / dump)
+# TBCX — Precompiled Tcl 9.1 Bytecode (save / load / dump)
 
-TBCX is a C extension for Tcl 9.1+ that **serializes** compiled Tcl bytecode (plus enough metadata to reconstruct `proc`s, TclOO methods, and **lambda constructs**) into a compact `.tbcx` file — and later **loads** that file into another interpreter for fast startup without re‑parsing or re‑compiling the original source. There's also a **disassembler** for human‑readable inspection.
+TBCX is a C extension for the **Tcl 9.1 family** that **serializes** compiled Tcl bytecode (plus enough metadata to reconstruct `proc`s, TclOO methods, and **lambda constructs**) into a compact `.tbcx` file — and later **loads** that file into another interpreter for fast startup without re‑parsing or re‑compiling the original source. There's also a **disassembler** for human‑readable inspection.
 
-> Status: draft implementation; interfaces are still evolving. We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout.
+> Status: draft implementation; interfaces are still evolving. We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout. Artifacts require an exact Tcl major/minor match at load time; 9.2+ artifacts are not accepted by a 9.1 loader and vice versa.
 
-For versions prior to Tcl 9.1+, please check
+For versions prior to Tcl 9.1, please check
 
 -  [tclcompiler](https://github.com/tcltk-depot/tclcompiler)
 -  [tbcload](https://github.com/tcltk-depot/tbcload)
@@ -38,7 +38,7 @@ puts [tbcx::dump ./hello.tbcx]
 - **Save**: Compile a script and write a `.tbcx` artifact containing:
   - Top-level bytecode (with literals, AuxData, exception ranges, local names)
   - All discovered `proc`s, each as precompiled bytecode
-  - TclOO classes (including superclass lists) and methods/constructors/destructors as precompiled bytecode
+  - TclOO classes (advisory catalog of discovered class names for dump/introspection) and methods/constructors/destructors as precompiled bytecode. Class creation and superclass structure are reconstructed by executing the rewritten top-level script during `tbcx::load`, not from a standalone serialized class graph.
   - **Self methods** (`self method` inside `oo::define`) serialized with kind `TBCX_METH_SELF`; loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses
   - Lambda literals (`apply {args body ?ns?}` forms) compiled and serialized as lambda‑bytecode literals
   - Bodies found in `namespace eval $ns { ... }` and other script-body contexts (compiled and bound to the correct namespace)
@@ -47,9 +47,9 @@ puts [tbcx::dump ./hello.tbcx]
   - **O(1) opcode dispatch**: instruction scanner uses a 256-entry `opMap[]` lookup table covering all 120 Tcl 9.1 instruction types, replacing per-instruction string comparisons
   - **Bytearray detection**: strings with bytes ≥ 0x80 are probed and emitted as `TBCX_LIT_BYTEARR` to avoid UTF-8 encoding corruption on round-trip
   - **Cross-interpreter support**: body literals are emitted as `TBCX_LIT_BYTESRC` (bytecode + preserved source text); loaded with `setPrecompiled=0` so Tcl can gracefully recompile from source in child interpreters or after epoch bumps
-- **Load**: Read a `.tbcx`, create procs, classes and methods, patch bytecode with the current interpreter/namespace, and execute the top level.
+- **Load**: Read a `.tbcx`, reconstruct precompiled procs, method bodies, and literal lambdas, then execute the top-level block with `TCL_EVAL_GLOBAL`. Class creation, namespace setup, and other top-level effects happen naturally when the rewritten script runs — with source-equivalent semantics.
 - **Dump**: Pretty-print / disassemble `.tbcx` contents (header, literals, AuxData summaries, exception ranges, full instruction streams).
-- **Safe interp support**: `tbcx_SafeInit` exposes only `tbcx::dump` (read‑only) in safe interpreters.
+- **Safe interp support**: In safe interpreters, `tbcx_SafeInit` provides the package and type infrastructure but does **not** register any `tbcx::*` commands. A parent interpreter may selectively grant access with `interp alias` or `interp expose`.
 - **Tcl 9.1 aware**: Uses Tcl 9.1 internal bytecode structures, literal encodings, and AuxData types; exposes them via a stable binary format header (`TBCX_FORMAT = 91`).
 
 ---
@@ -59,13 +59,13 @@ puts [tbcx::dump ./hello.tbcx]
 ### `tbcx::save in out`
 Compile and serialize to `.tbcx`.
 
-- **`in`** may be:
-  - a **Tcl value** containing the script text (no file I/O needed),
-  - an **open readable channel** (encoding is left as-is — the caller controls it),
-  - a **path** to a readable file (opened in text mode with default UTF-8 encoding, read, closed by TBCX).
+- **`in`** is resolved in this order:
+  1. **open channel name** — if the value names an existing open channel, it is read as text (encoding is left as-is — the caller controls it);
+  2. **readable file path** — if the value is a path to a readable file, it is opened in text mode (default UTF-8 encoding), read, and closed by TBCX;
+  3. **literal script text** — otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file-open error.
 - **`out`** may be:
-  - an **open writable channel** (binary mode is enforced; channel is *not* closed),
-  - a **path** to write a new `.tbcx` file (created/truncated; channel is closed on return).
+  - an **open writable channel** — binary mode (`-translation binary -eofchar {}`) is enforced; the channel is *not* closed. Note: the caller's channel settings are mutated and not restored.
+  - a **path** — TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.
 - **Result**: returns the output channel handle or normalized output path.
 
 What gets saved:
@@ -110,12 +110,12 @@ Explicitly purge stale entries from the per‑interpreter lambda shimmer‑recov
   - A **header** (magic, format version, Tcl version, code length, exception/literal/AuxData/local counts, max stack depth).
   - The **top-level compiled block** (code bytes, literals, AuxData, exception ranges, locals epilogue). Captured proc bodies are stripped during this phase. Body literals are emitted as `TBCX_LIT_BYTESRC` (source text + compiled bytecode).
   - A table of **procs**: name FQN, namespace, argument spec, then the separately compiled body block.
-  - **Classes** (FQN + superclass count), then **methods** (class FQN, kind 0–4, name, argument spec, compiled body block). Self methods use kind 4 (`TBCX_METH_SELF`).
+  - **Classes** *(advisory)* — discovered class names for dump/introspection (currently `nSupers = 0`; actual class structure is reconstructed by the top-level script at load time), then **methods** (class FQN, kind 0–4, name, argument spec, compiled body block). Self methods use kind 4 (`TBCX_METH_SELF`).
   - A final flush of any buffered output.
 
 **Runaway protection**: The serializer tracks total literal calls, block calls, recursion depth, and output bytes. If any limit is exceeded (2M literals, 256K blocks, depth 64, or 256 MB output), serialization aborts with a diagnostic error.
 
-Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, bytesrc** (bytecode + source text for cross-interp recompilation). Legacy **bytecode** (tag 10, no source text) is accepted on load but no longer emitted.
+Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, bytesrc** (bytecode + source text for cross-interp recompilation).
 
 Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachInfo**.
 
@@ -125,7 +125,7 @@ Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachIn
 
 `tbcx::load` reads the header, validates magic/format/Tcl‑version compatibility, then deserializes sections:
 
-1. **Top-level block**: Deserialized and marked `TCL_BYTECODE_PRECOMPILED` so Tcl skips compile-epoch checks and executes the bytecode directly. `TBCX_LIT_BYTESRC` literals within the block are loaded with `setPrecompiled=0` and their source text restored as string rep, allowing Tcl to recompile from source when needed (e.g. cross-interpreter evaluation or epoch mismatch). Legacy `TBCX_LIT_BYTECODE` literals (no source text) are loaded with `setPrecompiled=1` for backward compatibility.
+1. **Top-level block**: Deserialized and marked `TCL_BYTECODE_PRECOMPILED` so Tcl skips compile-epoch checks and executes the bytecode directly. `TBCX_LIT_BYTESRC` literals within the block are loaded with `setPrecompiled=0` and their source text restored as string rep, allowing Tcl to recompile from source when needed (e.g. cross-interpreter evaluation or epoch mismatch).
 2. **Procs**: A temporary **ProcShim** intercepts the `proc` command (both `objProc2` and `nreProc2` dispatch paths). When the top-level block evaluates a `proc` call matching a saved definition (by FQN + argument signature, or by indexed marker for conflicting definitions), the shim substitutes the precompiled body. Unmatched `proc` calls pass through to Tcl's original handler.
 3. **Classes and methods**: An **OOShim** temporarily renames `oo::define` (and `oo::objdefine` when available) to intercept method/constructor/destructor installations. Matching definitions receive precompiled bodies; constructors and destructors use a create-then-swap pattern (placeholder body `";"` → TclOO builds dispatch → bytecode swap) to preserve `next` routing through the constructor chain. **Self methods** (kind 4) are installed via `oo::define CLASS { self method NAME ARGS BODY }` — this uses the renamed original `oo::define` command, which properly sets up the metaclass inheritance chain so subclass class-objects inherit the method.
 4. **Lambda recovery**: An **ApplyShim** is installed as persistent per-interpreter `AssocData`. When a precompiled lambda's `lambdaExpr` internal rep gets evicted by shimmer, the shim detects the missing rep on the next `[apply]` call and re-installs the precompiled `Proc*` from its registry before forwarding to Tcl's real `[apply]`.
@@ -155,8 +155,8 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 **Sections (in order):**
 1. **Top‑level block** — code bytes, literal array, AuxData array, exception ranges, epilogue (maxStack, reserved, numLocals, local names).
 2. **Procs** — u32 count, then repeated tuples: name FQN (LPString), namespace (LPString), argument spec (LPString), compiled block.
-3. **Classes** *(advisory)* — u32 count, then class FQN + superclass list; creation occurs by evaluating the rewritten script at load time.
-4. **Methods** — u32 count, then repeated tuples: class FQN, kind (u8: 0=inst, 1=class, 2=ctor, 3=dtor), name, argument spec, compiled block.
+3. **Classes** *(advisory)* — u32 count, then class FQN; currently records discovered class names for dump/introspection only. Class creation and superclass structure are reconstructed by the rewritten top-level script at load time.
+4. **Methods** — u32 count, then repeated tuples: class FQN, kind (u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self), name, argument spec, compiled block.
 
 **Literal tags** (u32):
 | Tag | Kind | Payload |
@@ -171,8 +171,7 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | 7 | WIDEINT | signed 64-bit as u64 |
 | 8 | WIDEUINT | unsigned 64-bit as u64 |
 | 9 | LAMBDA_BC | ns FQN, args, compiled block, body source text |
-| 10 | BYTECODE | ns FQN + compiled block (legacy — no longer emitted, kept for backward-compatible loading) |
-| 11 | BYTESRC | source text (LPString) + ns FQN + compiled block (current default; enables cross-interp recompilation) |
+| 11 | BYTESRC | source text (LPString) + ns FQN + compiled block (enables cross-interp recompilation) |
 
 **AuxData tags** (u32):
 | Tag | Kind | Payload |
@@ -206,10 +205,10 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 
 ## Build
 
-This package uses **Tcl 9.1+** APIs and selected internals (e.g., `tclInt.h`, `tclCompile.h`).
+This package uses **Tcl 9.1** APIs and selected internals (e.g., `tclInt.h`, `tclCompile.h`).
 You'll need Tcl 9.1 headers/libs on your include path and to build as a standard loadable extension.
 The entry point `tbcx_Init` registers commands and provides `tbcx 1.0`.
-The safe entry point `tbcx_SafeInit` registers only `tbcx::dump`.
+The safe entry point `tbcx_SafeInit` provides the package and type infrastructure but registers **no commands**; use `interp alias` or `interp expose` from a parent interpreter to grant selective access.
 
 Example (TEA Linux/macOS):
 
@@ -228,6 +227,11 @@ make test
 - **AuxData coverage**: The saver asserts that all AuxData items in a block are of known kinds (jump tables, dict-update, NewForeachInfo). Unknown kinds cause the save to abort.
 - **OO coverage**: Supports `oo::class create`, `oo::define` (method/classmethod/constructor/destructor/self method plus declarative keywords like variable/superclass/mixin/filter/forward), and `oo::objdefine`. Builder-form class bodies are expanded into multi-word stubs for correct load-time reconstruction. Self methods (`self method` inside `oo::define`) are serialized with kind 4 (`TBCX_METH_SELF`) and loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses.
 - **Lambda shimmer recovery**: Precompiled lambdas are registered in a persistent per-interpreter ApplyShim. If the `lambdaExpr` internal rep is evicted by shimmer, the shim transparently re-installs it on the next `[apply]` call.
+- **Precompilation boundary**: TBCX precompiles bodies and lambdas only when they are present in statically identifiable literal positions. Strings assembled at runtime (e.g. with `format`, interpolation, or `list` construction) still round-trip correctly, but they remain ordinary data and compile at execution time when Tcl evaluates them.
+- **OO coverage**: TBCX preserves normal TclOO class/object construction semantics by executing the rewritten top-level script, while substituting precompiled bodies for recognized `oo::define` / `oo::objdefine` method forms. Tested scenarios include class methods, self methods, per-object methods, private methods, inheritance (including diamond), mixins, filters, forwards, abstract/singleton metaclasses, method rename/delete/export changes, metaclasses with `self method`, and `next`-based constructor chaining. Declarative TclOO builder commands (`variable`, `superclass`, `mixin`, `filter`, `forward`) are preserved in the rewritten top-level.
+- **Multi-interpreter and threads**: Artifacts are designed to load into interpreters other than the originating one. The bundled tests cover child interpreters and threaded scenarios. Interpreter-specific state such as the ApplyShim lambda registry remains per-interpreter.
+- **`tbcx::gc`**: Safe to call before any load (no-op) and safe to call repeatedly. Does not interfere with subsequent save/load operations.
+- **Load reentrancy**: Nested or reentrant `tbcx::load` calls are capped at depth 8 per interpreter.
 - **Conflicting proc definitions**: When multiple branches define a proc with the same name (e.g. `if {$cond} {proc p ...} else {proc p ...}`), the saver emits indexed markers so the loader matches by position rather than by FQN alone.
 - **Endianness**: Host endianness is detected at runtime; streams are always little-endian on disk.
 
