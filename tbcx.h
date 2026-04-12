@@ -29,6 +29,22 @@
 #define TBCX_MAGIC 0x58434254u
 #define TBCX_FORMAT 91u
 
+/* Thread-ownership assertion.  Verifies that the current thread is the
+ * one that created the interpreter, which is the only thread permitted
+ * to use it under Tcl's threading model.  Active only in debug builds
+ * (NDEBUG not defined).  Fires assert() on violation — there is no
+ * graceful fallback because cross-thread interpreter use is undefined
+ * behavior in Tcl. */
+#ifdef NDEBUG
+#define TBCX_ASSERT_INTERP_THREAD(ip) ((void)0)
+#else
+#define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                                                                                                  \
+    do {                                                                                                                                                                                               \
+        Interp *_tbcx_iPtr = (Interp *)(ip);                                                                                                                                                           \
+        assert(_tbcx_iPtr->threadId == Tcl_GetCurrentThread() && "TBCX: must be called from the interp-owning thread");                                                                                \
+    } while (0)
+#endif
+
 #define TBCX_LIT_BIGNUM 0u
 #define TBCX_LIT_BOOLEAN 1u
 #define TBCX_LIT_BYTEARR 2u
@@ -308,6 +324,7 @@ int               Tbcx_W_Flush(TbcxOut *w);
 Tcl_Obj          *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly);
 int               Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
 void              TbcxApplyShimPurgeAll(Tcl_Interp *ip);
+void              TbcxSaveInitOpcodes(void);
 void              TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode);
 int               TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label);
 

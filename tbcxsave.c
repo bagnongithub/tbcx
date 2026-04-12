@@ -1240,8 +1240,8 @@ static void Lit_LambdaBC(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *lambda) {
     memset(procPtr, 0, sizeof(Proc));
     procPtr->iPtr              = (Interp *)ctx->interp;
     procPtr->refCount          = 1;
-    procPtr->numArgs           = (int)argc;
-    procPtr->numCompiledLocals = (int)argc;
+    procPtr->numArgs           = argc;
+    procPtr->numCompiledLocals = argc;
     {
         CompiledLocal *first = NULL, *last = NULL;
         Tcl_Size       numA = 0;
@@ -2320,8 +2320,9 @@ enum {
     OP_ARITH,           /* arithmetic, comparison, string ops, list ops, dict ops, scalar/array variable ops: clobber TOS */
 };
 
-/* Cached opcode→handler map.  Built once on first InstrScanBodyLiterals call.
- * Thread note: tbcx::save runs only on the interp-owning thread;
+/* Cached opcode→handler map.  Built once during TbcxInitTypes() under
+ * the tbcxTypeMutex, before tbcxTypesLoaded is published.  Immutable
+ * after init — safe to read from any thread without synchronization.
  * TclGetInstructionTable() is constant for a given Tcl build. */
 static unsigned char tbcxOpMap[256];
 static int           tbcxOpMapReady    = 0;
@@ -2330,7 +2331,228 @@ static unsigned char tbcxOpNop         = 0; /* opcode for nop */
 static unsigned char tbcxOpJump1       = 0; /* opcode for jump1 (2-byte short jump) */
 static unsigned char tbcxStartCmdBytes = 0; /* numBytes for startCommand */
 
-static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
+/* TbcxSaveInitOpcodes — one-time opcode map initialization.
+ * Called from TbcxInitTypes() inside the type-init mutex, before the
+ * tbcxTypesLoaded flag is published.  Must NOT be called concurrently. */
+void                 TbcxSaveInitOpcodes(void) {
+    if (tbcxOpMapReady)
+        return;
+
+    const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
+
+    memset(tbcxOpMap, OP_UNKNOWN, sizeof(tbcxOpMap));
+    for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
+        const char *nm = instTable[i].name;
+        if (!nm)
+            continue;
+
+        switch (nm[0]) {
+        case 'p':
+            if (InstrIs(nm, "push")) {
+                tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP : nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH : OP_PUSH1_NOPOP);
+            } else if (InstrIs(nm, "pop"))
+                tbcxOpMap[i] = OP_POP;
+            break;
+        case 'i':
+            if (InstrIs(nm, "invokeStk"))
+                tbcxOpMap[i] = OP_INVOKE_STK;
+            else if (InstrIs(nm, "invokeExpanded") || InstrIs(nm, "invokeReplace"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "incrStkImm"))
+                tbcxOpMap[i] = OP_INCR_STK_IMM;
+            else if (InstrIs(nm, "incrStk"))
+                tbcxOpMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "isEmpty") || InstrIs(nm, "infoLevelNumber"))
+                tbcxOpMap[i] = (nm[1] == 'n' ? OP_PUSH1_NOPOP : OP_ARITH);
+            break;
+        case 'l':
+            if (InstrIs(nm, "loadStk"))
+                tbcxOpMap[i] = OP_LOAD_STK;
+            else if (InstrIs(nm, "loadArrayStk"))
+                tbcxOpMap[i] = OP_LOAD_ARR_STK;
+            else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "lappendListStk"))
+                tbcxOpMap[i] = OP_LAPPEND_LST_STK;
+            else if (InstrIs(nm, "lappendStk"))
+                tbcxOpMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "lappendList"))
+                tbcxOpMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "list"))
+                tbcxOpMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "lindexMulti") || InstrIs(nm, "listLength") || InstrIs(nm, "listIndexImm") || InstrIs(nm, "listRangeImm") || InstrIs(nm, "lreplace") || InstrIs(nm, "lsetFlat") ||
+                     InstrIs(nm, "land") || InstrIs(nm, "lor") || InstrIs(nm, "lnot") || InstrIs(nm, "lt") || InstrIs(nm, "le") || InstrIs(nm, "lshift"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "lmap_collect"))
+                tbcxOpMap[i] = OP_POP;
+            break;
+        case 's':
+            if (InstrIs(nm, "storeStk"))
+                tbcxOpMap[i] = OP_STORE_STK;
+            else if (InstrIs(nm, "storeArrayStk"))
+                tbcxOpMap[i] = OP_STORE_ARR_STK;
+            else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
+                tbcxOpMap[i] = OP_STORE_LVT;
+            else if (InstrIs(nm, "startCommand"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "strcat"))
+                tbcxOpMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "swap"))
+                tbcxOpMap[i] = OP_SWAP;
+            else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") || InstrIs(nm, "strfind") ||
+                     InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") || InstrIs(nm, "strcaseUpper") ||
+                     InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'a':
+            if (InstrIs(nm, "appendStk"))
+                tbcxOpMap[i] = OP_INCR_STK;
+            else if (InstrIs(nm, "arithSeries"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "add") || InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'b':
+            if (InstrIs(nm, "beginCatch"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "bitand") || InstrIs(nm, "bitor") || InstrIs(nm, "bitxor") || InstrIs(nm, "bitnot"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'c':
+            if (InstrIs(nm, "concat"))
+                tbcxOpMap[i] = OP_STRCAT_N;
+            else if (InstrIs(nm, "clockRead"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "constImm"))
+                tbcxOpMap[i] = OP_POP;
+            else if (InstrIs(nm, "constStk"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "currentNamespace"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'd':
+            if (InstrIs(nm, "done"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "dup"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "div") || InstrIs(nm, "dictGet") || InstrIs(nm, "dictPut") || InstrIs(nm, "dictSet") || InstrIs(nm, "dictExists") || InstrIs(nm, "dictRemove") ||
+                     InstrIs(nm, "dictGetDef"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "dictFirst") || InstrIs(nm, "dictNext"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "dictUpdateStart") || InstrIs(nm, "dictUpdateEnd"))
+                tbcxOpMap[i] = OP_NOP;
+            break;
+        case 'e':
+            if (InstrIs(nm, "endCatch"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "expandStkTop"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "expandStart"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "existStk"))
+                tbcxOpMap[i] = OP_INCR_STK_IMM;
+            else if (InstrIs(nm, "existScalar") || InstrIs(nm, "existArray") || InstrIs(nm, "eq") || InstrIs(nm, "expon") || InstrIs(nm, "exprStk") || InstrIs(nm, "errorPrefixEq"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'f':
+            if (InstrIs(nm, "foreach_start") || InstrIs(nm, "foreach_step") || InstrIs(nm, "foreach_end"))
+                tbcxOpMap[i] = OP_NOP;
+            break;
+        case 'g':
+            if (InstrIs(nm, "gt") || InstrIs(nm, "ge"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'j':
+            if (InstrIs(nm, "jump"))
+                tbcxOpMap[i] = OP_RESET;
+            break;
+        case 'm':
+            if (InstrIs(nm, "mult") || InstrIs(nm, "mod"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'n':
+            if (InstrIs(nm, "nop"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "not") || InstrIs(nm, "neq") || InstrIs(nm, "numericType"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "nsupvar"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'o':
+            if (InstrIs(nm, "over"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'r':
+            if (InstrIs(nm, "returnStk"))
+                tbcxOpMap[i] = OP_RETURN_STK;
+            else if (InstrIs(nm, "return"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "reverse"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "rshift") || InstrIs(nm, "regexp"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 't':
+            if (InstrIs(nm, "tailcall"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "tclooClass"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "tclooId"))
+                tbcxOpMap[i] = OP_ARITH;
+            else if (InstrIs(nm, "tclooNext"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "tclooSelf"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "tryCvtToNumeric"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'u':
+            if (InstrIs(nm, "unsetStk"))
+                tbcxOpMap[i] = OP_UNSET_STK;
+            else if (InstrIs(nm, "unsetScalar"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "uplevel"))
+                tbcxOpMap[i] = OP_RESET;
+            else if (InstrIs(nm, "upvar"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            else if (InstrIs(nm, "uminus") || InstrIs(nm, "uplus"))
+                tbcxOpMap[i] = OP_ARITH;
+            break;
+        case 'v':
+            if (InstrIs(nm, "verifyDict"))
+                tbcxOpMap[i] = OP_NOP;
+            else if (InstrIs(nm, "variable"))
+                tbcxOpMap[i] = OP_PUSH1_NOPOP;
+            break;
+        case 'y':
+            if (InstrIs(nm, "yield"))
+                tbcxOpMap[i] = OP_RESET;
+            break;
+        }
+    }
+    /* Cache startCommand, nop, and jump1 opcodes for stripping */
+    for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
+        const char *nm = instTable[i].name;
+        if (!nm)
+            continue;
+        if (InstrIs(nm, "startCommand")) {
+            tbcxOpStartCmd    = (unsigned char)i;
+            tbcxStartCmdBytes = (unsigned char)instTable[i].numBytes;
+        } else if (InstrIs(nm, "nop")) {
+            tbcxOpNop = (unsigned char)i;
+        } else if (strcmp(nm, "jump1") == 0 && instTable[i].numBytes == 2) {
+            tbcxOpJump1 = (unsigned char)i;
+        }
+    }
+    tbcxOpMapReady = 1;
+}
+
+static void InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
     if (!bc || !ctx || !ctx->instrBodyInit)
         return;
     if (!bc->codeStart || bc->numCodeBytes <= 0)
@@ -2343,229 +2565,11 @@ static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *pha
     Tcl_Size               codeLen   = bc->numCodeBytes;
     Tcl_Size               numLits   = bc->numLitObjects;
 
-    /* ---- Opcode dispatch table (built once, cached across calls) ---- */
-    if (!tbcxOpMapReady) {
-        memset(tbcxOpMap, OP_UNKNOWN, sizeof(tbcxOpMap));
-        for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
-            const char *nm = instTable[i].name;
-            if (!nm)
-                continue;
-
-            /* Order matters for prefix matching — check longer names first.
-               Use exact first-character dispatch to minimize strcmp calls. */
-            switch (nm[0]) {
-            case 'p':
-                if (InstrIs(nm, "push")) {
-                    tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP : /* pushResult/pushReturnCode/pushReturnOpts */
-                                        nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH
-                                                                                               : OP_PUSH1_NOPOP);
-                } else if (InstrIs(nm, "pop"))
-                    tbcxOpMap[i] = OP_POP;
-                break;
-            case 'i':
-                if (InstrIs(nm, "invokeStk"))
-                    tbcxOpMap[i] = OP_INVOKE_STK;
-                else if (InstrIs(nm, "invokeExpanded") || InstrIs(nm, "invokeReplace"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "incrStkImm"))
-                    tbcxOpMap[i] = OP_INCR_STK_IMM;
-                else if (InstrIs(nm, "incrStk"))
-                    tbcxOpMap[i] = OP_INCR_STK;
-                else if (InstrIs(nm, "incrScalar") || InstrIs(nm, "incrArray"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "isEmpty") || InstrIs(nm, "infoLevelNumber"))
-                    tbcxOpMap[i] = (nm[1] == 'n' ? OP_PUSH1_NOPOP : OP_ARITH); /* infoLevelNumber=push, isEmpty=arith */
-                break;
-            case 'l':
-                if (InstrIs(nm, "loadStk"))
-                    tbcxOpMap[i] = OP_LOAD_STK;
-                else if (InstrIs(nm, "loadArrayStk"))
-                    tbcxOpMap[i] = OP_LOAD_ARR_STK;
-                else if (InstrIs(nm, "loadScalar") || InstrIs(nm, "loadArray"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "lappendListStk"))
-                    tbcxOpMap[i] = OP_LAPPEND_LST_STK;
-                else if (InstrIs(nm, "lappendStk"))
-                    tbcxOpMap[i] = OP_INCR_STK;
-                else if (InstrIs(nm, "lappendList"))
-                    tbcxOpMap[i] = OP_STRCAT_N;
-                else if (InstrIs(nm, "lappendScalar") || InstrIs(nm, "lappendArray"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "list"))
-                    tbcxOpMap[i] = OP_STRCAT_N;
-                else if (InstrIs(nm, "lindexMulti") || InstrIs(nm, "listLength") || InstrIs(nm, "listIndexImm") || InstrIs(nm, "listRangeImm") || InstrIs(nm, "lreplace") || InstrIs(nm, "lsetFlat") ||
-                         InstrIs(nm, "land") || InstrIs(nm, "lor") || InstrIs(nm, "lnot") || InstrIs(nm, "lt") || InstrIs(nm, "le") || InstrIs(nm, "lshift"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "lmap_collect"))
-                    tbcxOpMap[i] = OP_POP;
-                break;
-            case 's':
-                if (InstrIs(nm, "storeStk"))
-                    tbcxOpMap[i] = OP_STORE_STK;
-                else if (InstrIs(nm, "storeArrayStk"))
-                    tbcxOpMap[i] = OP_STORE_ARR_STK;
-                else if (InstrIs(nm, "storeScalar") || InstrIs(nm, "storeArray"))
-                    tbcxOpMap[i] = OP_STORE_LVT;
-                else if (InstrIs(nm, "startCommand"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "strcat"))
-                    tbcxOpMap[i] = OP_STRCAT_N;
-                else if (InstrIs(nm, "swap"))
-                    tbcxOpMap[i] = OP_SWAP;
-                else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") ||
-                         InstrIs(nm, "strfind") || InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") ||
-                         InstrIs(nm, "strcaseUpper") || InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'a':
-                if (InstrIs(nm, "appendStk"))
-                    tbcxOpMap[i] = OP_INCR_STK;
-                else if (InstrIs(nm, "arithSeries"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "add") || InstrIs(nm, "appendScalar") || InstrIs(nm, "appendArray"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'b':
-                if (InstrIs(nm, "beginCatch"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "bitand") || InstrIs(nm, "bitor") || InstrIs(nm, "bitxor") || InstrIs(nm, "bitnot"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'c':
-                if (InstrIs(nm, "concat"))
-                    tbcxOpMap[i] = OP_STRCAT_N;
-                else if (InstrIs(nm, "clockRead"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "constImm"))
-                    tbcxOpMap[i] = OP_POP;
-                else if (InstrIs(nm, "constStk"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "currentNamespace"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                break;
-            case 'd':
-                if (InstrIs(nm, "done"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "dup"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "div") || InstrIs(nm, "dictGet") || InstrIs(nm, "dictPut") || InstrIs(nm, "dictSet") || InstrIs(nm, "dictExists") || InstrIs(nm, "dictRemove") ||
-                         InstrIs(nm, "dictGetDef"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "dictFirst") || InstrIs(nm, "dictNext"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "dictUpdateStart") || InstrIs(nm, "dictUpdateEnd"))
-                    tbcxOpMap[i] = OP_NOP;
-                break;
-            case 'e':
-                if (InstrIs(nm, "endCatch"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "expandStkTop"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "expandStart"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "existStk"))
-                    tbcxOpMap[i] = OP_INCR_STK_IMM;
-                else if (InstrIs(nm, "existScalar") || InstrIs(nm, "existArray") || InstrIs(nm, "eq") || InstrIs(nm, "expon") || InstrIs(nm, "exprStk") || InstrIs(nm, "errorPrefixEq"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'f':
-                if (InstrIs(nm, "foreach_start") || InstrIs(nm, "foreach_step") || InstrIs(nm, "foreach_end"))
-                    tbcxOpMap[i] = OP_NOP;
-                break;
-            case 'g':
-                if (InstrIs(nm, "gt") || InstrIs(nm, "ge"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'j':
-                if (InstrIs(nm, "jump"))
-                    tbcxOpMap[i] = OP_RESET;
-                break;
-            case 'm':
-                if (InstrIs(nm, "mult") || InstrIs(nm, "mod"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'n':
-                if (InstrIs(nm, "nop"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "not") || InstrIs(nm, "neq") || InstrIs(nm, "numericType"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "nsupvar"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                break;
-            case 'o':
-                if (InstrIs(nm, "over"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                break;
-            case 'r':
-                if (InstrIs(nm, "returnStk"))
-                    tbcxOpMap[i] = OP_RETURN_STK;
-                else if (InstrIs(nm, "return"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "reverse"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "rshift") || InstrIs(nm, "regexp"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 't':
-                if (InstrIs(nm, "tailcall"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "tclooClass"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "tclooId"))
-                    tbcxOpMap[i] = OP_ARITH;
-                else if (InstrIs(nm, "tclooNext"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "tclooSelf"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "tryCvtToNumeric"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'u':
-                if (InstrIs(nm, "unsetStk"))
-                    tbcxOpMap[i] = OP_UNSET_STK;
-                else if (InstrIs(nm, "unsetScalar"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "uplevel"))
-                    tbcxOpMap[i] = OP_RESET;
-                else if (InstrIs(nm, "upvar"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                else if (InstrIs(nm, "uminus") || InstrIs(nm, "uplus"))
-                    tbcxOpMap[i] = OP_ARITH;
-                break;
-            case 'v':
-                if (InstrIs(nm, "verifyDict"))
-                    tbcxOpMap[i] = OP_NOP;
-                else if (InstrIs(nm, "variable"))
-                    tbcxOpMap[i] = OP_PUSH1_NOPOP;
-                break;
-            case 'y':
-                if (InstrIs(nm, "yield"))
-                    tbcxOpMap[i] = OP_RESET;
-                break;
-            }
-        }
-        /* Cache startCommand, nop, and jump1 opcodes for stripping */
-        for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
-            const char *nm = instTable[i].name;
-            if (!nm)
-                continue;
-            if (InstrIs(nm, "startCommand")) {
-                tbcxOpStartCmd    = (unsigned char)i;
-                tbcxStartCmdBytes = (unsigned char)instTable[i].numBytes;
-            } else if (InstrIs(nm, "nop")) {
-                tbcxOpNop = (unsigned char)i;
-            } else if (strcmp(nm, "jump1") == 0 && instTable[i].numBytes == 2) {
-                tbcxOpJump1 = (unsigned char)i;
-            }
-        }
-        tbcxOpMapReady = 1;
-    } /* end if (!tbcxOpMapReady) */
-
     /* Track which literals are pushed by ANY instruction.  Literals that
        are never pushed are "dead references" -- source text kept for error
        reporting by Tcl's compiler for inline-compiled bodies (foreach,
        while, for, lmap, dict for).  These should also be precompiled. */
-    char *pushed = NULL;
+    char                  *pushed    = NULL;
     if (numLits <= 4096) {
         pushed = (char *)Tcl_Alloc((size_t)numLits);
         memset(pushed, 0, (size_t)numLits);
@@ -2901,26 +2905,6 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
     if (!bc) {
         W_Error(w, "tbcx: object is not bytecode");
         return;
-    }
-
-    /* Ensure startCommand/nop/jump1 opcodes are resolved before first use.
-       The full opmap is lazily built by InstrScanBodyLiterals, but we
-       need tbcxOpStartCmd before the code write (which precedes the scan). */
-    if (tbcxOpStartCmd == 0 && !tbcxOpMapReady) {
-        const InstructionDesc *it = (const InstructionDesc *)TclGetInstructionTable();
-        for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
-            const char *nm = it[i].name;
-            if (!nm)
-                continue;
-            if (nm[0] == 's' && InstrIs(nm, "startCommand")) {
-                tbcxOpStartCmd    = (unsigned char)i;
-                tbcxStartCmdBytes = (unsigned char)it[i].numBytes;
-            } else if (nm[0] == 'n' && InstrIs(nm, "nop")) {
-                tbcxOpNop = (unsigned char)i;
-            } else if (nm[0] == 'j' && strcmp(nm, "jump1") == 0 && it[i].numBytes == 2) {
-                tbcxOpJump1 = (unsigned char)i;
-            }
-        }
     }
 
     /* Runaway detection */
@@ -5530,6 +5514,7 @@ int Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj) {
  * ========================================================================== */
 
 int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(interp);
     if (objc != 3) {
         Tcl_WrongNumArgs(interp, 1, objv, "in out");
         return TCL_ERROR;

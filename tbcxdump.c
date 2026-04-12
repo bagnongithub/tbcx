@@ -750,6 +750,7 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
  * ========================================================================== */
 
 int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(interp);
     if (objc != 2) {
         Tcl_WrongNumArgs(interp, 1, objv, "filename");
         return TCL_ERROR;

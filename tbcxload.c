@@ -6,6 +6,12 @@
  *   All public entry points (Tbcx_LoadObjCmd, TbcxApplyShimPurgeAll)
  *   MUST be called from the thread that owns the Tcl_Interp.  This is
  *   the standard Tcl threading model — interpreters are not thread-safe.
+ *   Debug builds enforce this via TBCX_ASSERT_INTERP_THREAD.
+ *
+ *   Per-interpreter state (ApplyShim, load depth, OO shim hidden-ID
+ *   counter) is consolidated in TbcxInterpState, attached via
+ *   Tcl_SetAssocData.  No mutex is needed for this state because
+ *   each interpreter is used by exactly one thread.
  *
  *   Proc structs created by TBCX (in ReadProc, ReadMethod, ReadLit_LambdaBC,
  *   ProcShim_DirectInstall, CmdProcShim slow path, and top-level topProc)
@@ -17,9 +23,9 @@
  *   interp's ByteCode literal pool — all references are created and
  *   destroyed on the same thread.
  *
- *   Global state (tbcxTyBytecode, etc.) is initialized under tbcxTypeMutex
- *   with acquire/release fencing on tbcxTypesLoaded.  After initialization,
- *   these are read-only and safe without locking.
+ *   Global state (tbcxTyBytecode, opcode cache, etc.) is initialized
+ *   under tbcxTypeMutex with acquire/release fencing on tbcxTypesLoaded.
+ *   After initialization, these are read-only and safe without locking.
  * ========================================================================== */
 
 #include "tbcx.h"
@@ -31,15 +37,6 @@
 /* Stack-allocate argv for commands with this many words or fewer,
  * avoiding a per-call heap allocation in the common case. */
 #define TBCX_ARGV_STACK 8
-
-/* tbcxHiddenId: monotonically increasing counter used to generate unique
- * rename targets for OO shim commands.  Protected by tbcxHiddenIdMutex.
- * 64-bit to eliminate exhaustion risk in long-lived processes. */
-static uint64_t tbcxHiddenId = 0;
-
-/* tbcxHiddenIdMutex: protects tbcxHiddenId.  Lock-order position: leaf —
- * no other TBCX mutex may be held while this is held. */
-TCL_DECLARE_MUTEX(tbcxHiddenIdMutex);
 
 /* ==========================================================================
  * Type definitions
@@ -94,7 +91,7 @@ typedef struct {
  * the precompiled Proc* from its registry before forwarding to Tcl's
  * real [apply].  This eliminates the need to store body source text
  * in .tbcx files. */
-#define TBCX_APPLY_SHIM_KEY "tbcx::applyShim"
+#define TBCX_INTERP_STATE_KEY "tbcx::interpState"
 
 typedef struct {
     Proc    *procPtr; /* precompiled Proc (we hold a refcount) */
@@ -114,6 +111,20 @@ typedef struct {
                                         and forwards directly to savedApplyProc. */
 } ApplyShim;
 
+/* TbcxInterpState — consolidated per-interpreter state.
+ * Attached via Tcl_SetAssocData under TBCX_INTERP_STATE_KEY.
+ * Created lazily on first tbcx::load; destroyed when the interpreter
+ * is deleted.  Replaces the former separate assocdata keys for
+ * ApplyShim, load depth, and the OO shim hidden-ID counter
+ * (formerly the process-global tbcxHiddenId). */
+typedef struct {
+    Tcl_Interp *interp;
+    ApplyShim   apply;        /* embedded — no separate heap allocation */
+    int         applyActive;  /* 1 once the [apply] shim has been installed */
+    Tcl_Size    loadDepth;    /* reentrancy depth for tbcx::load */
+    uint64_t    nextHiddenId; /* per-interp OO shim rename counter */
+} TbcxInterpState;
+
 typedef struct {
     Var        *oldLocals;
     Tcl_Size    oldNum;
@@ -132,7 +143,7 @@ typedef struct {
 static int         AddOOShim(Tcl_Interp *ip, OOShim *os);
 static int         AddProcShim(Tcl_Interp *ip, ProcShim *ps);
 static void        ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
-static void        ApplyShimCleanup(void *cd, Tcl_Interp *ip);
+static void        ApplyShimTeardown(ApplyShim *as, Tcl_Interp *ip);
 static void        ApplyShimPurgeStale(ApplyShim *as);
 static Tcl_Obj    *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned char *code, uint32_t codeLen, Tcl_Obj **lits, uint32_t numLits, AuxData *auxArr, uint32_t numAux, ExceptionRange *exArr,
                                uint32_t numEx, int maxStackDepth, int setPrecompiled);
@@ -179,14 +190,16 @@ int                Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
 void               TbcxApplyShimPurgeAll(Tcl_Interp *ip);
 static ByteCode   *TbcxByteCode(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr, const TBCX_CompileEnvMin *env, int setPrecompiled);
 static void        TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr);
-static void        TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
-static void        TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
+static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip);
+static void             TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
+static void             TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
+static void             TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
 
 /* ==========================================================================
  * Buffered Read I/O & Utilities
  * ========================================================================== */
 
-static inline void R_Error(TbcxIn *r, const char *msg) {
+static inline void      R_Error(TbcxIn *r, const char *msg) {
     if (r->err == TCL_OK) {
         Tcl_SetObjResult(r->interp, Tcl_NewStringObj(msg, -1));
         r->err = TCL_ERROR;
@@ -842,11 +855,16 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             Tcl_IncrRefCount(unexpSub);
             for (Tcl_Size ui = 0; ui < uLen; ui++) {
                 Tcl_Obj *av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
-                Tcl_EvalObjv(ip, 4, av, 0);
-                Tcl_ResetResult(ip);
+                rc             = Tcl_EvalObjv(ip, 4, av, 0);
+                if (rc != TCL_OK) {
+                    break;
+                }
             }
             Tcl_DecrRefCount(unexpSub);
             Tcl_DecrRefCount(defCmd);
+            if (rc == TCL_OK) {
+                Tcl_ResetResult(ip);
+            }
         }
     }
     if (unexportedList)
@@ -939,6 +957,7 @@ static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, in
 }
 
 static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     OOShim  *os  = (OOShim *)cd;
     int      rc  = TCL_OK;
     Tcl_Obj *cls = NULL, *sub = NULL;
@@ -1177,6 +1196,7 @@ cleanup:
    methodsByKey registry since saver stores objdefine methods
    there keyed by the object/class FQN. */
 static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     OOShim  *os    = (OOShim *)cd;
     int      rc    = TCL_OK;
 
@@ -1322,12 +1342,12 @@ objdefine_forward:
 
     /* After builder form execution, apply precompiled bodies.
        Use oo::define (the renamed original) for body installation via PrecompClass,
-       since per-object methods can also be set through oo::define on the object.
-       F6 fix: if PrecompClass fails, clean interp result to prevent
-       contaminating subsequent operations. */
+       since per-object methods can also be set through oo::define on the object. */
     if (isBuilderForm && rc == TCL_OK) {
-        if (PrecompClass(ip, os, objFqn) != TCL_OK)
-            Tcl_ResetResult(ip);
+        int patchRc = PrecompClass(ip, os, objFqn);
+        if (patchRc != TCL_OK) {
+            rc = patchRc; /* preserve PrecompClass() error/result */
+        }
     }
 
     if (objFqn != obj)
@@ -1350,15 +1370,14 @@ static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
     Tcl_InitHashTable(&os->methodsByKey, TCL_STRING_KEYS);
 
     /* Generate a unique rename target so nested tbcx::load calls don't
-       collide.  Each nesting level gets its own orig command name. */
-    Tcl_MutexLock(&tbcxHiddenIdMutex);
-    if (tbcxHiddenId == UINT64_MAX) {
-        Tcl_MutexUnlock(&tbcxHiddenIdMutex);
+       collide.  Each nesting level gets its own orig command name.
+       The counter is per-interpreter (no mutex needed). */
+    TbcxInterpState *st = TbcxGetInterpState(ip);
+    if (st->nextHiddenId == UINT64_MAX) {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: OO shim ID counter exhausted"));
         return TCL_ERROR;
     }
-    uint64_t myId = tbcxHiddenId++;
-    Tcl_MutexUnlock(&tbcxHiddenIdMutex);
+    uint64_t myId = st->nextHiddenId++;
 
     /* Build unique rename targets using Tcl_ObjPrintf instead of raw snprintf */
     {
@@ -1785,7 +1804,7 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
         }
         Tcl_Size    nameLen = 0;
         const char *nm      = Tbcx_GetStringFromObjSafe(names[idx], &nameLen);
-        if (nameLen == 0 || nameLen > INT_MAX) {
+        if (nameLen == 0) {
             prev = cl;
             cl   = cl->nextPtr;
             continue;
@@ -1798,7 +1817,7 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
         memcpy(repl, cl, offsetof(CompiledLocal, name));
         memcpy(repl->name, nm, (size_t)nameLen);
         repl->name[nameLen] = '\0';
-        repl->nameLength    = (nameLen > INT_MAX) ? INT_MAX : (int)nameLen;
+        repl->nameLength    = nameLen;
         /* Splice replacement into the linked list using tracked predecessor
            (O(1) instead of the previous O(n) predecessor search). */
         repl->nextPtr       = cl->nextPtr;
@@ -1826,12 +1845,7 @@ void TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, 
     if (!bc)
         return;
     assert(ip != NULL && "TbcxFixupByteCode requires non-NULL interp");
-#ifndef NDEBUG
-    {
-        Interp *_iPtr = (Interp *)ip;
-        assert(_iPtr->threadId == Tcl_GetCurrentThread() && "TbcxFixupByteCode: must be called from interp-owning thread");
-    }
-#endif
+    TBCX_ASSERT_INTERP_THREAD(ip);
     bc->procPtr = proc;
     RefreshBC(bc, ip, ns);
     FixLiteralPoolProcPtr(bc);
@@ -3209,6 +3223,7 @@ static int ProcShim_DirectInstall(ProcShim *ps, Tcl_Interp *ip, Tcl_Obj *fqn, Tc
  * so that bodyPtr restoration works after the call returns. */
 
 static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     ProcShim *ps = (ProcShim *)cd;
 
     if (objc != 4) {
@@ -3488,6 +3503,7 @@ static void DelProcShim(Tcl_Interp *ip, ProcShim *ps) {
  * ========================================================================== */
 
 static int CmdApplyShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     ApplyShim *as = (ApplyShim *)cd;
 
     if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda) {
@@ -3520,6 +3536,7 @@ static int CmdApplyShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const 
  * original savedApplyNre so that the NRE trampoline is preserved
  * for deeply recursive lambda calls. */
 static int CmdApplyShimNre(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     ApplyShim *as = (ApplyShim *)cd;
 
     if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda) {
@@ -3544,8 +3561,8 @@ static int CmdApplyShimNre(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
 
 /* ApplyCmdDeleteTrace — called when the "apply" command is renamed or deleted.
  * Invalidates the cached Command* to prevent stale-pointer writes in
- * ApplyShimCleanup.  Without this trace, if "apply" is deleted or renamed
- * before interpreter destruction, ApplyShimCleanup would write through a
+ * ApplyShimTeardown.  Without this trace, if "apply" is deleted or renamed
+ * before interpreter destruction, ApplyShimTeardown would write through a
  * freed Command struct (use-after-free / process crash). */
 static void ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
     ApplyShim *as = (ApplyShim *)cd;
@@ -3558,9 +3575,11 @@ static void ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldNam
     }
 }
 
-static void ApplyShimCleanup(void *cd, Tcl_Interp *ip) {
-    ApplyShim *as = (ApplyShim *)cd;
-
+/* ApplyShimTeardown — clean up the apply shim state (untrace, restore
+ * original command handlers, free registry entries and hash table).
+ * Does NOT free the ApplyShim struct itself — it is embedded in
+ * TbcxInterpState and freed by TbcxInterpStateCleanup. */
+static void ApplyShimTeardown(ApplyShim *as, Tcl_Interp *ip) {
     /* Remove command trace before attempting any restore.
        If the command was already deleted, the trace fired and set
        applyCmdPtr = NULL and traceInstalled = 0. */
@@ -3590,9 +3609,6 @@ static void ApplyShimCleanup(void *cd, Tcl_Interp *ip) {
         ApplyLambdaEntry *le = (ApplyLambdaEntry *)Tcl_GetHashValue(e);
         if (le) {
             if (le->procPtr && --le->procPtr->refCount <= 0) {
-                /* Proc refCount hit zero — the registry was the last owner.
-                   Clean up the Proc properly: release bodyPtr and free
-                   compiled locals, then the Proc struct itself. */
                 TclProcCleanupProc(le->procPtr);
             }
             if (le->nsObj)
@@ -3601,7 +3617,40 @@ static void ApplyShimCleanup(void *cd, Tcl_Interp *ip) {
         }
     }
     Tcl_DeleteHashTable(&as->lambdaRegistry);
-    Tcl_Free(as);
+}
+
+/* TbcxInterpStateCleanup — Tcl_SetAssocData delete callback.
+ * Called when the interpreter is being destroyed.  Tears down the
+ * apply shim (if active) and frees the consolidated state struct. */
+static void TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip) {
+    TbcxInterpState *st = (TbcxInterpState *)cd;
+    if (st->applyActive) {
+        ApplyShimTeardown(&st->apply, ip);
+        st->applyActive = 0;
+    } else {
+        /* Hash table was initialized in TbcxGetInterpState but the
+           apply shim was never activated — just delete the empty table. */
+        Tcl_DeleteHashTable(&st->apply.lambdaRegistry);
+    }
+    Tcl_Free(st);
+}
+
+/* TbcxGetInterpState — get or create the per-interpreter state.
+ * On first call, allocates and registers the state under
+ * TBCX_INTERP_STATE_KEY with TbcxInterpStateCleanup as the
+ * delete callback.  Subsequent calls return the existing state. */
+static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip) {
+    TbcxInterpState *st = (TbcxInterpState *)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
+    if (st)
+        return st;
+
+    st = (TbcxInterpState *)Tcl_Alloc(sizeof(TbcxInterpState));
+    memset(st, 0, sizeof(*st));
+    st->interp = ip;
+    Tcl_InitHashTable(&st->apply.lambdaRegistry, TCL_ONE_WORD_KEYS);
+    st->apply.interp = ip;
+    Tcl_SetAssocData(ip, TBCX_INTERP_STATE_KEY, TbcxInterpStateCleanup, st);
+    return st;
 }
 
 /* ApplyShimPurgeStale — remove registry entries for lambda objects that
@@ -3675,6 +3724,8 @@ static void ApplyShimPurgeStale(ApplyShim *as) {
             Tcl_DeleteHashEntry(e);
             /* Release the registry's reference (may free the lambda) */
             Tcl_DecrRefCount(lambda);
+            if (as->numRegistered > 0)
+                as->numRegistered--;
         }
     }
 
@@ -3688,18 +3739,20 @@ static void ApplyShimPurgeStale(ApplyShim *as) {
  * ========================================================================== */
 
 void TbcxApplyShimPurgeAll(Tcl_Interp *ip) {
-    ApplyShim *as = (ApplyShim *)Tcl_GetAssocData(ip, TBCX_APPLY_SHIM_KEY, NULL);
-    if (as)
-        ApplyShimPurgeStale(as);
+    TbcxInterpState *st = (TbcxInterpState *)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
+    if (st && st->applyActive)
+        ApplyShimPurgeStale(&st->apply);
 }
 
-/* EnsureApplyShim — get or create the per-interp ApplyShim.
- * First call installs the shim on [apply] and registers it as AssocData.
+/* EnsureApplyShim — get or activate the per-interp ApplyShim.
+ * First call installs the shim on [apply] within the TbcxInterpState.
  * Subsequent calls (from additional tbcx::load invocations) return the
  * existing shim — new lambda entries are simply added to the registry. */
 static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
-    ApplyShim *as = (ApplyShim *)Tcl_GetAssocData(ip, TBCX_APPLY_SHIM_KEY, NULL);
-    if (as) {
+    TbcxInterpState *st = TbcxGetInterpState(ip);
+    ApplyShim       *as = &st->apply;
+
+    if (st->applyActive) {
         /* Subsequent load: purge stale entries before adding new ones */
         ApplyShimPurgeStale(as);
         return as;
@@ -3709,24 +3762,15 @@ static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
     if (!token)
         return NULL;
 
-    as = (ApplyShim *)Tcl_Alloc(sizeof(ApplyShim));
-    memset(as, 0, sizeof(*as));
-    Tcl_InitHashTable(&as->lambdaRegistry, TCL_ONE_WORD_KEYS);
-
-    as->interp         = ip;
     as->applyCmdPtr    = (Command *)token;
     as->savedApplyProc = as->applyCmdPtr->objProc2;
     as->savedApplyNre  = as->applyCmdPtr->nreProc2;
     as->savedApplyCD   = as->applyCmdPtr->objClientData2;
 
     /* Install a command trace so we know if "apply" is renamed or deleted
-       before cleanup runs.  Without this, ApplyShimCleanup would write
-       through a stale Command* — a crash-class UAF bug.
-       Defensive: FindCommand above guarantees "apply" exists, so this
-       cannot fail in single-threaded use, but check anyway. */
+       before cleanup runs.  Without this, TbcxInterpStateCleanup would write
+       through a stale Command* — a crash-class UAF bug. */
     if (Tcl_TraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as) != TCL_OK) {
-        Tcl_DeleteHashTable(&as->lambdaRegistry);
-        Tcl_Free((char *)as);
         return NULL;
     }
     as->traceInstalled              = 1;
@@ -3735,17 +3779,14 @@ static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
        In Tcl 9.1, [apply] is NRE-enabled (nreProc2 != NULL), so the bytecode
        engine dispatches through nreProc2 — bypassing objProc2 entirely.
        Without intercepting nreProc2, shimmer recovery for precompiled lambdas
-       would silently fail when called from compiled code.
-       The NRE path uses a separate shim function that forwards to the
-       original savedApplyNre, preserving the NRE trampoline for deeply
-       recursive lambda calls. */
+       would silently fail when called from compiled code. */
     as->applyCmdPtr->objProc2       = CmdApplyShim;
     as->applyCmdPtr->objClientData2 = as;
     if (as->applyCmdPtr->nreProc2) {
         as->applyCmdPtr->nreProc2 = CmdApplyShimNre;
     }
 
-    Tcl_SetAssocData(ip, TBCX_APPLY_SHIM_KEY, ApplyShimCleanup, as);
+    st->applyActive = 1;
     return as;
 }
 
@@ -4095,32 +4136,26 @@ static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
 }
 
 #define TBCX_MAX_LOAD_DEPTH 8
-#define TBCX_LOAD_DEPTH_KEY "tbcx::loadDepth"
 
 static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
-    intptr_t depth = 0;
-    {
-        void *dv = Tcl_GetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL);
-        if (dv)
-            depth = (intptr_t)dv;
-        if (depth >= TBCX_MAX_LOAD_DEPTH) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %d exceeds limit %d", (int)depth, TBCX_MAX_LOAD_DEPTH));
-            return TCL_ERROR;
-        }
-        Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void *)(depth + 1));
+    TbcxInterpState *st = TbcxGetInterpState(ip);
+    if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH) {
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d", st->loadDepth, TBCX_MAX_LOAD_DEPTH));
+        return TCL_ERROR;
     }
+    st->loadDepth++;
 
     TbcxIn r;
     Tbcx_R_Init(&r, ip, ch);
     TbcxHeader H;
 
     if (Tbcx_CheckBinaryChan(ip, ch) != TCL_OK) {
-        Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void *)depth);
+        st->loadDepth--;
         return TCL_ERROR;
     }
 
     if (!Tbcx_ReadHeader(&r, &H) || r.err) {
-        Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void *)depth);
+        st->loadDepth--;
         return TCL_ERROR;
     }
 
@@ -4129,7 +4164,7 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
 
     Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, ip, curNs, &dummyNL, 1, 0);
     if (!topBC) {
-        Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void *)depth);
+        st->loadDepth--;
         return TCL_ERROR;
     }
     Tcl_IncrRefCount(topBC); /* protect against all early-return paths */
@@ -4286,7 +4321,7 @@ cleanup:
         DelOOShim(ip, &ooshim);
     if (shimInited)
         DelProcShim(ip, &shim);
-    Tcl_SetAssocData(ip, TBCX_LOAD_DEPTH_KEY, NULL, (void *)depth);
+    st->loadDepth--;
     return rc;
 }
 
@@ -4306,6 +4341,7 @@ cleanup:
  * ========================================================================== */
 
 int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
+    TBCX_ASSERT_INTERP_THREAD(interp);
     if (objc != 2) {
         Tcl_WrongNumArgs(interp, 1, objv, "in");
         return TCL_ERROR;
