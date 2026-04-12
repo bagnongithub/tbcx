@@ -606,4 +606,104 @@ test mt.stress.3 {stress: threads creating child interps with OO+lambda loads} \
     list allOk=$allOk threads=$N interpsPerThread=$M
 } -result {allOk=1 threads=4 interpsPerThread=3}
 
+# ========================================================================
+# Section 5: Concurrent initialization (requires Thread package)
+# ========================================================================
+
+# --- 5.1  Concurrent package require + immediate save ---
+#     Tests the P0 fix directly: multiple threads do [package require tbcx]
+#     concurrently (racing through TbcxInitTypes / TbcxSaveInitOpcodesLocked),
+#     then immediately exercise tbcx::save with a script complex enough to
+#     hit startCommand stripping.  No serial pre-initialization.
+
+test mt.init.1 {concurrent package require + save (P0 init race)} \
+    -constraints haveThread -body {
+
+    set N 6
+    set tids {}
+    set outfiles {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend outfiles [makeFile "" mt.init.1-$i.tbcx]
+        lappend tids [thread::create]
+    }
+
+    # A script with enough structure to exercise opcode mapping:
+    # procs, control flow, expressions, startCommand sequences.
+    set script {
+        proc fib {n} {
+            if {$n <= 1} {return $n}
+            return [expr {[fib [expr {$n-1}]] + [fib [expr {$n-2}]]}]
+        }
+        proc fact {n} {
+            set r 1
+            for {set i 2} {$i <= $n} {incr i} {
+                set r [expr {$r * $i}]
+            }
+            return $r
+        }
+        return [list [fib 10] [fact 6]]
+    }
+
+    # Fire all at once — NO prior thread::send for package require.
+    # Each thread races through TbcxInitTypes concurrently.
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{script f} {
+            package require tbcx
+            tbcx::save $script $f
+            set ::_done 1
+        }} $script [lindex $outfiles $i]]
+    }
+
+    # Synchronize
+    foreach tid $tids { thread::send $tid {set ::_done} }
+
+    # Verify all outputs are valid .tbcx and produce correct results
+    set ok 0
+    for {set i 0} {$i < $N} {incr i} {
+        if {[tbcx::load [lindex $outfiles $i]] eq {55 720}} { incr ok }
+    }
+
+    foreach tid $tids { thread::release $tid }
+    set ok
+} -result 6
+
+# --- 5.2  Concurrent package require + load ---
+#     Same race window but on the load side.
+
+test mt.init.2 {concurrent package require + load (P0 init race)} \
+    -constraints haveThread -body {
+
+    set out [makeFile "" mt.init.2.tbcx]
+    tbcx::save {
+        oo::class create Svc
+        oo::define Svc method run {x} { expr {$x * $x} }
+        return [[Svc new] run 9]
+    } $out
+
+    set N 6
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend tids [thread::create]
+    }
+
+    # Fire concurrent package require + load — no serial pre-init
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{f} {
+            package require tbcx
+            set ::_result [tbcx::load $f]
+        }} $out]
+    }
+
+    set results {}
+    foreach tid $tids {
+        lappend results [thread::send $tid {set ::_result}]
+    }
+    foreach tid $tids { thread::release $tid }
+
+    # All should produce 81
+    set ok 0
+    foreach r $results { if {$r eq "81"} { incr ok } }
+    set ok
+} -result 6
+
 cleanupTests
