@@ -1,5 +1,6 @@
 # -*-Tcl-*-
-# 21-proposals.test — verify proposals P1–P6, P8, P9
+# 21-proposals.test
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

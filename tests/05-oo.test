@@ -487,6 +487,4 @@ test oo.28 {oo: diamond inheritance with next} -body {
     tbcx::load $out
 } -result Bottom+Left+Right+Top
 
-
-
 cleanupTests

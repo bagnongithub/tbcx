@@ -272,6 +272,4 @@ test proc.18 {proc using apply/lambda} -body {
     tbcx::load $out
 } -result {1 4 9 16}
 
-
-
 cleanupTests

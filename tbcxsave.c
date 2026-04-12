@@ -2324,7 +2324,10 @@ enum {
  * Thread note: tbcx::save runs only on the interp-owning thread;
  * TclGetInstructionTable() is constant for a given Tcl build. */
 static unsigned char tbcxOpMap[256];
-static int           tbcxOpMapReady = 0;
+static int           tbcxOpMapReady    = 0;
+static unsigned char tbcxOpStartCmd    = 0; /* opcode for startCommand */
+static unsigned char tbcxOpNop         = 0; /* opcode for nop */
+static unsigned char tbcxStartCmdBytes = 0; /* numBytes for startCommand */
 
 static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
     if (!bc || !ctx || !ctx->instrBodyInit)
@@ -2538,6 +2541,18 @@ static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *pha
                 if (InstrIs(nm, "yield"))
                     tbcxOpMap[i] = OP_RESET;
                 break;
+            }
+        }
+        /* Cache startCommand and nop opcodes for stripping */
+        for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
+            const char *nm = instTable[i].name;
+            if (!nm)
+                continue;
+            if (InstrIs(nm, "startCommand")) {
+                tbcxOpStartCmd    = (unsigned char)i;
+                tbcxStartCmdBytes = (unsigned char)instTable[i].numBytes;
+            } else if (InstrIs(nm, "nop")) {
+                tbcxOpNop = (unsigned char)i;
             }
         }
         tbcxOpMapReady = 1;
@@ -2885,6 +2900,24 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
         return;
     }
 
+    /* Ensure startCommand/nop opcodes are resolved before first use.
+       The full opmap is lazily built by InstrScanBodyLiterals, but we
+       need tbcxOpStartCmd before the code write (which precedes the scan). */
+    if (tbcxOpStartCmd == 0 && !tbcxOpMapReady) {
+        const InstructionDesc *it = (const InstructionDesc *)TclGetInstructionTable();
+        for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
+            const char *nm = it[i].name;
+            if (!nm)
+                continue;
+            if (nm[0] == 's' && InstrIs(nm, "startCommand")) {
+                tbcxOpStartCmd    = (unsigned char)i;
+                tbcxStartCmdBytes = (unsigned char)it[i].numBytes;
+            } else if (nm[0] == 'n' && InstrIs(nm, "nop")) {
+                tbcxOpNop = (unsigned char)i;
+            }
+        }
+    }
+
     /* Runaway detection */
     if (ctx) {
         ctx->totalBlocks++;
@@ -2922,7 +2955,10 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
         return;
     }
 
-    /* 1) code */
+    /* 1) code — strip startCommand instructions (they exist solely for
+       command-level tracing and add ~15% overhead to code size).  Replace
+       each startCommand with nop bytes.  startCommand has no stack effect
+       and jump targets never land on it, so this is always safe. */
     if ((uint64_t)bc->numCodeBytes > TBCX_MAX_CODE) {
         W_Error(w, "tbcx: code too large");
         if (ctx)
@@ -2930,7 +2966,25 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
         return;
     }
     W_U32(w, (uint32_t)bc->numCodeBytes);
-    W_Bytes(w, bc->codeStart, (size_t)bc->numCodeBytes);
+    if (tbcxOpStartCmd != 0 && tbcxStartCmdBytes > 0) {
+        const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
+        unsigned char         *stripped  = (unsigned char *)Tcl_Alloc((size_t)bc->numCodeBytes);
+        memcpy(stripped, bc->codeStart, (size_t)bc->numCodeBytes);
+        for (Tcl_Size pc = 0; pc + tbcxStartCmdBytes <= bc->numCodeBytes;) {
+            if (stripped[pc] == tbcxOpStartCmd) {
+                memset(&stripped[pc], tbcxOpNop, tbcxStartCmdBytes);
+                pc += tbcxStartCmdBytes;
+            } else if (stripped[pc] <= LAST_INST_OPCODE) {
+                pc += instTable[stripped[pc]].numBytes;
+            } else {
+                pc++;
+            }
+        }
+        W_Bytes(w, stripped, (size_t)bc->numCodeBytes);
+        Tcl_Free((char *)stripped);
+    } else {
+        W_Bytes(w, bc->codeStart, (size_t)bc->numCodeBytes);
+    }
 
     /* 2) literal pool */
     /* scan instructions to identify body-argument literals

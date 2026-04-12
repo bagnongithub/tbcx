@@ -1,0 +1,784 @@
+# -*-Tcl-*-
+# 28-bytecode-coverage.test — Exercise every bytecode-compiled command
+#
+# Targets Tcl 9.1 commands/subcommands that have a compileProc in
+# tclBasic.c but are NOT (or barely) covered by tests 01–27.
+#
+# Source files: tclCompCmds.c  (A–F)
+#               tclCompCmdsGR.c (G–R)
+#               tclCompCmdsSZ.c (S–Z)
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+proc bcRoundtrip {tag script} {
+    set out [makeFile "" ${tag}-out.tbcx]
+    tbcx::save $script $out
+    interp create BC_$tag
+    interp eval BC_$tag [list package require tbcx]
+    interp eval BC_$tag {proc exit {args} {error "exit $args"}}
+    set rc [interp eval BC_$tag [list catch [list tbcx::load $out] _r _o]]
+    set pass 0; set fail 0; set errors {}
+    catch {set pass [interp eval BC_$tag {set ::_pass}]}
+    catch {set fail [interp eval BC_$tag {set ::_fail}]}
+    if {$fail > 0} { catch {set errors [interp eval BC_$tag {set ::_errors}]} }
+    set loadErr ""
+    if {$rc != 0} { catch {set loadErr [interp eval BC_$tag {set _r}]} }
+    interp delete BC_$tag
+    if {$rc != 0} { error "load error after $pass ok: $loadErr" }
+    if {$fail != 0} { error "$fail failures out of [expr {$pass+$fail}]: $errors" }
+    return $pass
+}
+
+set H {
+set ::_pass 0; set ::_fail 0; set ::_errors {}
+proc assert {tag got expected} {
+    if {$got eq $expected} { incr ::_pass } else {
+        incr ::_fail; lappend ::_errors "$tag: got=$got exp=$expected"
+    }
+}
+}
+
+# =====================================================================
+# GROUP 1: Tcl 9.x new compiled commands
+# =====================================================================
+
+test bc.1 {const — constStk instruction} -body {
+    set script $H
+    append script {
+        proc use_const {} {
+            const PI 3.14159
+            const LABEL "hello"
+            return "$LABEL=$PI"
+        }
+        assert const-val [use_const] hello=3.14159
+        proc const_readonly {} {
+            const X 1
+            catch {set X 2} msg
+            return [string match "*constant*" $msg]
+        }
+        assert const-ro [const_readonly] 1
+    }
+    bcRoundtrip bc1 $script
+} -result 2
+
+test bc.2 {lseq — arithmetic sequence generation} -body {
+    set script $H
+    append script {
+        assert lseq-n     [lseq 5]                {0 1 2 3 4}
+        assert lseq-to    [lseq 3 to 7]           {3 4 5 6 7}
+        assert lseq-by    [lseq 0 to 10 by 2]     {0 2 4 6 8 10}
+        assert lseq-down  [lseq 5 to 1]           {5 4 3 2 1}
+        assert lseq-len   [llength [lseq 100]]    100
+    }
+    bcRoundtrip bc2 $script
+} -result 5
+
+test bc.3 {lpop — pop element from list variable} -body {
+    set script $H
+    append script {
+        set L {a b c d e}
+        set v [lpop L end]
+        assert lpop-end $v e
+        assert lpop-rem $L {a b c d}
+        set v2 [lpop L 1]
+        assert lpop-mid $v2 b
+        assert lpop-rem2 $L {a c d}
+    }
+    bcRoundtrip bc3 $script
+} -result 4
+
+test bc.4 {ledit — replace range in list variable} -body {
+    set script $H
+    append script {
+        set L {a b c d e}
+        ledit L 1 2 X Y Z
+        assert ledit-rep $L {a X Y Z d e}
+        ledit L 0 0 Q
+        assert ledit-0 $L {Q X Y Z d e}
+        ledit L end end
+        assert ledit-del $L {Q X Y Z d}
+    }
+    bcRoundtrip bc4 $script
+} -result 3
+
+test bc.5 {lremove — remove elements by index} -body {
+    set script $H
+    append script {
+        assert lrm-basic [lremove {a b c d e f} 1 3 5] {a c e}
+        assert lrm-none  [lremove {x y z}]             {x y z}
+        assert lrm-all   [lremove {a b c} 0 1 2]       {}
+    }
+    bcRoundtrip bc5 $script
+} -result 3
+
+test bc.6 {lset — lsetFlat / lsetList} -body {
+    set script $H
+    append script {
+        set L {a b c d e}
+        lset L 2 X
+        assert lset-flat $L {a b X d e}
+        set N {{1 2} {3 4} {5 6}}
+        lset N 1 0 Z
+        assert lset-nest $N {{1 2} {Z 4} {5 6}}
+        lset N end end W
+        assert lset-end $N {{1 2} {Z 4} {5 W}}
+    }
+    bcRoundtrip bc6 $script
+} -result 3
+
+test bc.7 {yieldto — yieldto instruction} -body {
+    set script $H
+    append script {
+        proc coro_yt {} {
+            yieldto return -level 0 "from-yieldto"
+        }
+        set val [coroutine ytc coro_yt]
+        assert yieldto-val $val from-yieldto
+        rename ytc ""
+    }
+    bcRoundtrip bc7 $script
+} -result 1
+
+# =====================================================================
+# GROUP 2: String subcommands missing from tests 01–27
+# =====================================================================
+
+test bc.8 {string cat — strcat instruction} -body {
+    set script $H
+    append script {
+        assert scat-2  [string cat "hello" " world"]  "hello world"
+        assert scat-3  [string cat "a" "b" "c"]       "abc"
+        set a "foo"; set b "bar"
+        assert scat-v  [string cat $a $b]              "foobar"
+        assert scat-e  [string cat "" "x" ""]          "x"
+    }
+    bcRoundtrip bc8 $script
+} -result 4
+
+test bc.9 {string compare — strcmp instruction} -body {
+    set script $H
+    append script {
+        assert scmp-eq  [string compare "abc" "abc"]               0
+        assert scmp-lt  [expr {[string compare "abc" "abd"] < 0}]  1
+        assert scmp-gt  [expr {[string compare "abd" "abc"] > 0}]  1
+        assert scmp-nc  [string compare -nocase "ABC" "abc"]       0
+    }
+    bcRoundtrip bc9 $script
+} -result 4
+
+test bc.10 {string equal — streq instruction} -body {
+    set script $H
+    append script {
+        assert seq-yes [string equal "foo" "foo"]              1
+        assert seq-no  [string equal "foo" "bar"]              0
+        assert seq-nc  [string equal -nocase "HELLO" "hello"]  1
+    }
+    bcRoundtrip bc10 $script
+} -result 3
+
+test bc.11 {string totitle — strcaseTitle instruction} -body {
+    set script $H
+    append script {
+        assert stot-basic [string totitle "hello WORLD"]  "Hello world"
+        assert stot-empty [string totitle ""]             ""
+        assert stot-one   [string totitle "x"]            "X"
+    }
+    bcRoundtrip bc11 $script
+} -result 3
+
+test bc.12 {string trimleft / trimright — strtrimLeft/strtrimRight} -body {
+    set script $H
+    append script {
+        assert stl-basic  [string trimleft  "  hello  "]      "hello  "
+        assert str-basic  [string trimright "  hello  "]      "  hello"
+        assert stl-chars  [string trimleft  "xxyhello" "xy"]  "hello"
+        assert str-chars  [string trimright "helloxyy" "xy"]  "hello"
+    }
+    bcRoundtrip bc12 $script
+} -result 4
+
+# =====================================================================
+# GROUP 3: Dict subcommands missing from tests 01–27
+# =====================================================================
+
+test bc.13 {dict incr — dictIncrImm instruction} -body {
+    set script $H
+    append script {
+        set d {count 0 total 100}
+        dict incr d count
+        dict incr d count
+        dict incr d total 5
+        dict incr d total -10
+        assert dincr-cnt [dict get $d count] 2
+        assert dincr-tot [dict get $d total] 95
+        dict incr d newkey
+        assert dincr-new [dict get $d newkey] 1
+    }
+    bcRoundtrip bc13 $script
+} -result 3
+
+test bc.14 {dict merge — dictMerge instruction} -body {
+    set script $H
+    append script {
+        set d1 [dict create a 1 b 2]
+        set d2 [dict create b 3 c 4]
+        set m  [dict merge $d1 $d2]
+        assert dm-a [dict get $m a]  1
+        assert dm-b [dict get $m b]  3
+        assert dm-c [dict get $m c]  4
+        assert dm-sz [dict size $m]  3
+    }
+    bcRoundtrip bc14 $script
+} -result 4
+
+test bc.15 {dict unset — dictUnsetN instruction} -body {
+    set script $H
+    append script {
+        set d {a 1 b 2 c 3}
+        dict unset d b
+        assert du-gone [dict exists $d b]  0
+        assert du-left [dict size $d]      2
+        set d2 {top {x 1 y 2}}
+        dict unset d2 top x
+        assert du-nest [dict get $d2 top] {y 2}
+    }
+    bcRoundtrip bc15 $script
+} -result 3
+
+# =====================================================================
+# GROUP 4: Array compiled subcommands
+# =====================================================================
+
+test bc.16 {array set/unset/exists — arraySetStk/arrayUnsetStk/arrayExistsStk} -body {
+    set script $H
+    append script {
+        array set myarr {one 1 two 2 three 3}
+        assert as-get    $myarr(two)             2
+        assert as-exists [array exists myarr]    1
+        array unset myarr two
+        assert au-gone   [info exists myarr(two)] 0
+        assert au-keep   $myarr(one)              1
+        array unset myarr
+        assert au-all    [array exists myarr]     0
+    }
+    bcRoundtrip bc16 $script
+} -result 5
+
+# =====================================================================
+# GROUP 5: Info subcommands
+# =====================================================================
+
+test bc.17 {info coroutine — infoCoroutine instruction} -body {
+    set script $H
+    append script {
+        proc coro_id {} {
+            set name [info coroutine]
+            yield $name
+        }
+        set result [coroutine myid coro_id]
+        assert icoro-name $result ::myid
+        assert icoro-outside [info coroutine] {}
+    }
+    bcRoundtrip bc17 $script
+} -result 2
+
+test bc.18 {info object isa / info object namespace — tclooIsA/tclooNs} -body {
+    set script $H
+    append script {
+        oo::class create Bc18A {}
+        oo::class create Bc18B { superclass Bc18A }
+        set o [Bc18B new]
+        assert isa-obj  [info object isa object $o]     1
+        assert isa-cls  [info object isa class Bc18B]   1
+        assert isa-meta [info object isa metaclass oo::class] 1
+        set ns [info object namespace $o]
+        assert ons-match [string match "::oo::Obj*" $ns] 1
+    }
+    bcRoundtrip bc18 $script
+} -result 4
+
+# =====================================================================
+# GROUP 6: Namespace compiled subcommands
+# =====================================================================
+
+test bc.19 {namespace current — currentNamespace instruction} -body {
+    set script $H
+    append script {
+        assert nscur-global [namespace current] ::
+        namespace eval ::bc19ns {
+            proc cur {} { return [namespace current] }
+        }
+        assert nscur-child [::bc19ns::cur] ::bc19ns
+    }
+    bcRoundtrip bc19 $script
+} -result 2
+
+test bc.20 {namespace tail / qualifiers} -body {
+    set script $H
+    append script {
+        assert nstail-basic [namespace tail ::foo::bar::baz]        baz
+        assert nstail-root  [namespace tail ::top]                  top
+        assert nsqual-basic [namespace qualifiers ::foo::bar::baz]  ::foo::bar
+        assert nsqual-none  [namespace qualifiers ::top]            {}
+    }
+    bcRoundtrip bc20 $script
+} -result 4
+
+test bc.21 {namespace upvar — nsupvar instruction} -body {
+    set script $H
+    append script {
+        namespace eval ::bc21ns { variable val 42 }
+        proc read_nsvar {} {
+            namespace upvar ::bc21ns val local
+            return $local
+        }
+        proc write_nsvar {v} {
+            namespace upvar ::bc21ns val local
+            set local $v
+        }
+        assert nsuv-read [read_nsvar] 42
+        write_nsvar 99
+        assert nsuv-write [read_nsvar] 99
+    }
+    bcRoundtrip bc21 $script
+} -result 2
+
+test bc.22 {namespace origin / which / code} -body {
+    set script $H
+    append script {
+        namespace eval ::bc22src {
+            proc greet {} { return hi }
+            namespace export greet
+        }
+        namespace eval ::bc22imp {
+            namespace import ::bc22src::greet
+        }
+        assert nsorig [namespace origin ::bc22imp::greet]        ::bc22src::greet
+        assert nswhich [namespace which -command ::bc22src::greet] ::bc22src::greet
+        set codeScript [namespace code {expr {1+1}}]
+        assert nscode [string match "::namespace inscope*" $codeScript] 1
+    }
+    bcRoundtrip bc22 $script
+} -result 3
+
+# =====================================================================
+# GROUP 7: Clock compiled subcommands
+# =====================================================================
+
+test bc.23 {clock clicks/microseconds/milliseconds/seconds — clockRead} -body {
+    set script $H
+    append script {
+        set c1 [clock clicks]
+        set c2 [clock clicks]
+        assert clk-clicks [expr {$c2 >= $c1}] 1
+        set us [clock microseconds]
+        assert clk-us [expr {$us > 0}] 1
+        set ms [clock milliseconds]
+        assert clk-ms [expr {$ms > 0}] 1
+        set sec [clock seconds]
+        assert clk-sec [expr {$sec > 1000000000}] 1
+    }
+    bcRoundtrip bc23 $script
+} -result 4
+
+# =====================================================================
+# GROUP 8: Concat (barely covered — 1 hit in 27 files)
+# =====================================================================
+
+test bc.24 {concat — compiled concat} -body {
+    set script $H
+    append script {
+        assert cat-2    [concat {a b} {c d}]        {a b c d}
+        assert cat-3    [concat {a} {b} {c}]        {a b c}
+        assert cat-trim [concat "  a  " "  b  "]    {a b}
+        assert cat-mix  [concat {a b} c {d e}]      {a b c d e}
+    }
+    bcRoundtrip bc24 $script
+} -result 4
+
+# =====================================================================
+# GROUP 9: Reinforce weak coverage
+# =====================================================================
+
+test bc.25 {lassign — listIndexImm + listRangeImm decomposition} -body {
+    set script $H
+    append script {
+        lassign {10 20 30} a b c
+        assert la-a $a 10
+        assert la-b $b 20
+        assert la-c $c 30
+        set rest [lassign {1 2 3 4 5} x y]
+        assert la-rest $rest {3 4 5}
+        assert la-x $x 1
+    }
+    bcRoundtrip bc25 $script
+} -result 5
+
+test bc.26 {linsert — compiled linsert form} -body {
+    set script $H
+    append script {
+        set L {a c d}
+        assert li-mid  [linsert $L 1 b]      {a b c d}
+        assert li-end  [linsert $L end e]     {a c d e}
+        assert li-mult [linsert $L 1 x y]     {a x y c d}
+        assert li-zero [linsert $L 0 Z]       {Z a c d}
+    }
+    bcRoundtrip bc26 $script
+} -result 4
+
+test bc.27 {unset — unsetStk instruction} -body {
+    set script $H
+    append script {
+        set a 1; set b 2; set c 3
+        unset b
+        assert uns-gone [info exists b] 0
+        assert uns-keep [info exists a] 1
+        unset -nocomplain nonexistent
+        assert uns-noerr 1 1
+        set arr(x) 1; set arr(y) 2
+        unset arr(x)
+        assert uns-arr [info exists arr(x)] 0
+        assert uns-arr2 $arr(y) 2
+    }
+    bcRoundtrip bc27 $script
+} -result 5
+
+test bc.28 {global — nsupvar to :: namespace} -body {
+    set script $H
+    append script {
+        set ::gvar28 999
+        proc read_g {} {
+            global gvar28
+            return $gvar28
+        }
+        proc write_g {v} {
+            global gvar28
+            set gvar28 $v
+        }
+        assert glob-read [read_g] 999
+        write_g 123
+        assert glob-write $::gvar28 123
+    }
+    bcRoundtrip bc28 $script
+} -result 2
+
+# =====================================================================
+# GROUP 10: Expression operators — fill instruction gaps
+# =====================================================================
+
+test bc.29 {expr: bitwise and/or/xor/not, shift} -body {
+    set script $H
+    append script {
+        assert bw-and  [expr {0xFF & 0x0F}]    15
+        assert bw-or   [expr {0xF0 | 0x0F}]    255
+        assert bw-xor  [expr {0xFF ^ 0x0F}]    240
+        assert bw-not  [expr {~0}]              -1
+        assert bw-lsh  [expr {1 << 10}]         1024
+        assert bw-rsh  [expr {1024 >> 3}]       128
+    }
+    bcRoundtrip bc29 $script
+} -result 6
+
+test bc.30 {expr: mod, expon, neg, neq} -body {
+    set script $H
+    append script {
+        assert mod  [expr {17 % 5}]     2
+        assert exp  [expr {2 ** 20}]    1048576
+        assert neg  [expr {-(42)}]      -42
+        assert neq1 [expr {3 != 4}]     1
+        assert neq0 [expr {3 != 3}]     0
+    }
+    bcRoundtrip bc30 $script
+} -result 5
+
+test bc.31 {expr: logical and/or/not — land/lor/lnot} -body {
+    set script $H
+    append script {
+        assert land1 [expr {1 && 1}]    1
+        assert land0 [expr {1 && 0}]    0
+        assert lor1  [expr {0 || 1}]    1
+        assert lor0  [expr {0 || 0}]    0
+        assert lnot0 [expr {!0}]        1
+        assert lnot1 [expr {!1}]        0
+    }
+    bcRoundtrip bc31 $script
+} -result 6
+
+# =====================================================================
+# GROUP 11: String commands — reinforce weak or indirect coverage
+# =====================================================================
+
+test bc.32 {string first/last — strfind/strrfind} -body {
+    set script $H
+    append script {
+        assert sf-hit  [string first "ll" "hello world"]  2
+        assert sf-miss [string first "zz" "hello"]       -1
+        assert sf-from [string first "l" "hello" 3]       3
+        assert sl-hit  [string last "l" "hello world"]    9
+        assert sl-miss [string last "z" "hello"]         -1
+    }
+    bcRoundtrip bc32 $script
+} -result 5
+
+test bc.33 {string replace — strreplace instruction} -body {
+    set script $H
+    append script {
+        assert sr-mid [string replace "hello" 1 3 "XY"]  "hXYo"
+        assert sr-beg [string replace "abcde" 0 1 "XY"]  "XYcde"
+        assert sr-end [string replace "abcde" 3 4 "Z"]   "abcZ"
+    }
+    bcRoundtrip bc33 $script
+} -result 3
+
+test bc.34 {string is — strclass instruction, all class types} -body {
+    set script $H
+    append script {
+        assert si-int   [string is integer "42"]     1
+        assert si-nint  [string is integer "abc"]    0
+        assert si-dbl   [string is double "3.14"]    1
+        assert si-alpha [string is alpha "hello"]    1
+        assert si-alnum [string is alnum "abc123"]   1
+        assert si-digit [string is digit "12345"]    1
+        assert si-space [string is space "  \t\n"]   1
+        assert si-lower [string is lower "hello"]    1
+        assert si-upper [string is upper "HELLO"]    1
+        assert si-bool  [string is boolean "yes"]    1
+    }
+    bcRoundtrip bc34 $script
+} -result 10
+
+test bc.35 {string repeat/reverse — Tcl 9.x compiled} -body {
+    set script $H
+    append script {
+        assert srep   [string repeat "ab" 4]     "abababab"
+        assert srev   [string reverse "Hello"]   "olleH"
+        assert srep-e [string repeat "" 100]     ""
+        assert srev-e [string reverse ""]        ""
+    }
+    bcRoundtrip bc35 $script
+} -result 4
+
+test bc.36 {string map — strmap instruction} -body {
+    set script $H
+    append script {
+        assert sm-basic [string map {a A e E} "abcde"]           "AbcdE"
+        assert sm-multi [string map {foo bar baz qux} "foobaz"]  "barqux"
+        assert sm-empty [string map {} "hello"]                  "hello"
+    }
+    bcRoundtrip bc36 $script
+} -result 3
+
+# =====================================================================
+# GROUP 12: Dict iteration — reinforce dict for/with/update
+# =====================================================================
+
+test bc.37 {dict for/with/update — dictFirst/dictNext/dictDone etc.} -body {
+    set script $H
+    append script {
+        set sum 0
+        dict for {k v} {a 10 b 20 c 30} { incr sum $v }
+        assert df-sum $sum 60
+
+        set d {name Alice age 30}
+        dict with d { set name Bob; incr age }
+        assert dw-name [dict get $d name] Bob
+        assert dw-age  [dict get $d age]  31
+
+        set d2 {x 1 y 2}
+        dict update d2 x xv y yv { incr xv 10; incr yv 20 }
+        assert du-x [dict get $d2 x] 11
+        assert du-y [dict get $d2 y] 22
+    }
+    bcRoundtrip bc37 $script
+} -result 5
+
+test bc.38 {dict append / dict lappend — dictAppend/dictLappend} -body {
+    set script $H
+    append script {
+        set d {msg hello tags {}}
+        dict append d msg " world"
+        assert da-val [dict get $d msg] "hello world"
+        dict lappend d tags first
+        dict lappend d tags second
+        assert dl-val [dict get $d tags] {first second}
+    }
+    bcRoundtrip bc38 $script
+} -result 2
+
+# =====================================================================
+# GROUP 13: OO compiled — self/next/info reinforcement
+# =====================================================================
+
+test bc.39 {self/next — tclooSelf/tclooNext} -body {
+    set script $H
+    append script {
+        oo::class create Bc39Base {
+            method tag {} { return "base" }
+        }
+        oo::class create Bc39Child {
+            superclass Bc39Base
+            method tag {} { return "child+[next]" }
+            method me {} { return [self] }
+        }
+        set o [Bc39Child new]
+        assert oo-next [$o tag] "child+base"
+        assert oo-self [string match "::oo::Obj*" [$o me]] 1
+    }
+    bcRoundtrip bc39 $script
+} -result 2
+
+test bc.40 {info object class — tclooClass instruction} -body {
+    set script $H
+    append script {
+        oo::class create Bc40C {}
+        set o [Bc40C new]
+        assert oocls [info object class $o] ::Bc40C
+    }
+    bcRoundtrip bc40 $script
+} -result 1
+
+# =====================================================================
+# GROUP 14: Coroutine patterns
+# =====================================================================
+
+test bc.41 {yield with value passing — accumulator} -body {
+    set script $H
+    append script {
+        proc accumulator {} {
+            set total 0
+            while 1 {
+                set val [yield $total]
+                incr total $val
+            }
+        }
+        coroutine acc accumulator
+        acc 0
+        acc 10
+        acc 20
+        assert yield-accum [acc 5] 35
+        rename acc ""
+    }
+    bcRoundtrip bc41 $script
+} -result 1
+
+test bc.42 {info coroutine inside coroutine body} -body {
+    set script $H
+    append script {
+        proc coro_body {} {
+            yield [info coroutine]
+        }
+        set name [coroutine mycor42 coro_body]
+        assert icoro $name ::mycor42
+    }
+    bcRoundtrip bc42 $script
+} -result 1
+
+# =====================================================================
+# GROUP 15: Remaining compiled commands
+# =====================================================================
+
+test bc.43 {format — compiled inline format} -body {
+    set script $H
+    append script {
+        assert fmt-d [format "%05d" 42]           "00042"
+        assert fmt-s [format "%-10s|" "hi"]       "hi        |"
+        assert fmt-x [format "0x%02X" 255]        "0xFF"
+        assert fmt-m [format "%s=%d" "x" 42]      "x=42"
+    }
+    bcRoundtrip bc43 $script
+} -result 4
+
+test bc.44 {regexp/regsub — compiled forms} -body {
+    set script $H
+    append script {
+        assert re-yes   [regexp {^\d+$} "12345"]                  1
+        assert re-no    [regexp {^\d+$} "abc"]                    0
+        assert re-cap   [regexp -inline {(\d+)} "abc123def"]      {123 123}
+        assert resub    [regsub -all {[aeiou]} "hello" "*"]       "h*ll*"
+    }
+    bcRoundtrip bc44 $script
+} -result 4
+
+test bc.45 {throw — compiled throw + trap} -body {
+    set script $H
+    append script {
+        proc do_throw {} {
+            try {
+                throw {MY ERROR} "test msg"
+            } trap {MY ERROR} {msg} {
+                return "trapped:$msg"
+            }
+        }
+        assert throw-trap [do_throw] "trapped:test msg"
+    }
+    bcRoundtrip bc45 $script
+} -result 1
+
+test bc.46 {variable — link to namespace var} -body {
+    set script $H
+    append script {
+        namespace eval ::bc46ns {
+            variable counter 0
+            proc bump {} {
+                variable counter
+                incr counter
+            }
+            proc get {} {
+                variable counter
+                return $counter
+            }
+        }
+        ::bc46ns::bump; ::bc46ns::bump; ::bc46ns::bump
+        assert var-link [::bc46ns::get] 3
+    }
+    bcRoundtrip bc46 $script
+} -result 1
+
+test bc.47 {lmap — compiled foreach variant} -body {
+    set script $H
+    append script {
+        set sq [lmap x {1 2 3 4 5} { expr {$x * $x} }]
+        assert lmap-sq $sq {1 4 9 16 25}
+        set even [lmap x {1 2 3 4 5 6} {
+            if {$x % 2 == 0} { set x } else { continue }
+        }]
+        assert lmap-even $even {2 4 6}
+    }
+    bcRoundtrip bc47 $script
+} -result 2
+
+test bc.48 {apply — lambda roundtrip} -body {
+    set script $H
+    append script {
+        assert app-basic [apply {{x} {expr {$x * 2}}} 21]          42
+        assert app-multi [apply {{a b} {expr {$a + $b}}} 20 22]    42
+        assert app-dflt  [apply {{x {y 10}} {expr {$x + $y}}} 5]   15
+    }
+    bcRoundtrip bc48 $script
+} -result 3
+
+test bc.49 {binary format/scan — invokeStk roundtrip} -body {
+    set script $H
+    append script {
+        set packed [binary format ii 12345 67890]
+        binary scan $packed ii a b
+        assert bin-a $a 12345
+        assert bin-b $b 67890
+    }
+    bcRoundtrip bc49 $script
+} -result 2
+
+test bc.50 {scan — invokeStk roundtrip} -body {
+    set script $H
+    append script {
+        scan "42 3.14 hello" "%d %f %s" i f s
+        assert scan-i $i     42
+        assert scan-f [format "%.2f" $f] 3.14
+        assert scan-s $s     hello
+    }
+    bcRoundtrip bc50 $script
+} -result 3
+
+cleanupTests

@@ -83,6 +83,4 @@ test dump.7 {dump with AuxData} -body {
     expr {[string match "*umptable*" $d] || [string match "*ux*" $d]}
 } -result 1
 
-
-
 cleanupTests

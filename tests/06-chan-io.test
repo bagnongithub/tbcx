@@ -93,6 +93,4 @@ test io.9 {save large inline script} -body {
     tbcx::load $out
 } -result 5050
 
-
-
 cleanupTests

@@ -91,6 +91,4 @@ test interp.6 {child interps isolated} -body {
     list $r1 $r2
 } -result {alpha beta}
 
-
-
 cleanupTests

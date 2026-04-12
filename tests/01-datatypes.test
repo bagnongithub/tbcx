@@ -247,6 +247,4 @@ test literal.28 {LIT: multiple lambdas} -body {
     tbcx::load $out
 } -result {7 12}
 
-
-
 cleanupTests

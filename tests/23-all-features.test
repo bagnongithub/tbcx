@@ -802,4 +802,3 @@ test af.28 {complex: data pipeline with list/dict/lmap} -body {
 } -result 2
 
 cleanupTests
-

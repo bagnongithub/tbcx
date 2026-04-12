@@ -1,19 +1,6 @@
 # -*-Tcl-*-
-# 24-security-regression.test — Regression tests for findings 1–8
+# 24-security-regression.test
 #
-# These tests verify that the fixes for the 8 confirmed findings in the
-# tbcx code analysis report are effective and that the library rejects
-# malformed or adversarial input correctly.
-#
-# Finding 1: Untrusted wire identifiers with embedded NUL / relative ns
-# Finding 2: Save-side TCL_STRING_KEYS NUL truncation
-# Finding 3: FqnUnder strict contract
-# Finding 4: Tcl_Size drift (verified implicitly by large-script tests)
-# Finding 5: Checked-multiply (verified by stress tests)
-# Finding 6: snprintf replacement (verified implicitly by method key tests)
-# Finding 7: Numeric conversion return codes
-# Finding 8: Safe interpreter documentation/behavior
-
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

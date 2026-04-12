@@ -234,6 +234,4 @@ test exc.14 {break within try in loop} -body {
     tbcx::load $out
 } -result {1 2}
 
-
-
 cleanupTests
