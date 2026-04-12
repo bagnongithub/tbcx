@@ -2327,6 +2327,7 @@ static unsigned char tbcxOpMap[256];
 static int           tbcxOpMapReady    = 0;
 static unsigned char tbcxOpStartCmd    = 0; /* opcode for startCommand */
 static unsigned char tbcxOpNop         = 0; /* opcode for nop */
+static unsigned char tbcxOpJump1       = 0; /* opcode for jump1 (2-byte short jump) */
 static unsigned char tbcxStartCmdBytes = 0; /* numBytes for startCommand */
 
 static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
@@ -2543,7 +2544,7 @@ static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *pha
                 break;
             }
         }
-        /* Cache startCommand and nop opcodes for stripping */
+        /* Cache startCommand, nop, and jump1 opcodes for stripping */
         for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
             const char *nm = instTable[i].name;
             if (!nm)
@@ -2553,6 +2554,8 @@ static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *pha
                 tbcxStartCmdBytes = (unsigned char)instTable[i].numBytes;
             } else if (InstrIs(nm, "nop")) {
                 tbcxOpNop = (unsigned char)i;
+            } else if (strcmp(nm, "jump1") == 0 && instTable[i].numBytes == 2) {
+                tbcxOpJump1 = (unsigned char)i;
             }
         }
         tbcxOpMapReady = 1;
@@ -2900,7 +2903,7 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
         return;
     }
 
-    /* Ensure startCommand/nop opcodes are resolved before first use.
+    /* Ensure startCommand/nop/jump1 opcodes are resolved before first use.
        The full opmap is lazily built by InstrScanBodyLiterals, but we
        need tbcxOpStartCmd before the code write (which precedes the scan). */
     if (tbcxOpStartCmd == 0 && !tbcxOpMapReady) {
@@ -2914,6 +2917,8 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
                 tbcxStartCmdBytes = (unsigned char)it[i].numBytes;
             } else if (nm[0] == 'n' && InstrIs(nm, "nop")) {
                 tbcxOpNop = (unsigned char)i;
+            } else if (nm[0] == 'j' && strcmp(nm, "jump1") == 0 && it[i].numBytes == 2) {
+                tbcxOpJump1 = (unsigned char)i;
             }
         }
     }
@@ -2970,9 +2975,23 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
         const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
         unsigned char         *stripped  = (unsigned char *)Tcl_Alloc((size_t)bc->numCodeBytes);
         memcpy(stripped, bc->codeStart, (size_t)bc->numCodeBytes);
+
+        /* Replace each startCommand with jump1 + nop padding.
+           startCommand is a single multi-byte instruction, so no jump target
+           can land inside it — safe to overwrite all bytes.  The jump1
+           skips the entire region in 1 dispatch cycle.  Original standalone
+           nops are left untouched because they ARE individual instructions
+           and jump targets may land on any of them. */
         for (Tcl_Size pc = 0; pc + tbcxStartCmdBytes <= bc->numCodeBytes;) {
             if (stripped[pc] == tbcxOpStartCmd) {
-                memset(&stripped[pc], tbcxOpNop, tbcxStartCmdBytes);
+                if (tbcxOpJump1 != 0 && tbcxStartCmdBytes >= 2) {
+                    stripped[pc]     = tbcxOpJump1;
+                    stripped[pc + 1] = (unsigned char)tbcxStartCmdBytes;
+                    if (tbcxStartCmdBytes > 2)
+                        memset(&stripped[pc + 2], tbcxOpNop, tbcxStartCmdBytes - 2);
+                } else {
+                    memset(&stripped[pc], tbcxOpNop, tbcxStartCmdBytes);
+                }
                 pc += tbcxStartCmdBytes;
             } else if (stripped[pc] <= LAST_INST_OPCODE) {
                 pc += instTable[stripped[pc]].numBytes;
@@ -2980,6 +2999,7 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
                 pc++;
             }
         }
+
         W_Bytes(w, stripped, (size_t)bc->numCodeBytes);
         Tcl_Free((char *)stripped);
     } else {
