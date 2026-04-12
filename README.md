@@ -2,7 +2,7 @@
 
 TBCX is a C extension for the **Tcl 9.1 family** that **serializes** compiled Tcl bytecode (plus enough metadata to reconstruct `proc`s, TclOO methods, and **lambda constructs**) into a compact `.tbcx` file — and later **loads** that file into another interpreter for fast startup without re‑parsing or re‑compiling the original source. There's also a **disassembler** for human‑readable inspection.
 
-> Status: draft implementation; interfaces are still evolving. We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout. Artifacts require an exact Tcl major/minor match at load time; 9.2+ artifacts are not accepted by a 9.1 loader and vice versa.
+> Status: production release (v1.1). We optimize for **simplicity** (no backward compatibility guarantees yet) and strict **Tcl 9.1** compliance throughout. Artifacts require an exact Tcl major/minor match at load time; 9.2+ artifacts are not accepted by a 9.1 loader and vice versa.
 
 For versions prior to Tcl 9.1, please check
 
@@ -46,6 +46,7 @@ puts [tbcx::dump ./hello.tbcx]
   - **Unpushed literal detection** (Phase 2): identifies dead-reference body literals from Tcl 9.1's inline-compiled `foreach`/`lmap` loops (compiled to `foreach_start` opcodes) and precompiles them
   - **O(1) opcode dispatch**: instruction scanner uses a 256-entry `opMap[]` lookup table covering all 120 Tcl 9.1 instruction types, replacing per-instruction string comparisons
   - **Bytearray detection**: strings with bytes ≥ 0x80 are probed and emitted as `TBCX_LIT_BYTEARR` to avoid UTF-8 encoding corruption on round-trip
+  - **`startCommand` stripping**: at save time, `startCommand` debugging instructions (~15% of bytecode) are replaced with `nop` bytes, reducing execution overhead while preserving jump offsets and exception ranges
   - **Cross-interpreter support**: body literals are emitted as `TBCX_LIT_BYTESRC` (bytecode + preserved source text); loaded with `setPrecompiled=0` so Tcl can gracefully recompile from source in child interpreters or after epoch bumps
 - **Load**: Read a `.tbcx`, reconstruct precompiled procs, method bodies, and literal lambdas, then execute the top-level block with `TCL_EVAL_GLOBAL`. Class creation, namespace setup, and other top-level effects happen naturally when the rewritten script runs — with source-equivalent semantics.
 - **Dump**: Pretty-print / disassemble `.tbcx` contents (header, literals, AuxData summaries, exception ranges, full instruction streams).
@@ -102,6 +103,7 @@ Explicitly purge stale entries from the per‑interpreter lambda shimmer‑recov
 - **Capture and rewrite**: `CaptureAndRewriteScript` walks the script's token tree once, extracting `proc`, `namespace eval`, `oo::class create`, `oo::define` (method/constructor/destructor/self method), and `oo::objdefine` forms. It simultaneously produces a **rewritten** script where captured method/constructor/destructor bodies are replaced with indexed stubs, ensuring the top-level bytecode doesn't redundantly contain their full source.
 - **Namespace body scanning**: The rewritten script and captured definition bodies are scanned (`ScanScriptBodiesRec`) for nested script-body patterns — `namespace eval`, `try`/`on`/`trap`/`finally`, `foreach`, `while`, `for`, `catch`, `if`/`elseif`/`else`, `uplevel`, `eval`, `dict for`/`map`/`update`/`with`, `lsort -command` — building a mapping from body text to namespace FQN.
 - **Pre‑compilation**: Matched namespace eval body literals in the top-level literal pool are compiled into a **side table** (never modifying the pool itself) so they serialize as bytecode rather than source text.
+  - Strips `startCommand` debugging instructions from all compiled blocks (replaced with `nop` bytes for ~15% leaner execution).
 - **Instruction scanning** (`InstrScanBodyLiterals`): Two-phase bytecode analysis runs on each compiled block:
   - **Phase 1** (invokeStk analysis): Models the operand stack using a 256-entry `opMap[]` dispatch table (built once per call from instruction names, O(1) per instruction). Tracks literal indices through `push`/`loadStk`/`storeStk`/`swap` etc. to identify which literal is the command argument for each `invokeStk` call. Marks body literals for `eval`, `try`/`on`/`trap`/`finally`, `catch`, `foreach`, `while`, `for`, `if`, `uplevel`, `time`, `timerate`, `dict for`/`map`/`update`/`with` (including FQN `::tcl::dict::*`), and `self method`.
   - **Phase 2** (unpushed literal detection): For blocks containing `foreach_start` opcodes, identifies literal pool entries that are never referenced by any `push` instruction — these are dead body-text references kept by Tcl's compiler for error reporting. Marks them for precompilation via `LooksLikeScriptBody()` filtering.
@@ -199,7 +201,7 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 - **Functional equivalence**: `tbcx::load` aims to be *functionally identical* to `source` of the original script. Differences are limited to avoiding re‑parse/re‑compile time.
 - **Namespaces**: The top-level block is executed with `TCL_EVAL_GLOBAL`. Saved blocks carry namespace metadata to bind compiled code correctly. Lambda literals that include a namespace element keep that association.
 - **Version check**: The loader requires an exact major.minor Tcl version match (e.g. 9.1). Bytecode instruction semantics can change between minor versions.
-- **Sanity limits**: Code ≤ 1 GiB; literal/AuxData/exception pools ≤ 64M entries; LPString ≤ 16 MiB; output ≤ 256 MB; recursion depth ≤ 64.
+- **Sanity limits**: Code ≤ 64 MiB; literal/AuxData/exception pools ≤ 1M entries; LPString ≤ 4 MiB; output ≤ 256 MB; recursion depth ≤ 64.
 
 ---
 
@@ -207,7 +209,7 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 
 This package uses **Tcl 9.1** APIs and selected internals (e.g., `tclInt.h`, `tclCompile.h`).
 You'll need Tcl 9.1 headers/libs on your include path and to build as a standard loadable extension.
-The entry point `tbcx_Init` registers commands and provides `tbcx 1.0`.
+The entry point `tbcx_Init` registers commands and provides `tbcx 1.1`.
 The safe entry point `tbcx_SafeInit` provides the package and type infrastructure but registers **no commands**; use `interp alias` or `interp expose` from a parent interpreter to grant selective access.
 
 Example (TEA Linux/macOS):
@@ -256,7 +258,7 @@ Given the reliance on Tcl internals, please include **Tcl 9.1** details (commit/
 
 ## License
 
-MIT License. Copyright © 2025 Miguel Bañón.
+MIT License. Copyright © 2025–2026 Miguel Bañón.
 
 ---
 

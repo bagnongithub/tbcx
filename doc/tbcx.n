@@ -1,4 +1,4 @@
-.TH tbcx 3 "Mar 13, 2026" "tbcx 1.0" "Tcl Bytecode eXchange"
+.TH tbcx 3 "Apr 12, 2026" "tbcx 1.1" "Tcl Bytecode eXchange"
 .SH NAME
 tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.
 .SH SYNOPSIS
@@ -62,6 +62,8 @@ producing a rewritten script with method bodies replaced by stubs.
 Pre\-compiles namespace eval body literals and other script\-body patterns (\fBtry\fR/\fBon\fR/\fBtrap\fR/\fBfinally\fR, \fBforeach\fR, \fBlmap\fR, \fBwhile\fR, \fBfor\fR, \fBcatch\fR, \fBif\fR/\fBelseif\fR/\fBelse\fR, \fBeval\fR, \fBuplevel\fR, \fBtime\fR, \fBtimerate\fR, \fBdict for\fR/\fBmap\fR/\fBupdate\fR/\fBwith\fR, \fBlsort \-command\fR, and \fBself method\fR bodies inside \fBoo::define\fR).
 .IP \(bu 2
 Performs two\-phase instruction\-level body detection: Phase 1 analyzes \fBinvokeStk\fR operand stack patterns to find body arguments; Phase 2 identifies unpushed literals from inline\-compiled \fBforeach\fR/\fBlmap\fR loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instruction types.
+.IP \(bu 2
+Strips \fBstartCommand\fR debugging instructions from all compiled blocks, replacing them with \fBnop\fR bytes for ~15% leaner bytecode execution.
 .IP \(bu 2
 Detects bytearray literals (bytes \[>=] 0x80) and emits them as \fBTBCX_LIT_BYTEARR\fR to prevent UTF\-8 corruption.
 .IP \(bu 2
@@ -331,8 +333,8 @@ registry remains per\-interpreter.
 
 .SH LIMITS
 .PP
-Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
-string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
+Sanity caps exist for code size (64 MiB), literal/AuxData/exception counts (1M each),
+string lengths (4 MiB), total serialized output (256 MB), serialization recursion depth (64),
 total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
 Exceeding any limit produces an error.
 .PP
@@ -356,6 +358,6 @@ grant selective access.
 source(n), TclOO(n)
 
 .SH COPYRIGHT
-\[co] 2025 Miguel Banon
+\[co] 2025-2026 Miguel Banon
 
 MIT License.
