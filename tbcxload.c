@@ -119,10 +119,10 @@ typedef struct {
  * (formerly the process-global tbcxHiddenId). */
 typedef struct {
     Tcl_Interp *interp;
-    ApplyShim   apply;        /* embedded — no separate heap allocation */
-    int         applyActive;  /* 1 once the [apply] shim has been installed */
-    Tcl_Size    loadDepth;    /* reentrancy depth for tbcx::load */
-    uint64_t    nextHiddenId; /* per-interp OO shim rename counter */
+    ApplyShim   apply;          /* embedded — no separate heap allocation */
+    int         applyActive;    /* 1 once the [apply] shim has been installed */
+    Tcl_Size    loadDepth;      /* reentrancy depth for tbcx::load */
+    uint64_t    nextHiddenId;   /* per-interp OO shim rename counter */
 } TbcxInterpState;
 
 typedef struct {
@@ -191,15 +191,15 @@ void               TbcxApplyShimPurgeAll(Tcl_Interp *ip);
 static ByteCode   *TbcxByteCode(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr, const TBCX_CompileEnvMin *env, int setPrecompiled);
 static void        TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr);
 static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip);
-static void             TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
-static void             TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
-static void             TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
+static void        TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
+static void        TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
+static void        TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
 
 /* ==========================================================================
  * Buffered Read I/O & Utilities
  * ========================================================================== */
 
-static inline void      R_Error(TbcxIn *r, const char *msg) {
+static inline void R_Error(TbcxIn *r, const char *msg) {
     if (r->err == TCL_OK) {
         Tcl_SetObjResult(r->interp, Tcl_NewStringObj(msg, -1));
         r->err = TCL_ERROR;
@@ -855,7 +855,7 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             Tcl_IncrRefCount(unexpSub);
             for (Tcl_Size ui = 0; ui < uLen; ui++) {
                 Tcl_Obj *av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
-                rc             = Tcl_EvalObjv(ip, 4, av, 0);
+                rc = Tcl_EvalObjv(ip, 4, av, 0);
                 if (rc != TCL_OK) {
                     break;
                 }
@@ -1346,7 +1346,7 @@ objdefine_forward:
     if (isBuilderForm && rc == TCL_OK) {
         int patchRc = PrecompClass(ip, os, objFqn);
         if (patchRc != TCL_OK) {
-            rc = patchRc; /* preserve PrecompClass() error/result */
+            rc = patchRc;   /* preserve PrecompClass() error/result */
         }
     }
 
@@ -3739,6 +3739,7 @@ static void ApplyShimPurgeStale(ApplyShim *as) {
  * ========================================================================== */
 
 void TbcxApplyShimPurgeAll(Tcl_Interp *ip) {
+    TBCX_ASSERT_INTERP_THREAD(ip);
     TbcxInterpState *st = (TbcxInterpState *)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
     if (st && st->applyActive)
         ApplyShimPurgeStale(&st->apply);
@@ -4140,7 +4141,8 @@ static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
 static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
     TbcxInterpState *st = TbcxGetInterpState(ip);
     if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH) {
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d", st->loadDepth, TBCX_MAX_LOAD_DEPTH));
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d",
+                                            st->loadDepth, TBCX_MAX_LOAD_DEPTH));
         return TCL_ERROR;
     }
     st->loadDepth++;
@@ -4341,7 +4343,7 @@ cleanup:
  * ========================================================================== */
 
 int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
-    TBCX_ASSERT_INTERP_THREAD(interp);
+    TBCX_CHECK_INTERP_THREAD(interp);
     if (objc != 2) {
         Tcl_WrongNumArgs(interp, 1, objv, "in");
         return TCL_ERROR;

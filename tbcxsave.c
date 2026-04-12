@@ -2331,10 +2331,11 @@ static unsigned char tbcxOpNop         = 0; /* opcode for nop */
 static unsigned char tbcxOpJump1       = 0; /* opcode for jump1 (2-byte short jump) */
 static unsigned char tbcxStartCmdBytes = 0; /* numBytes for startCommand */
 
-/* TbcxSaveInitOpcodes — one-time opcode map initialization.
+/* TbcxSaveInitOpcodesLocked — one-time opcode map initialization.
  * Called from TbcxInitTypes() inside the type-init mutex, before the
- * tbcxTypesLoaded flag is published.  Must NOT be called concurrently. */
-void                 TbcxSaveInitOpcodes(void) {
+ * tbcxTypesLoaded flag is published.  Must NOT be called concurrently.
+ * Not declared in tbcx.h — only accessible via file-local extern in tbcx.c. */
+void TbcxSaveInitOpcodesLocked(void) {
     if (tbcxOpMapReady)
         return;
 
@@ -2349,7 +2350,9 @@ void                 TbcxSaveInitOpcodes(void) {
         switch (nm[0]) {
         case 'p':
             if (InstrIs(nm, "push")) {
-                tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP : nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH : OP_PUSH1_NOPOP);
+                tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP :
+                                    nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH
+                                                                                           : OP_PUSH1_NOPOP);
             } else if (InstrIs(nm, "pop"))
                 tbcxOpMap[i] = OP_POP;
             break;
@@ -2403,9 +2406,9 @@ void                 TbcxSaveInitOpcodes(void) {
                 tbcxOpMap[i] = OP_STRCAT_N;
             else if (InstrIs(nm, "swap"))
                 tbcxOpMap[i] = OP_SWAP;
-            else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") || InstrIs(nm, "strfind") ||
-                     InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") || InstrIs(nm, "strcaseUpper") ||
-                     InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
+            else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") ||
+                     InstrIs(nm, "strfind") || InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") ||
+                     InstrIs(nm, "strcaseUpper") || InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
                 tbcxOpMap[i] = OP_ARITH;
             break;
         case 'a':
@@ -2552,7 +2555,7 @@ void                 TbcxSaveInitOpcodes(void) {
     tbcxOpMapReady = 1;
 }
 
-static void InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
+static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
     if (!bc || !ctx || !ctx->instrBodyInit)
         return;
     if (!bc->codeStart || bc->numCodeBytes <= 0)
@@ -2569,7 +2572,7 @@ static void InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks)
        are never pushed are "dead references" -- source text kept for error
        reporting by Tcl's compiler for inline-compiled bodies (foreach,
        while, for, lmap, dict for).  These should also be precompiled. */
-    char                  *pushed    = NULL;
+    char *pushed = NULL;
     if (numLits <= 4096) {
         pushed = (char *)Tcl_Alloc((size_t)numLits);
         memset(pushed, 0, (size_t)numLits);
@@ -5514,7 +5517,7 @@ int Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj) {
  * ========================================================================== */
 
 int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
-    TBCX_ASSERT_INTERP_THREAD(interp);
+    TBCX_CHECK_INTERP_THREAD(interp);
     if (objc != 3) {
         Tcl_WrongNumArgs(interp, 1, objv, "in out");
         return TCL_ERROR;

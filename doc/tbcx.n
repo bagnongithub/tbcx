@@ -326,10 +326,24 @@ metaclasses with \fBself method\fR, and \fBnext\fR\-based constructor chaining.
 
 .SH MULTI\-INTERPRETER AND THREAD SUPPORT
 .PP
+TBCX follows Tcl's standard threading model: only the thread that created
+an interpreter may call
+.BR tbcx::save ,
+.BR tbcx::load ,
+.BR tbcx::dump ,
+or
+.B tbcx::gc
+on that interpreter.  Multi\-thread support means multiple independent
+interpreters, each used by its owning thread \(em not sharing one
+interpreter across threads.  Calling a TBCX command from a non\-owning
+thread returns
+.B TCL_ERROR
+with a diagnostic message.
+.PP
 Artifacts are designed to load into interpreters other than the
-originating one. The bundled tests cover child interpreters and threaded
-scenarios. Interpreter\-specific state such as the ApplyShim lambda
-registry remains per\-interpreter.
+originating one.  Interpreter\-specific state (ApplyShim lambda registry,
+load depth, OO shim hidden\-ID counter) remains strictly per\-interpreter
+and is cleaned up automatically when the interpreter is deleted.
 
 .SH LIMITS
 .PP

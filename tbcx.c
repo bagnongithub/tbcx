@@ -62,6 +62,10 @@ extern int                Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp
 extern int                Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 extern int                Tbcx_GcObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 
+/* Internal init helper — called exactly once from TbcxInitTypes() under
+ * tbcxTypeMutex.  Not exposed in tbcx.h to prevent unprotected calls. */
+extern void               TbcxSaveInitOpcodesLocked(void);
+
 /* ==========================================================================
  * Forward Declarations
  * ========================================================================== */
@@ -85,7 +89,7 @@ DLLEXPORT int             tbcx_Init(Tcl_Interp *interp);
  * ========================================================================== */
 
 int                       Tbcx_GcObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
-    TBCX_ASSERT_INTERP_THREAD(interp);
+    TBCX_CHECK_INTERP_THREAD(interp);
     if (objc != 1) {
         Tcl_WrongNumArgs(interp, 1, objv, "");
         return TCL_ERROR;
@@ -257,7 +261,7 @@ static int TbcxInitTypes(Tcl_Interp *interp) {
 
     /* Publish: all type pointer stores above must be visible to any
      * thread that subsequently observes tbcxTypesLoaded == 1. */
-    TbcxSaveInitOpcodes();
+    TbcxSaveInitOpcodesLocked();
     atomic_store_explicit(&tbcxTypesLoaded, 1, memory_order_release);
 
     Tcl_MutexUnlock(&tbcxTypeMutex);
