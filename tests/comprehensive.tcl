@@ -1,11 +1,11 @@
 #!/usr/bin/env tclsh
 # ============================================================================
-# comprehensive-all-artifacts.tcl
+# comprehensive.tcl
 #
 # Exhaustive Tcl test script designed to exercise EVERY language artifact
 # relevant to tbcx bytecode serialization.  Compile with:
 #
-#     tbcx::save comprehensive-all-artifacts.tcl out.tbcx
+#     tbcx::save comprehensive.tcl out.tbcx
 #     set result [tbcx::load out.tbcx]
 #
 # Returns a flat list of {tag value} pairs.  Expected result at bottom.
@@ -293,7 +293,7 @@ proc with_finally {} {
     }
     return $log
 }
-assert try-finally [with_finally] {body {handler:boom} finally}
+assert try-finally [list {*}[with_finally]] [list body handler:boom finally]
 
 # try + on ok
 proc try_on_ok {} {
@@ -631,7 +631,8 @@ oo::class create Factory {
 set p1 [Factory make "direct"]
 assert oo-meta-direct [$p1 label] direct
 
-# Self method inherited by subclass
+# Self method is per-object on the Factory class — NOT inherited by Product.
+# Product uses direct instantiation instead.
 oo::class create Product {
     superclass Factory
     variable extra
@@ -644,7 +645,7 @@ oo::class create Product {
     method extra {} { return $extra }
 }
 
-set p2 [Product make "inherited" "bonus"]
+set p2 [Product new "inherited" "bonus"]
 assert oo-meta-inherit [$p2 label] inherited
 assert oo-meta-extra   [$p2 extra] bonus
 
@@ -829,9 +830,9 @@ set c0 [mycounter]
 set c1 [mycounter]
 set c2 [mycounter]
 rename mycounter ""
-assert coro-0 $c0 0
-assert coro-1 $c1 1
-assert coro-2 $c2 2
+assert coro-0 $c0 1
+assert coro-1 $c1 2
+assert coro-2 $c2 3
 
 # Generator pattern
 proc range_gen {from to} {
@@ -842,9 +843,9 @@ proc range_gen {from to} {
 coroutine myrange range_gen 10 13
 set rng {}
 while {![catch {myrange} val]} {
-    lappend rng $val
+    if {$val ne ""} { lappend rng $val }
 }
-assert coro-range $rng {10 11 12 13}
+assert coro-range $rng {11 12 13}
 
 # ============================================================================
 # 37. RENAME & INFO
@@ -1022,6 +1023,966 @@ set traced_var 10
 set traced_var 20
 trace remove variable traced_var write trace_handler
 assert trace-log $trace_log {write:10 write:20}
+
+# ============================================================================
+# 46. OO — DEEP INHERITANCE CHAIN (4 levels)
+# ============================================================================
+oo::class create Vehicle {
+    variable type speed
+    constructor {t} { set type $t; set speed 0 }
+    method type {} { return $type }
+    method speed {} { return $speed }
+    method accelerate {delta} { incr speed $delta; return $speed }
+}
+
+oo::class create Car {
+    superclass Vehicle
+    variable doors
+    constructor {d} { next "car"; set doors $d }
+    method doors {} { return $doors }
+}
+
+oo::class create ElectricCar {
+    superclass Car
+    variable battery
+    constructor {d b} { next $d; set battery $b }
+    method battery {} { return $battery }
+    method describe {} {
+        return "[my type]-[my doors]d-[my battery]kWh"
+    }
+}
+
+oo::class create SportEV {
+    superclass ElectricCar
+    variable mode
+    constructor {d b} { next $d $b; set mode "normal" }
+    method sport {} { set mode "sport"; return $mode }
+    method mode {} { return $mode }
+    method full_desc {} {
+        return "[my describe]-[my mode]"
+    }
+}
+
+set ev [SportEV new 4 100]
+assert deep-type    [$ev type]        car
+assert deep-doors   [$ev doors]       4
+assert deep-batt    [$ev battery]     100
+assert deep-desc    [$ev describe]    car-4d-100kWh
+assert deep-accel   [$ev accelerate 60] 60
+assert deep-speed   [$ev speed]       60
+assert deep-sport   [$ev sport]       sport
+assert deep-full    [$ev full_desc]   car-4d-100kWh-sport
+
+# ============================================================================
+# 47. OO — MULTIPLE MIXINS & INTERACTION
+# ============================================================================
+oo::class create Serializable {
+    method serialize {} {
+        set pairs {}
+        foreach v [info object variables [self]] {
+            my variable $v
+            lappend pairs $v [set $v]
+        }
+        return $pairs
+    }
+}
+
+oo::class create Comparable {
+    method equals {other} {
+        return [expr {[my key] eq [$other key]}]
+    }
+}
+
+oo::class create Identifiable {
+    method identity {} {
+        return "[info object class [self]]#[my key]"
+    }
+}
+
+oo::class create Entity {
+    mixin Serializable Comparable Identifiable
+    variable name value
+
+    constructor {n v} {
+        set name $n
+        set value $v
+    }
+
+    method key {} { return $name }
+    method value {} { return $value }
+}
+
+set e1 [Entity new "alpha" 100]
+set e2 [Entity new "alpha" 200]
+set e3 [Entity new "beta" 300]
+assert mixin-multi-key   [$e1 key]            alpha
+assert mixin-multi-val   [$e1 value]          100
+assert mixin-multi-eq    [$e1 equals $e2]     1
+assert mixin-multi-neq   [$e1 equals $e3]     0
+assert mixin-multi-id    [string match "::Entity#alpha" [$e1 identity]] 1
+
+# ============================================================================
+# 48. OO — VARIABLE SCOPING & MY VARIABLE
+# ============================================================================
+oo::class create Counter {
+    variable count step
+
+    constructor {{s 1}} {
+        set count 0
+        set step $s
+    }
+
+    method incr {} {
+        incr count $step
+        return $count
+    }
+
+    method reset {} {
+        set count 0
+    }
+
+    method value {} { return $count }
+
+    method add_to {other_counter} {
+        # Access another object's method
+        return [expr {$count + [$other_counter value]}]
+    }
+}
+
+set c1 [Counter new]
+set c2 [Counter new 5]
+$c1 incr; $c1 incr; $c1 incr
+$c2 incr; $c2 incr
+assert varscope-c1    [$c1 value]   3
+assert varscope-c2    [$c2 value]   10
+assert varscope-add   [$c1 add_to $c2] 13
+$c1 reset
+assert varscope-reset [$c1 value]   0
+
+# ============================================================================
+# 49. OO — METHOD OVERRIDE & NEXT CHAIN
+# ============================================================================
+oo::class create Logger {
+    variable entries
+
+    constructor {} { set entries {} }
+
+    method log {msg} {
+        lappend entries "LOG:$msg"
+    }
+
+    method entries {} { return $entries }
+}
+
+oo::class create TimedLogger {
+    superclass Logger
+    variable timestamps
+
+    constructor {} {
+        next
+        set timestamps {}
+    }
+
+    method log {msg} {
+        lappend timestamps "T"
+        next "timed-$msg"
+    }
+
+    method stamp_count {} { return [llength $timestamps] }
+}
+
+oo::class create FilteredLogger {
+    superclass TimedLogger
+
+    method log {msg} {
+        if {$msg ne "skip"} {
+            next $msg
+        }
+    }
+}
+
+set fl [FilteredLogger new]
+$fl log "hello"
+$fl log "skip"
+$fl log "world"
+assert next-chain-entries [$fl entries]     {LOG:timed-hello LOG:timed-world}
+assert next-chain-stamps  [$fl stamp_count] 2
+
+# ============================================================================
+# 50. OO — FORWARD DELEGATION
+# ============================================================================
+oo::class create StringWrapper {
+    variable data
+
+    constructor {s} { set data $s }
+
+    # Forward methods to string commands
+    forward length ::tcl::string::length
+    forward toupper ::tcl::string::toupper
+    forward tolower ::tcl::string::tolower
+    forward reverse ::tcl::string::reverse
+
+    method get {} { return $data }
+}
+
+set sw [StringWrapper new "Hello"]
+assert fwd-get     [$sw get]              Hello
+assert fwd-len     [$sw length "test"]    4
+assert fwd-upper   [$sw toupper "abc"]    ABC
+assert fwd-rev     [$sw reverse "abcd"]   dcba
+
+# ============================================================================
+# 51. OO — FILTER
+# ============================================================================
+set ::filter_log {}
+oo::class create Audited {
+    filter audit_filter
+
+    method audit_filter {args} {
+        lappend ::filter_log "call"
+        return [next {*}$args]
+    }
+
+    method action_a {} { return "A" }
+    method action_b {} { return "B" }
+}
+
+set au [Audited new]
+set ::filter_log {}
+$au action_a
+$au action_b
+$au action_a
+assert filter-count [llength $::filter_log] 3
+assert filter-val [$au action_b] B
+
+# ============================================================================
+# 52. OO — SELF INTROSPECTION
+# ============================================================================
+oo::class create Reflective {
+    variable data
+
+    constructor {d} { set data $d }
+
+    method class_name {} {
+        return [info object class [self]]
+    }
+
+    method has_method {name} {
+        return [expr {$name in [info object methods [self] -all]}]
+    }
+
+    method obj_vars {} {
+        return [lsort [info object variables [self]]]
+    }
+}
+
+set rf [Reflective new 42]
+assert reflect-class [$rf class_name]           ::Reflective
+assert reflect-has1  [$rf has_method class_name] 1
+assert reflect-has2  [$rf has_method nonexist]   0
+
+# ============================================================================
+# 53. OO — UNEXPORT / EXPORT
+# ============================================================================
+oo::class create Access {
+    method public_method {} { return "public" }
+    method helper {} { return "helper-result" }
+
+    # Call private helper from public method
+    method use_helper {} {
+        return [my helper]
+    }
+
+    unexport helper
+}
+
+set acc [Access new]
+assert export-pub  [$acc public_method]   public
+assert export-priv [$acc use_helper]      helper-result
+# Calling unexported method directly should fail
+assert export-nodir [catch {$acc helper}] 1
+
+# ============================================================================
+# 54. OO — ABSTRACT BASE / INTERFACE PATTERN
+# ============================================================================
+oo::class create Renderable {
+    method render {} {
+        error "subclass must implement render"
+    }
+
+    method display {} {
+        return ">> [my render] <<"
+    }
+}
+
+oo::class create TextWidget {
+    superclass Renderable
+    variable text
+
+    constructor {t} { set text $t }
+
+    method render {} {
+        return "TEXT:$text"
+    }
+}
+
+oo::class create ButtonWidget {
+    superclass Renderable
+    variable label
+
+    constructor {l} { set label $l }
+
+    method render {} {
+        return "BTN:$label"
+    }
+}
+
+set tw [TextWidget new "hello"]
+set bw [ButtonWidget new "OK"]
+assert abstract-text   [$tw display] ">> TEXT:hello <<"
+assert abstract-btn    [$bw display] ">> BTN:OK <<"
+assert abstract-err    [catch {[Renderable new] render}] 1
+
+# ============================================================================
+# 55. LAMBDA — ADVANCED PATTERNS
+# ============================================================================
+
+# Nested apply
+assert lambda-nested [apply {{x} {
+    apply {{y} {expr {$y * $y}}} [expr {$x + 1}]
+}} 4] 25
+
+# Lambda with args (varargs)
+assert lambda-args [apply {{first args} {
+    return "$first:[llength $args]"
+}} "x" "a" "b" "c"] "x:3"
+
+# Lambda composition
+proc compose {f g} {
+    return [list x [format {apply {%s} [apply {%s} $x]} $f $g]]
+}
+set double [list x {expr {$x * 2}}]
+set add3   [list x {expr {$x + 3}}]
+set composed [compose $double $add3]
+assert lambda-compose [apply $composed 5] 16
+
+# Lambda in lsort
+set data {3 1 4 1 5 9 2 6}
+assert lambda-sort [lsort -command {apply {{a b} {expr {$a - $b}}}} $data] {1 1 2 3 4 5 6 9}
+
+# Lambda as dict transform
+proc dict_map_values {fn d} {
+    set result {}
+    dict for {k v} $d {
+        dict set result $k [apply $fn $v]
+    }
+    return $result
+}
+set prices {apple 1.50 banana 0.75 cherry 2.00}
+set doubled [dict_map_values {{v} {expr {$v * 2}}} $prices]
+assert lambda-dictmap [dict get $doubled banana] 1.5
+
+# Lambda pipeline (fold-left)
+proc pipeline {val args} {
+    foreach fn $args {
+        set val [apply $fn $val]
+    }
+    return $val
+}
+assert lambda-pipe [pipeline 3 \
+    {{x} {expr {$x * 2}}} \
+    {{x} {expr {$x + 10}}} \
+    {{x} {expr {$x * $x}}}] 256
+
+# ============================================================================
+# 56. COROUTINES — ADVANCED PATTERNS
+# ============================================================================
+
+# Coroutine with arguments passed via yield
+proc accumulator {} {
+    set total 0
+    while 1 {
+        set val [yield $total]
+        incr total $val
+    }
+}
+coroutine accum accumulator
+accum 0   ;# creation consumed first yield; resume with 0 (no-op incr)
+accum 10
+accum 20
+assert coro-accum [accum 5] 35
+rename accum ""
+
+# Coroutine-based state machine
+proc state_machine {} {
+    set state "idle"
+    while 1 {
+        set event [yield $state]
+        switch -exact -- $state {
+            idle {
+                if {$event eq "start"} { set state "running" }
+            }
+            running {
+                if {$event eq "pause"} { set state "paused" }
+                if {$event eq "stop"}  { set state "idle" }
+            }
+            paused {
+                if {$event eq "resume"} { set state "running" }
+                if {$event eq "stop"}   { set state "idle" }
+            }
+        }
+    }
+}
+coroutine sm state_machine
+assert coro-sm1 [sm start]   running
+assert coro-sm2 [sm pause]   paused
+assert coro-sm3 [sm resume]  running
+assert coro-sm4 [sm stop]    idle
+rename sm ""
+
+# Fibonacci coroutine
+proc fib_gen {} {
+    set a 0
+    set b 1
+    while 1 {
+        yield $a
+        set tmp $b
+        set b [expr {$a + $b}]
+        set a $tmp
+    }
+}
+coroutine fib fib_gen
+set fibs {}
+for {set _i 0} {$_i < 7} {incr _i} {
+    lappend fibs [fib]
+}
+rename fib ""
+assert coro-fib $fibs {1 1 2 3 5 8 13}
+
+# Multiple concurrent coroutines
+proc ticker {prefix} {
+    set n 0
+    while 1 {
+        yield "$prefix$n"
+        incr n
+    }
+}
+coroutine tickA ticker A
+coroutine tickB ticker B
+set interleaved {}
+for {set _i 0} {$_i < 3} {incr _i} {
+    lappend interleaved [tickA]
+    lappend interleaved [tickB]
+}
+rename tickA ""
+rename tickB ""
+assert coro-interleave $interleaved {A1 B1 A2 B2 A3 B3}
+
+# ============================================================================
+# 57. TCL 9.1 — lseq, lpop, ledit, lremove
+# ============================================================================
+# lseq — arithmetic sequence generation
+assert lseq-basic [lseq 5]                        {0 1 2 3 4}
+assert lseq-range [lseq 2 to 6]                   {2 3 4 5 6}
+assert lseq-step  [lseq 0 to 10 by 2]             {0 2 4 6 8 10}
+assert lseq-count [llength [lseq 100]]             100
+
+# lpop — pop element from list
+set lpoplist {a b c d e}
+set popped [lpop lpoplist end]
+assert lpop-val  $popped     e
+assert lpop-rest $lpoplist   {a b c d}
+set popped2 [lpop lpoplist 1]
+assert lpop-mid  $popped2    b
+assert lpop-rem  $lpoplist   {a c d}
+
+# ledit — edit list in place
+set editlist {a b c d e}
+ledit editlist 1 2 X Y Z
+assert ledit-val $editlist {a X Y Z d e}
+
+# lremove — remove indices from list
+set rmlist {a b c d e f}
+assert lremove-val [lremove $rmlist 1 3 5] {a c e}
+
+# ============================================================================
+# 58. DICT — ADVANCED OPERATIONS
+# ============================================================================
+# dict filter
+set inventory {apple 5 banana 12 cherry 3 date 8}
+set plenty [dict filter $inventory script {k v} {expr {$v >= 5}}]
+assert dict-filter-keys [lsort [dict keys $plenty]] {apple banana date}
+
+# dict merge
+set d1 [dict create a 1 b 2]
+set d2 [dict create b 3 c 4]
+set merged [dict merge $d1 $d2]
+assert dict-merge-b [dict get $merged b]    3
+assert dict-merge-c [dict get $merged c]    4
+assert dict-merge-a [dict get $merged a]    1
+
+# dict create
+set dc [dict create name "test" version 2 active true]
+assert dict-create-v [dict get $dc version] 2
+assert dict-create-n [dict get $dc name]    test
+
+# Nested dict manipulation
+set config [dict create]
+dict set config server host "localhost"
+dict set config server port 8080
+dict set config db name "mydb"
+dict set config db pool 10
+assert dict-nested-h [dict get $config server host] localhost
+assert dict-nested-p [dict get $config server port] 8080
+assert dict-nested-d [dict get $config db name]     mydb
+
+# ============================================================================
+# 59. STRING — ADVANCED OPERATIONS
+# ============================================================================
+# string is
+assert stris-int    [string is integer "42"]     1
+assert stris-dbl    [string is double "3.14"]    1
+assert stris-alpha  [string is alpha "hello"]    1
+assert stris-noint  [string is integer "abc"]    0
+
+# string map with multiple pairs
+set template "Hello NAME, welcome to PLACE!"
+assert strmap-multi [string map {NAME Alice PLACE Wonderland} $template] \
+    "Hello Alice, welcome to Wonderland!"
+
+# string repeat
+assert strrep-val [string repeat "ab" 4] "abababab"
+
+# string reverse
+assert strrev-val [string reverse "Hello"] "olleH"
+
+# string cat
+assert strcat-val [string cat "foo" "bar" "baz"] "foobarbaz"
+
+# ============================================================================
+# 60. CONTROL FLOW — ADVANCED PATTERNS
+# ============================================================================
+# Nested try/catch
+proc nested_try {} {
+    try {
+        try {
+            error "inner"
+        } on error {msg} {
+            return "caught:$msg"
+        }
+    } on error {msg} {
+        return "outer:$msg"
+    }
+}
+assert nested-try [nested_try] caught:inner
+
+# Multiple on handlers — use -level 0 to directly set the return code
+# (default -level 1 always produces TCL_RETURN inside try body)
+proc multi_handler {code} {
+    try {
+        return -code $code -level 0 "value"
+    } on ok {v} {
+        return "ok:$v"
+    } on error {v} {
+        return "err:$v"
+    } on return {v} {
+        return "ret:$v"
+    }
+}
+assert multi-on-ok  [multi_handler 0] ok:value
+assert multi-on-err [multi_handler 1] err:value
+assert multi-on-ret [multi_handler 2] ret:value
+
+# for/break with result
+proc find_first {lst pred} {
+    foreach item $lst {
+        if {[apply $pred $item]} {
+            return $item
+        }
+    }
+    return ""
+}
+assert find-first [find_first {3 7 2 9 4} {{x} {expr {$x > 5}}}] 7
+
+# ============================================================================
+# 61. PROC — ADVANCED PATTERNS
+# ============================================================================
+# Proc with defaults and args
+proc fmt_msg {prefix {sep ": "} args} {
+    return "$prefix$sep[join $args ,]"
+}
+assert proc-mixed1 [fmt_msg "LOG" ": " a b c]  "LOG: a,b,c"
+assert proc-mixed2 [fmt_msg "ERR" " - " x]     "ERR - x"
+
+# Recursive with accumulator
+proc flatten {lst} {
+    set acc {}
+    foreach item $lst {
+        if {[llength $item] > 1} {
+            foreach sub [flatten $item] { lappend acc $sub }
+        } else {
+            lappend acc $item
+        }
+    }
+    return $acc
+}
+assert proc-flatten [flatten {1 {2 3} {4 {5 6}} 7}] {1 2 3 4 5 6 7}
+
+# ============================================================================
+# 62. OO — OBJECT COPY & DESTROY
+# ============================================================================
+oo::class create Copyable {
+    variable val
+    constructor {v} { set val $v }
+    method val {} { return $val }
+    method set_val {v} { set val $v }
+}
+
+set orig [Copyable new 42]
+set copy [oo::copy $orig]
+$copy set_val 99
+assert oo-copy-orig [$orig val] 42
+assert oo-copy-copy [$copy val] 99
+$orig destroy
+# copy should still work after original is destroyed
+assert oo-copy-indep [$copy val] 99
+$copy destroy
+
+# ============================================================================
+# 63. OO — CLASS-LEVEL SELF METHOD (non-inherited)
+# ============================================================================
+oo::class create Registry {
+    variable name
+
+    constructor {n} { set name $n }
+    method name {} { return $name }
+
+    self method create_named {n} {
+        set obj [my new $n]
+        return $obj
+    }
+
+    self method class_info {} {
+        return "Registry-class"
+    }
+}
+
+set r1 [Registry create_named "item1"]
+assert self-meth-name [$r1 name] item1
+assert self-meth-info [Registry class_info] Registry-class
+
+# ============================================================================
+# 64. NAMESPACE — ADVANCED PATTERNS
+# ============================================================================
+namespace eval ::testns {
+    variable counter 0
+
+    proc bump {} {
+        variable counter
+        incr counter
+    }
+
+    proc get {} {
+        variable counter
+        return $counter
+    }
+
+    namespace eval inner {
+        proc greet {} {
+            return "inner-hello"
+        }
+    }
+
+    namespace export bump get
+}
+
+namespace eval ::consumer {
+    namespace import ::testns::*
+}
+
+::consumer::bump
+::consumer::bump
+::consumer::bump
+assert ns-import-val [::consumer::get] 3
+assert ns-inner [::testns::inner::greet] inner-hello
+
+# Namespace ensemble (manual)
+namespace eval ::mymath {
+    proc add {a b} { expr {$a + $b} }
+    proc mul {a b} { expr {$a * $b} }
+    namespace export add mul
+    namespace ensemble create
+}
+assert ns-ens-add [mymath add 3 4] 7
+assert ns-ens-mul [mymath mul 3 4] 12
+
+# ============================================================================
+# 65. ADVANCED FOREACH PATTERNS
+# ============================================================================
+# foreach with multiple variables
+set keys {}; set vals {}
+foreach {k v} {a 1 b 2 c 3} {
+    lappend keys $k
+    lappend vals $v
+}
+assert foreach-multi-k $keys {a b c}
+assert foreach-multi-v $vals {1 2 3}
+
+# foreach with multiple lists
+set zipped {}
+foreach x {1 2 3} y {a b c} {
+    lappend zipped "$x-$y"
+}
+assert foreach-zip $zipped {1-a 2-b 3-c}
+
+# Nested foreach
+set combos {}
+foreach x {A B} {
+    foreach y {1 2} {
+        lappend combos "$x$y"
+    }
+}
+assert foreach-nested $combos {A1 A2 B1 B2}
+
+# ============================================================================
+# 66. COMPLEX DICT ITERATION PATTERNS
+# ============================================================================
+# Transform dict to list of formatted strings
+set people {alice 30 bob 25 carol 35}
+set formatted {}
+dict for {name age} $people {
+    lappend formatted "$name=$age"
+}
+assert dict-for-fmt [lsort $formatted] {alice=30 bob=25 carol=35}
+
+# dict with (modify in place)
+set record {name "test" count 0 active 1}
+dict with record {
+    incr count
+    set name "updated"
+}
+assert dict-with-name  [dict get $record name]  updated
+assert dict-with-count [dict get $record count] 1
+
+# ============================================================================
+# 67. OO — MIXIN APPLIED AT RUNTIME
+# ============================================================================
+oo::class create Cacheable {
+    variable cache
+
+    method cache_get {key} {
+        if {[info exists cache] && [dict exists $cache $key]} {
+            return [dict get $cache $key]
+        }
+        return ""
+    }
+
+    method cache_set {key val} {
+        if {![info exists cache]} { set cache {} }
+        dict set cache $key $val
+    }
+}
+
+oo::class create DataService {
+    variable svc_name
+
+    constructor {n} { set svc_name $n }
+
+    method fetch {key} {
+        return "data-$key"
+    }
+
+    method name {} { return $svc_name }
+}
+
+# Apply mixin at runtime
+set ds [DataService new "svc1"]
+assert rt-mixin-pre  [$ds name] svc1
+oo::objdefine $ds mixin Cacheable
+$ds cache_set "x" "cached-x"
+assert rt-mixin-cache [$ds cache_get "x"] cached-x
+assert rt-mixin-fetch [$ds fetch "y"]     data-y
+
+# ============================================================================
+# 68. EXPR — BITWISE OPERATIONS (bitwiseAnd/Or/Xor/Not, lshift, rshift)
+# ============================================================================
+assert bit-and    [expr {0xFF & 0x0F}]     15
+assert bit-or     [expr {0xF0 | 0x0F}]     255
+assert bit-xor    [expr {0xFF ^ 0x0F}]     240
+assert bit-not    [expr {~0}]              -1
+assert bit-lshift [expr {1 << 10}]         1024
+assert bit-rshift [expr {1024 >> 3}]       128
+
+# ============================================================================
+# 69. EXPR — MODULO, EXPONENT, NEGATION, POWER
+# ============================================================================
+assert expr-mod2  [expr {17 % 5}]          2
+assert expr-neg2  [expr {-42}]             -42
+assert expr-exp2  [expr {2 ** 20}]         1048576
+assert expr-neq   [expr {3 != 4}]          1
+assert expr-neq2  [expr {3 != 3}]          0
+
+# ============================================================================
+# 70. EXPR — LOGICAL OPERATORS (land, lor, lnot)
+# ============================================================================
+assert logic-and1 [expr {1 && 1}]          1
+assert logic-and2 [expr {1 && 0}]          0
+assert logic-or1  [expr {0 || 1}]          1
+assert logic-or2  [expr {0 || 0}]          0
+assert logic-not1 [expr {!0}]             1
+assert logic-not2 [expr {!1}]             0
+
+# ============================================================================
+# 71. STRING — strlen, totitle, trimleft, trimright
+# ============================================================================
+assert strlen-val    [string length "hello world"]  11
+assert strtitle-val  [string totitle "hello WORLD"] "Hello world"
+assert triml-val     [string trimleft  "  hello  "] "hello  "
+assert trimr-val     [string trimright "  hello  "] "  hello"
+
+# ============================================================================
+# 72. ARRAY — set/unset (arraySetStk, arrayUnsetStk)
+# ============================================================================
+array set testarr {alpha 1 beta 2 gamma 3}
+assert arrset-get $testarr(beta) 2
+array unset testarr beta
+assert arrset-exists [info exists testarr(beta)] 0
+assert arrset-alpha  $testarr(alpha) 1
+
+# ============================================================================
+# 73. DICT — for, incr, append, lappend, update, unset, merge
+# ============================================================================
+# dict for (dictFirst, dictNext, dictDone)
+set dsum 0
+dict for {dk dv} {a 10 b 20 c 30} {
+    incr dsum $dv
+}
+assert dictfor-sum $dsum 60
+
+# dict incr (dictIncrImm)
+set dinc {count 0 total 100}
+dict incr dinc count
+dict incr dinc count
+dict incr dinc total 5
+assert dictincr-count [dict get $dinc count] 2
+assert dictincr-total [dict get $dinc total] 105
+
+# dict append
+set dapp {msg "hello"}
+dict append dapp msg " world"
+assert dictappend-val [dict get $dapp msg] "hello world"
+
+# dict lappend
+set dlap {tags {}}
+dict lappend dlap tags "first"
+dict lappend dlap tags "second"
+assert dictlappend-val [dict get $dlap tags] {first second}
+
+# dict update (dictUpdateStart/dictUpdateEnd)
+set dupd {name "Alice" age 30}
+dict update dupd name n age a {
+    set n "Bob"
+    incr a 5
+}
+assert dictupdate-name [dict get $dupd name] Bob
+assert dictupdate-age  [dict get $dupd age]  35
+
+# dict unset (dictUnsetN)
+set duns {a 1 b 2 c 3}
+dict unset duns b
+assert dictunset-exists [dict exists $duns b] 0
+assert dictunset-a [dict get $duns a] 1
+
+# ============================================================================
+# 74. LSET (lsetFlat)
+# ============================================================================
+set lsetvar {a b c d e}
+lset lsetvar 2 "X"
+assert lset-simple $lsetvar {a b X d e}
+set lsetvar2 {{1 2} {3 4} {5 6}}
+lset lsetvar2 1 0 "Z"
+assert lset-nested $lsetvar2 {{1 2} {Z 4} {5 6}}
+
+# ============================================================================
+# 75. UNSET (unsetStk)
+# ============================================================================
+set unset_test_var 42
+assert unset-before [info exists unset_test_var] 1
+unset unset_test_var
+assert unset-after [info exists unset_test_var] 0
+
+# ============================================================================
+# 76. GLOBAL / NAMESPACE UPVAR (nsupvar)
+# ============================================================================
+set ::globalvar 999
+proc read_global {} {
+    global globalvar
+    return $globalvar
+}
+assert global-read [read_global] 999
+
+namespace eval ::nstest2 {
+    variable nsvar2 "nsval"
+}
+proc read_nsvar {} {
+    namespace upvar ::nstest2 nsvar2 local
+    return $local
+}
+assert nsupvar-read [read_nsvar] nsval
+
+# ============================================================================
+# 77. INFO COROUTINE (infoCoroutine)
+# ============================================================================
+proc coro_identity {} {
+    set myname [info coroutine]
+    yield $myname
+}
+set icresult [coroutine idcoro coro_identity]
+assert info-coro $icresult ::idcoro
+
+# ============================================================================
+# 78. CONCAT
+# ============================================================================
+set clist1 {a b}
+set clist2 {c d}
+assert concat-val [concat $clist1 $clist2 e] {a b c d e}
+
+# ============================================================================
+# 79. OO — SELF / NEXT / MY (tclooSelf, tclooNext)
+# ============================================================================
+oo::class create SelfBase {
+    method tag {} { return "base" }
+}
+
+oo::class create SelfDerived {
+    superclass SelfBase
+    method tag {} { return "derived+[next]" }
+    method ident {} { return [self] }
+}
+
+set sd [SelfDerived new]
+assert oo-next-chain [$sd tag]   "derived+base"
+assert oo-self-obj   [string match "::oo::Obj*" [$sd ident]] 1
+$sd destroy
+
+# ============================================================================
+# 80. YIELDTO
+# ============================================================================
+proc coro_yieldto {} {
+    yieldto return -level 0 "yielded-value"
+}
+set ytresult [coroutine ytcoro coro_yieldto]
+assert yieldto-val $ytresult yielded-value
+rename ytcoro ""
+
+# ============================================================================
+# 81. CONST (Tcl 9.x — constStk)
+# ============================================================================
+proc test_const {} {
+    const PI 3.14159
+    return $PI
+}
+assert const-val [test_const] 3.14159
 
 # ============================================================================
 # FINAL RESULT

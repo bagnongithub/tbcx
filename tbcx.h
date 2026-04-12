@@ -50,7 +50,7 @@
 #define TBCX_METH_CLASS 1u
 #define TBCX_METH_CTOR 2u
 #define TBCX_METH_DTOR 3u
-#define TBCX_METH_SELF 4u /* self method (class-level, installed via oo::define builder body) */
+#define TBCX_METH_SELF 4u    /* self method (class-level, installed via oo::define builder body) */
 #define TBCX_METH_NONE 0xFFu /* sentinel: no method kind identified */
 
 /* Indexed proc marker prefix.  The save side emits stub bodies of the
@@ -62,8 +62,7 @@
 
 /* TbcxHeader: wire-format documentation & local staging area.
  * Serialized field-by-field via W_U32/W_U64; never memcpy'd as a block. */
-typedef struct TbcxHeader
-{
+typedef struct TbcxHeader {
     uint32_t magic;       /* "TBCX" */
     uint32_t format;      /* format version */
     uint32_t tcl_version; /* mmjjppTT */
@@ -77,7 +76,7 @@ typedef struct TbcxHeader
 
 extern _Atomic int tbcxHostIsLE;
 
-uint32_t Tbcx_PackTclVersion(void);
+uint32_t           Tbcx_PackTclVersion(void);
 
 /* Wire-format caps — production-safe defaults for untrusted input.
  * These limit the maximum values the deserializer will accept from a
@@ -103,17 +102,15 @@ uint32_t Tbcx_PackTclVersion(void);
  * callers can safely treat the value as an empty string/byte-array in
  * non-fatal scanning/rewrite paths.
  */
-static inline const char* Tbcx_GetStringFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
-{
-    const char* s;
+static inline const char *Tbcx_GetStringFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *lenPtr) {
+    const char *s;
 
     if (lenPtr)
         *lenPtr = 0;
     if (!objPtr)
         return "";
     s = Tcl_GetStringFromObj(objPtr, lenPtr);
-    if (!s)
-    {
+    if (!s) {
         if (lenPtr)
             *lenPtr = 0;
         return "";
@@ -121,9 +118,8 @@ static inline const char* Tbcx_GetStringFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* l
     return s;
 }
 
-static inline const char* Tbcx_GetStringSafe(Tcl_Obj* objPtr)
-{
-    const char* s;
+static inline const char *Tbcx_GetStringSafe(Tcl_Obj *objPtr) {
+    const char *s;
 
     if (!objPtr)
         return "";
@@ -131,24 +127,22 @@ static inline const char* Tbcx_GetStringSafe(Tcl_Obj* objPtr)
     return s ? s : "";
 }
 
-static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
-{
+static inline unsigned char *Tbcx_GetByteArrayFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *lenPtr) {
     /* const: sentinel byte must never be written through the returned pointer.
      * Cast to non-const on return to match Tcl_GetByteArrayFromObj signature;
      * callers that only need the bytes for reading are safe. */
     static const unsigned char emptyByte = 0;
-    unsigned char* p;
+    unsigned char             *p;
 
     if (lenPtr)
         *lenPtr = 0;
     if (!objPtr)
-        return (unsigned char*)&emptyByte;
+        return (unsigned char *)&emptyByte;
     p = Tcl_GetByteArrayFromObj(objPtr, lenPtr);
-    if (!p)
-    {
+    if (!p) {
         if (lenPtr)
             *lenPtr = 0;
-        return (unsigned char*)&emptyByte;
+        return (unsigned char *)&emptyByte;
     }
     return p;
 }
@@ -160,18 +154,15 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_S
  * wherever an empty-string substitution would silently corrupt identifiers
  * (namespace FQNs, proc/method/class names, shim-name construction, wire-
  * format keys).  Callers must check the return value and propagate error. */
-static inline const char* Tbcx_GetStringFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
-{
-    const char* s;
-    if (!o)
-    {
+static inline const char *Tbcx_GetStringFromObjStrict(Tcl_Interp *ip, Tcl_Obj *o, Tcl_Size *len) {
+    const char *s;
+    if (!o) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetStringFromObj(o, len);
-    if (!s)
-    {
+    if (!s) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
@@ -179,18 +170,15 @@ static inline const char* Tbcx_GetStringFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o
     return s;
 }
 
-static inline const char* Tbcx_GetStringStrict(Tcl_Interp* ip, Tcl_Obj* o)
-{
-    const char* s;
-    if (!o)
-    {
+static inline const char *Tbcx_GetStringStrict(Tcl_Interp *ip, Tcl_Obj *o) {
+    const char *s;
+    if (!o) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetString(o);
-    if (!s)
-    {
+    if (!s) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
@@ -198,18 +186,15 @@ static inline const char* Tbcx_GetStringStrict(Tcl_Interp* ip, Tcl_Obj* o)
     return s;
 }
 
-static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
-{
-    unsigned char* p;
-    if (!o)
-    {
+static inline unsigned char *Tbcx_GetByteArrayFromObjStrict(Tcl_Interp *ip, Tcl_Obj *o, Tcl_Size *len) {
+    unsigned char *p;
+    if (!o) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     p = Tcl_GetByteArrayFromObj(o, len);
-    if (!p)
-    {
+    if (!p) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object", -1));
         return NULL;
@@ -220,22 +205,18 @@ static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_
 /* Validate a key string for use with namespace/hash APIs.
  * Rejects embedded NULs and optionally requires absolute namespace form.
  * Returns TCL_OK on success, TCL_ERROR with interp result set on failure. */
-static inline int Tbcx_ValidateKeyString(Tcl_Interp* ip, const char* s, Tcl_Size len, const char* what, int requireAbsoluteNs)
-{
-    if (!s)
-    {
+static inline int Tbcx_ValidateKeyString(Tcl_Interp *ip, const char *s, Tcl_Size len, const char *what, int requireAbsoluteNs) {
+    if (!s) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing %s", what));
         return TCL_ERROR;
     }
-    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
-    {
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
         return TCL_ERROR;
     }
-    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':'))
-    {
+    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':')) {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
         return TCL_ERROR;
@@ -247,10 +228,10 @@ static inline int Tbcx_ValidateKeyString(Tcl_Interp* ip, const char* s, Tcl_Size
  * Must accommodate "::tbcx::__oo_objdef_orig_NNNN__" with generous room. */
 #define TBCX_OSHIM_NAME_MAX 80
 
-extern const Tcl_ObjType* tbcxTyBignum;
-extern const Tcl_ObjType* tbcxTyBoolean;
-extern const Tcl_ObjType* tbcxTyByteArray;
-extern const Tcl_ObjType* tbcxTyBytecode;
+extern const Tcl_ObjType *tbcxTyBignum;
+extern const Tcl_ObjType *tbcxTyBoolean;
+extern const Tcl_ObjType *tbcxTyByteArray;
+extern const Tcl_ObjType *tbcxTyBytecode;
 
 /* TbcxGetByteCode — extract ByteCode* from a Tcl_Obj using the runtime
  * type pointer (tbcxTyBytecode), NOT the compile-time &tclByteCodeType.
@@ -262,10 +243,9 @@ extern const Tcl_ObjType* tbcxTyBytecode;
  * they differ, ByteCodeGetInternalRep silently returns NULL, causing all
  * procPtr/epoch fixups to be skipped — leading to crashes on coroutine
  * yield/resume (procPtr=NULL, SIGSEGV at offset 0x30). */
-static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
-{
-    const Tcl_ObjInternalRep* irPtr = Tcl_FetchInternalRep(objPtr, tbcxTyBytecode);
-    return irPtr ? (ByteCode*)irPtr->twoPtrValue.ptr1 : NULL;
+static inline ByteCode   *TbcxGetByteCode(Tcl_Obj *objPtr) {
+    const Tcl_ObjInternalRep *irPtr = Tcl_FetchInternalRep(objPtr, tbcxTyBytecode);
+    return irPtr ? (ByteCode *)irPtr->twoPtrValue.ptr1 : NULL;
 }
 
 /* Flags for TbcxFixupByteCode cache handling strategy. */
@@ -273,70 +253,67 @@ static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
 #define TBCX_FIXUP_CACHE_DROP 1 /* NULL out LocalCache (procs — Tcl rebuilds) */
 #define TBCX_FIXUP_CACHE_NONE 2 /* Don't touch LocalCache */
 
-extern const Tcl_ObjType* tbcxTyDict;
-extern const Tcl_ObjType* tbcxTyDouble;
-extern const Tcl_ObjType* tbcxTyInt;
-extern const Tcl_ObjType* tbcxTyLambda;
-extern const Tcl_ObjType* tbcxTyList;
-extern const Tcl_ObjType* tbcxTyProcBody;
+extern const Tcl_ObjType *tbcxTyDict;
+extern const Tcl_ObjType *tbcxTyDouble;
+extern const Tcl_ObjType *tbcxTyInt;
+extern const Tcl_ObjType *tbcxTyLambda;
+extern const Tcl_ObjType *tbcxTyList;
+extern const Tcl_ObjType *tbcxTyProcBody;
 
-extern const AuxDataType* tbcxAuxJTStr;
-extern const AuxDataType* tbcxAuxJTNum;
-extern const AuxDataType* tbcxAuxDictUpdate;
-extern const AuxDataType* tbcxAuxNewForeach;
+extern const AuxDataType *tbcxAuxJTStr;
+extern const AuxDataType *tbcxAuxJTNum;
+extern const AuxDataType *tbcxAuxDictUpdate;
+extern const AuxDataType *tbcxAuxNewForeach;
 
 /* ==========================================================================
  * Buffered I/O wrapper types
  * ========================================================================== */
 
-typedef struct TbcxIn
-{
-    Tcl_Interp* interp;
-    Tcl_Channel chan;
-    int err;
+typedef struct TbcxIn {
+    Tcl_Interp   *interp;
+    Tcl_Channel   chan;
+    int           err;
     unsigned char buf[TBCX_BUFSIZE];
-    Tcl_Size bufPos;  /* next byte to consume */
-    Tcl_Size bufFill; /* valid bytes in buf */
+    Tcl_Size      bufPos;  /* next byte to consume */
+    Tcl_Size      bufFill; /* valid bytes in buf */
 } TbcxIn;
 
-typedef struct
-{
-    Tcl_Interp* interp;
-    Tcl_Channel chan;
-    int err;
+typedef struct {
+    Tcl_Interp   *interp;
+    Tcl_Channel   chan;
+    int           err;
     unsigned char buf[TBCX_BUFSIZE];
-    Tcl_Size bufPos;     /* next free position in buf */
-    uint64_t totalBytes; /* total bytes written (buf flushes + current bufPos) */
+    Tcl_Size      bufPos;     /* next free position in buf */
+    uint64_t      totalBytes; /* total bytes written (buf flushes + current bufPos) */
 } TbcxOut;
 
 /* ==========================================================================
  * Forward Declarations
  * ========================================================================== */
 
-int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, Tcl_Size* numArgsOut);
-int Tbcx_CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch);
-Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
-void Tbcx_FreeLocals(CompiledLocal* first);
-int Tbcx_ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
-int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
-void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
-int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n);
-int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
-int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
-int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
-int Tbcx_R_U8(TbcxIn* r, uint8_t* v);
-void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
-int Tbcx_W_Flush(TbcxOut* w);
-Tcl_Obj* Tbcx_ReadBlock(TbcxIn* r, Tcl_Interp* ip, Namespace* nsForDefault, uint32_t* numLocalsOut, int setPrecompiled, int dumpOnly);
-int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
-void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
-void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip, Namespace* ns, int cacheMode);
-int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label);
+int               Tbcx_BuildLocals(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **firstOut, CompiledLocal **lastOut, Tcl_Size *numArgsOut);
+int               Tbcx_CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
+Tcl_Namespace    *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn);
+void              Tbcx_FreeLocals(CompiledLocal *first);
+int               Tbcx_ProbeOpenChannel(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_Channel *chPtr);
+int               Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj);
+void              Tbcx_R_Init(TbcxIn *r, Tcl_Interp *ip, Tcl_Channel ch);
+int               Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n);
+int               Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
+int               Tbcx_R_U32(TbcxIn *r, uint32_t *vp);
+int               Tbcx_R_U64(TbcxIn *r, uint64_t *vp);
+int               Tbcx_R_U8(TbcxIn *r, uint8_t *v);
+void              Tbcx_W_Init(TbcxOut *w, Tcl_Interp *ip, Tcl_Channel ch);
+int               Tbcx_W_Flush(TbcxOut *w);
+Tcl_Obj          *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly);
+int               Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
+void              TbcxApplyShimPurgeAll(Tcl_Interp *ip);
+void              TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode);
+int               TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label);
 
 /* Checked multiplication for allocation sizes.  Returns 1 on success
  * (result stored in *out), 0 if the multiplication would overflow size_t. */
-static inline int tbcx_checked_mul(size_t a, size_t b, size_t* out)
-{
+static inline int tbcx_checked_mul(size_t a, size_t b, size_t *out) {
     if (a != 0 && b > SIZE_MAX / a)
         return 0;
     *out = a * b;
