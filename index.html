@@ -2,8 +2,8 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Apr 10, 2026'>
-  <meta name='generator' content='tbcx 1.0'>
+  <meta name='date' content='Apr 12, 2026'>
+  <meta name='generator' content='tbcx 1.1'>
   <style>
     :root{
         --bg: #ffffff;
@@ -58,7 +58,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.0 Apr 10, 2026</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.1 Apr 12, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -155,6 +155,7 @@ tbcx::gc</code></pre>
             <li>Performs two-phase instruction-level body detection: Phase 1 analyzes <b>invokeStk</b>
                 operand stack patterns; Phase 2 identifies unpushed literals from inline-compiled
                 <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all Tcl 9.1 instructions.</li>
+            <li>Strips <b>startCommand</b> debugging instructions from all compiled blocks, replacing them with <b>nop</b> bytes for ~15% leaner bytecode execution.</li>
             <li>Detects bytearray literals (bytes &ge; 0x80) and emits them as <b>TBCX_LIT_BYTEARR</b>
                 to prevent UTF-8 encoding corruption.</li>
             <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
@@ -356,8 +357,8 @@ try {
 
       <h2 id='limits'>LIMITS</h2>
       <p>
-        Sanity caps exist for code size (1 GiB), literal/AuxData/exception counts (64M each),
-        string lengths (16 MiB), total serialized output (256 MB), serialization recursion depth (64),
+        Sanity caps exist for code size (64 MiB), literal/AuxData/exception counts (1M each),
+        string lengths (4 MiB), total serialized output (256 MB), serialization recursion depth (64),
         total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
         Exceeding any limit produces an error.</p>
       <p>
@@ -381,10 +382,10 @@ try {
       <p>source(n), TclOO(n)</p>
 
       <h2 id='copyright'>COPYRIGHT</h2>
-      <p>&copy; 2025 Miguel Banon</p>
+      <p>&copy; 2025–2026 Miguel Banon</p>
       <p>MIT License.</p>
 
-      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.0</div>
+      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.1</div>
     </div>
     <a href='#top' class='back-to-top'>&uarr; Top</a>
   </body>
