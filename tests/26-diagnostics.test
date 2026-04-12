@@ -4,9 +4,7 @@
 # Each failure is decomposed into a chain of sub-tests from simplest
 # to most complex.  The first sub-test that FAILS identifies the
 # mechanism responsible.
-#
-# Run with:  tclsh all.tcl -file 26-diagnostics.test
-#
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

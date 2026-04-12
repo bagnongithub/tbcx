@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 15-control-flow.test — Control flow construct round-trip tests
+#
+# Exercises while, for, foreach, switch, if/elseif/else, break,
+# continue, and return across tbcx save/load cycles.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

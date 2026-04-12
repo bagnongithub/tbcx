@@ -1,12 +1,13 @@
 # -*-Tcl-*-
 # 24-security-regression.test
 #
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*
 
 # =====================================================================
-# Finding 1: Namespace validation on the load path
+# Namespace validation on the load path
 #
 # The load path now validates that namespace/proc identifiers from the
 # wire format are absolute (start with ::) and contain no embedded NUL.
@@ -108,7 +109,7 @@ test f1.7 {F1: method in namespaced class roundtrips} -body {
 
 
 # =====================================================================
-# Finding 2: Save-side body/class string NUL-safety
+# Save-side body/class string NUL-safety
 #
 # The save side now skips strip-body and ns-eval-body optimization for
 # bodies containing embedded NUL.  We verify that normal bodies (no NUL)
@@ -161,7 +162,7 @@ test f2.4 {F2: bytearray body (binary data) roundtrips without corruption} -body
 
 
 # =====================================================================
-# Finding 3: FqnUnder strict contract verification
+# FqnUnder strict contract verification
 #
 # FqnUnder now returns NULL on invalid input and all call sites guard
 # the result.  These tests exercise the class-name FQN construction
@@ -206,7 +207,7 @@ test f3.3 {F3: class create with named instance (no builder body)} -body {
 
 
 # =====================================================================
-# Finding 4: Tcl_Size compliance
+# Tcl_Size compliance
 #
 # These tests exercise scenarios with many words/locals/args to verify
 # that the Tcl_Size conversions work for non-trivial counts.
@@ -270,7 +271,7 @@ test f4.4 {F4: script with many top-level commands} -body {
 
 
 # =====================================================================
-# Finding 5: Checked-multiply for allocations
+# Checked-multiply for allocations
 #
 # Verify that large but valid jump tables and class tables don't crash.
 # =====================================================================
@@ -301,7 +302,7 @@ test f5.2 {F5: many OO classes in one file} -body {
 
 
 # =====================================================================
-# Finding 6: MethodKeyBuf (snprintf replacement)
+# MethodKeyBuf (snprintf replacement)
 #
 # These test that method key construction works for all 4 method kinds
 # (instance, class, constructor, destructor) after the Tcl_ObjPrintf fix.
@@ -377,7 +378,7 @@ test f6.5 {F6: all four method kinds in one class} -body {
 
 
 # =====================================================================
-# Finding 7: Numeric conversion error handling
+# Numeric conversion error handling
 #
 # The serializer and dumper now check return codes from Tcl_GetDoubleFromObj
 # and Tcl_GetBooleanFromObj.  These tests verify that valid doubles and
@@ -421,7 +422,7 @@ test f7.5 {F7: boolean in dump output} -body {
 
 
 # =====================================================================
-# Finding 8: Safe interpreter behavior
+# Safe interpreter behavior
 #
 # tbcx_SafeInit registers no commands.  Verify that safe interpreters
 # cannot access tbcx::save, tbcx::load, or tbcx::dump directly.

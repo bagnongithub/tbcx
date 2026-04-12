@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 11-package-lifecycle.test — Package require/forget lifecycle test
+#
+# Verifies that tbcx can be required, forgotten, and re-required
+# without errors.  Intentionally does not pre-load tbcx at file scope.
+
 package require tcltest 2.5
 namespace import ::tcltest::*
 

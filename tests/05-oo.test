@@ -1,4 +1,10 @@
 # -*-Tcl-*-
+# 05-oo.test — TclOO class and object round-trip tests
+#
+# Exercises oo::class, oo::define, oo::objdefine method/constructor/
+# destructor bodies, class methods, unexport, and inheritance across
+# tbcx save/load cycles.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

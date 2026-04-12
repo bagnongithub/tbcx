@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 18-stress.test — Stress tests for large scripts
+#
+# Exercises large literal pools, many procs, deep nesting, long
+# switch chains, and bulk list operations under tbcx save/load.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

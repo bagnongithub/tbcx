@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 08-multi-interp.test — Multi-interpreter load and isolation tests
+#
+# Verifies that .tbcx files load correctly in child interpreters,
+# including proc execution, OO classes, and inter-interpreter isolation.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

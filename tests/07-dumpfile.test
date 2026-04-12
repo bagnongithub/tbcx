@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 07-dumpfile.test — tbcx::dump diagnostic output tests
+#
+# Verifies that tbcx::dump produces readable disassembly output
+# covering headers, sections, proc tables, and bytecode listings.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

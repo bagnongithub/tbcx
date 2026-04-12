@@ -1,4 +1,10 @@
 # -*-Tcl-*-
+# 01-datatypes.test — Literal data type round-trip tests
+#
+# Verifies that every Tcl literal type (string, boolean, integer,
+# wide integer, double, bytearray, bignum, list, dict) survives
+# tbcx save/load with correct values and internal representations.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

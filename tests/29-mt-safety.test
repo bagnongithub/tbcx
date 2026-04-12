@@ -1,0 +1,609 @@
+# -*-Tcl-*-
+# 29-mt-safety.test — Multi-interpreter and multi-thread safety tests
+#
+# Opcode cache race (concurrent tbcx::save from multiple threads)
+# Thread-ownership assertions (debug builds only — not directly testable)
+# Per-interpreter state consolidation (TbcxInterpState isolation)
+#
+# Requires: Tcl 9.1, tbcx, tcltest 2.5
+# Optional: Thread package (tests with -constraints haveThread)
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+testConstraint haveThread [expr {![catch {package require Thread}]}]
+
+# ========================================================================
+# Section 1: Multi-interpreter state isolation (single thread)
+# ========================================================================
+
+test mt.interp.1 {N child interps load same file independently} -body {
+    set out [makeFile "" mt.interp.1.tbcx]
+    tbcx::save {
+        proc greet {who} { return "hello $who" }
+        return [greet world]
+    } $out
+    set results {}
+    for {set i 0} {$i < 5} {incr i} {
+        interp create C$i
+        interp eval C$i [list package require tbcx]
+        lappend results [interp eval C$i [list tbcx::load $out]]
+        interp delete C$i
+    }
+    set results
+} -result {{hello world} {hello world} {hello world} {hello world} {hello world}}
+
+test mt.interp.2 {per-interp OO class isolation} -body {
+    set out1 [makeFile "" mt.interp.2a.tbcx]
+    set out2 [makeFile "" mt.interp.2b.tbcx]
+    tbcx::save {
+        oo::class create Dog
+        oo::define Dog method speak {} { return "woof" }
+        return [[Dog new] speak]
+    } $out1
+    tbcx::save {
+        oo::class create Dog
+        oo::define Dog method speak {} { return "bark" }
+        return [[Dog new] speak]
+    } $out2
+    interp create I1
+    interp create I2
+    interp eval I1 [list package require tbcx]
+    interp eval I2 [list package require tbcx]
+    set r1 [interp eval I1 [list tbcx::load $out1]]
+    set r2 [interp eval I2 [list tbcx::load $out2]]
+    interp delete I1
+    interp delete I2
+    list $r1 $r2
+} -result {woof bark}
+
+test mt.interp.3 {per-interp OO unexport isolation} -body {
+    set out [makeFile "" mt.interp.3.tbcx]
+    tbcx::save {
+        oo::class create Priv
+        oo::define Priv {
+            method pub {} { return [my secret] }
+            method secret {} { return "hidden" }
+            unexport secret
+        }
+        set p [Priv new]
+        set canCall [catch {$p secret} err]
+        set pubRes [$p pub]
+        return [list canCall=$canCall pub=$pubRes]
+    } $out
+    set results {}
+    foreach name {I1 I2 I3} {
+        interp create $name
+        interp eval $name [list package require tbcx]
+        lappend results [interp eval $name [list tbcx::load $out]]
+        interp delete $name
+    }
+    set results
+} -result {{canCall=1 pub=hidden} {canCall=1 pub=hidden} {canCall=1 pub=hidden}}
+
+test mt.interp.4 {per-interp lambda isolation} -body {
+    set out [makeFile "" mt.interp.4.tbcx]
+    tbcx::save {
+        set double [list {x} {expr {$x * 2}}]
+        set triple [list {x} {expr {$x * 3}}]
+        return [list [apply $double 5] [apply $triple 5]]
+    } $out
+    interp create A
+    interp create B
+    interp eval A [list package require tbcx]
+    interp eval B [list package require tbcx]
+    set rA [interp eval A [list tbcx::load $out]]
+    set rB [interp eval B [list tbcx::load $out]]
+    interp eval A {
+        set lam [list {x} {expr {$x * 2}}]
+        set s [format "%s" $lam]
+        apply $lam 7
+    }
+    interp delete A
+    interp delete B
+    list $rA $rB
+} -result {{10 15} {10 15}}
+
+test mt.interp.5 {per-interp load depth independence} -body {
+    set inner [makeFile "" mt.interp.5-inner.tbcx]
+    set outer [makeFile "" mt.interp.5-outer.tbcx]
+    tbcx::save {return "inner-ok"} $inner
+    set outerScript "set r \[tbcx::load [list $inner]\]\nreturn \"outer(\$r)\""
+    tbcx::save $outerScript $outer
+    interp create I1
+    interp create I2
+    interp eval I1 [list package require tbcx]
+    interp eval I2 [list package require tbcx]
+    set r1 [interp eval I1 [list tbcx::load $outer]]
+    set r2 [interp eval I2 [list tbcx::load $inner]]
+    interp delete I1
+    interp delete I2
+    list $r1 $r2
+} -result {outer(inner-ok) inner-ok}
+
+test mt.interp.6 {per-interp GC does not affect other interps} -body {
+    set out [makeFile "" mt.interp.6.tbcx]
+    tbcx::save {
+        set lam [list {x} {expr {$x + 1}}]
+        return [apply $lam 41]
+    } $out
+    interp create G1
+    interp create G2
+    interp eval G1 [list package require tbcx]
+    interp eval G2 [list package require tbcx]
+    interp eval G1 [list tbcx::load $out]
+    set r2 [interp eval G2 [list tbcx::load $out]]
+    interp eval G1 {tbcx::gc}
+    interp delete G1
+    set r2post [interp eval G2 {
+        set lam [list {x} {expr {$x + 1}}]
+        apply $lam 99
+    }]
+    interp delete G2
+    list $r2 $r2post
+} -result {42 100}
+
+test mt.interp.7 {rapid interp create/load/delete cycle} -body {
+    set out [makeFile "" mt.interp.7.tbcx]
+    tbcx::save {
+        oo::class create Tmp
+        oo::define Tmp method val {} { return 42 }
+        proc tmpfn {} { return ok }
+        set lam [list {} {return lam}]
+        return [list [tmpfn] [[Tmp new] val] [apply $lam]]
+    } $out
+    set ok 0
+    for {set i 0} {$i < 20} {incr i} {
+        interp create T
+        interp eval T [list package require tbcx]
+        set r [interp eval T [list tbcx::load $out]]
+        interp delete T
+        if {$r eq {ok 42 lam}} { incr ok }
+    }
+    set ok
+} -result 20
+
+test mt.interp.8 {multiple OO loads in same interp get distinct shim IDs} -body {
+    set out1 [makeFile "" mt.interp.8a.tbcx]
+    set out2 [makeFile "" mt.interp.8b.tbcx]
+    tbcx::save {
+        oo::class create A
+        oo::define A method val {} { return "A" }
+        return [[A new] val]
+    } $out1
+    tbcx::save {
+        oo::class create B
+        oo::define B method val {} { return "B" }
+        return [[B new] val]
+    } $out2
+    interp create M
+    interp eval M [list package require tbcx]
+    set r1 [interp eval M [list tbcx::load $out1]]
+    set r2 [interp eval M [list tbcx::load $out2]]
+    interp delete M
+    list $r1 $r2
+} -result {A B}
+
+# ========================================================================
+# Section 2: Multi-thread safety (requires Thread package)
+# ========================================================================
+
+test mt.thread.1 {concurrent save from N threads (P0 opcode race)} \
+    -constraints haveThread -body {
+    set script {
+        proc fib {n} {
+            if {$n <= 1} {return $n}
+            return [expr {[fib [expr {$n-1}]] + [fib [expr {$n-2}]]}]
+        }
+        return [fib 10]
+    }
+    set N 4
+    set tids {}
+    set outfiles {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend outfiles [makeFile "" mt.thread.1-$i.tbcx]
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{script f} {
+            tbcx::save $script $f
+        }} $script [lindex $outfiles $i]]
+    }
+    foreach tid $tids { thread::send $tid {set _ 1} }
+    set results {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend results [tbcx::load [lindex $outfiles $i]]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {55 55 55 55}
+
+test mt.thread.2 {concurrent load from N threads} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.2.tbcx]
+    tbcx::save {
+        proc double {x} { expr {$x * 2} }
+        return [double 21]
+    } $out
+    set N 4
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{f} {
+            set ::_result [tbcx::load $f]
+        }} $out]
+    }
+    set results {}
+    foreach tid $tids {
+        lappend results [thread::send $tid {set ::_result}]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {42 42 42 42}
+
+test mt.thread.3 {mixed concurrent save+load} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.3.tbcx]
+    tbcx::save {return "base"} $out
+    set tA [thread::create]
+    thread::send $tA [list package require tbcx]
+    set tB [thread::create]
+    thread::send $tB [list package require tbcx]
+    set saveFile [makeFile "" mt.thread.3-save.tbcx]
+    thread::send -async $tA [list apply {{f} {
+        for {set i 0} {$i < 5} {incr i} {
+            tbcx::save {return "saved"} $f
+        }
+        set ::_doneA 1
+    }} $saveFile]
+    thread::send -async $tB [list apply {{f} {
+        set ::_results {}
+        for {set i 0} {$i < 5} {incr i} {
+            lappend ::_results [tbcx::load $f]
+        }
+        set ::_doneB 1
+    }} $out]
+    thread::send $tA {set ::_doneA}
+    thread::send $tB {set ::_doneB}
+    thread::release $tA
+    thread::release $tB
+    return "ok"
+} -result ok
+
+test mt.thread.4 {thread with child interps loading OO} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.4.tbcx]
+    tbcx::save {
+        oo::class create Counter
+        oo::define Counter {
+            variable count
+            constructor {} { set count 0 }
+            method incr {} { ::incr count }
+            method get {} { return $count }
+        }
+        set c [Counter new]
+        $c incr; $c incr; $c incr
+        return [$c get]
+    } $out
+    set N 3
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend tids [thread::create]
+    }
+    set results {}
+    foreach tid $tids {
+        set r [thread::send $tid [list apply {{f} {
+            package require tbcx
+            interp create child
+            interp eval child [list package require tbcx]
+            set r [interp eval child [list tbcx::load $f]]
+            interp delete child
+            set r
+        }} $out]]
+        lappend results $r
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {3 3 3}
+
+test mt.thread.5 {concurrent lambda loads across threads} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.5.tbcx]
+    tbcx::save {
+        set square [list {x} {expr {$x * $x}}]
+        set cube   [list {x} {expr {$x * $x * $x}}]
+        return [list [apply $square 3] [apply $cube 3]]
+    } $out
+    set N 4
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    set results {}
+    foreach tid $tids {
+        lappend results [thread::send $tid [list tbcx::load $out]]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {{9 27} {9 27} {9 27} {9 27}}
+
+test mt.thread.6 {stress: N threads save+load+eval independently} \
+    -constraints haveThread -body {
+    set N 6
+    set tids {}
+    set outfiles {}
+    set scripts {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend outfiles [makeFile "" mt.thread.6-$i.tbcx]
+        set val [expr {$i * $i}]
+        lappend scripts [string map [list %N% $i %V% $val] {
+            proc compute_%N% {} { return %V% }
+            return [compute_%N%]
+        }]
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{script f} {
+            tbcx::save $script $f
+            set ::_result [tbcx::load $f]
+        }} [lindex $scripts $i] [lindex $outfiles $i]]
+    }
+    set results {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend results [thread::send [lindex $tids $i] {set ::_result}]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {0 1 4 9 16 25}
+
+test mt.thread.7 {rapid thread create/load/destroy cycle} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.7.tbcx]
+    tbcx::save {
+        proc f {} { return ok }
+        set lam [list {} {return lam}]
+        return [list [f] [apply $lam]]
+    } $out
+    set ok 0
+    for {set i 0} {$i < 10} {incr i} {
+        set tid [thread::create]
+        set r [thread::send $tid [list apply {{f} {
+            package require tbcx
+            tbcx::load $f
+        }} $out]]
+        thread::release $tid
+        if {$r eq {ok lam}} { incr ok }
+    }
+    set ok
+} -result 10
+
+test mt.thread.8 {concurrent OO+unexport loads across threads} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.thread.8.tbcx]
+    tbcx::save {
+        oo::class create Svc
+        oo::define Svc {
+            method call {} { return [my impl] }
+            method impl {} { return "internal" }
+            unexport impl
+        }
+        set s [Svc new]
+        set pub [$s call]
+        set priv [catch {$s impl}]
+        return [list pub=$pub priv_blocked=$priv]
+    } $out
+    set N 4
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    set results {}
+    foreach tid $tids {
+        lappend results [thread::send $tid [list tbcx::load $out]]
+    }
+    foreach tid $tids { thread::release $tid }
+    set allSame 1
+    foreach r $results {
+        if {$r ne "pub=internal priv_blocked=1"} { set allSame 0 }
+    }
+    list allSame=$allSame count=[llength $results]
+} -result {allSame=1 count=4}
+
+# ========================================================================
+# Section 3: State lifecycle and edge cases
+# ========================================================================
+
+test mt.lifecycle.1 {load depth limit enforced per interp} -body {
+    set files {}
+    for {set i 0} {$i <= 9} {incr i} {
+        lappend files [makeFile "" mt.lifecycle.1-$i.tbcx]
+    }
+    tbcx::save {return "deep"} [lindex $files 0]
+    for {set i 1} {$i <= 9} {incr i} {
+        set inner [lindex $files [expr {$i - 1}]]
+        set script "return \[tbcx::load [list $inner]\]"
+        tbcx::save $script [lindex $files $i]
+    }
+    set r_ok [tbcx::load [lindex $files 7]]
+    set r_fail [catch {tbcx::load [lindex $files 9]} err]
+    list ok=$r_ok fail=$r_fail
+} -result {ok=deep fail=1}
+
+test mt.lifecycle.2 {load depth resets after error} -body {
+    set bad [makeFile "" mt.lifecycle.2-bad.tbcx]
+    set good [makeFile "" mt.lifecycle.2-good.tbcx]
+    tbcx::save {error "boom"} $bad
+    tbcx::save {return "ok"} $good
+    catch {tbcx::load $bad}
+    catch {tbcx::load $bad}
+    catch {tbcx::load $bad}
+    tbcx::load $good
+} -result ok
+
+test mt.lifecycle.3 {GC purge after load} -body {
+    set out [makeFile "" mt.lifecycle.3.tbcx]
+    tbcx::save {
+        set lam [list {x} {expr {$x + 1}}]
+        return [apply $lam 10]
+    } $out
+    set r1 [tbcx::load $out]
+    tbcx::gc
+    set r2 [tbcx::load $out]
+    list $r1 $r2
+} -result {11 11}
+
+test mt.lifecycle.4 {sequential OO loads get distinct shim names} -body {
+    set results {}
+    for {set i 0} {$i < 5} {incr i} {
+        set out [makeFile "" mt.lifecycle.4-$i.tbcx]
+        set script [string map [list %I% $i] {
+            oo::class create C%I%
+            oo::define C%I% method val {} { return %I% }
+            return [[C%I% new] val]
+        }]
+        tbcx::save $script $out
+        lappend results [tbcx::load $out]
+    }
+    set results
+} -result {0 1 2 3 4}
+
+test mt.lifecycle.5 {PrecompClass failure detected (not suppressed)} -body {
+    set out [makeFile "" mt.lifecycle.5.tbcx]
+    tbcx::save {
+        oo::class create Valid
+        oo::define Valid {
+            method m {} { return "valid" }
+        }
+        return [[Valid new] m]
+    } $out
+    set results {}
+    for {set i 0} {$i < 3} {incr i} {
+        interp create V$i
+        interp eval V$i [list package require tbcx]
+        lappend results [interp eval V$i [list tbcx::load $out]]
+        interp delete V$i
+    }
+    set results
+} -result {valid valid valid}
+
+# ========================================================================
+# Section 4: Concurrent stress (requires Thread package)
+# ========================================================================
+
+test mt.stress.1 {stress: N threads full OO save+load} \
+    -constraints haveThread -body {
+    set N 8
+    set tids {}
+    set outfiles {}
+    set scripts {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend outfiles [makeFile "" mt.stress.1-$i.tbcx]
+        lappend scripts [string map [list %I% $i] {
+            oo::class create W%I%
+            oo::define W%I% method id {} { return %I% }
+            set w [W%I% new]
+            return [$w id]
+        }]
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{script f} {
+            tbcx::save $script $f
+            set ::_result [tbcx::load $f]
+        }} [lindex $scripts $i] [lindex $outfiles $i]]
+    }
+    set results {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend results [thread::send [lindex $tids $i] {set ::_result}]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {0 1 2 3 4 5 6 7}
+
+test mt.stress.2 {stress: N threads lambda save+load+apply} \
+    -constraints haveThread -body {
+    set N 6
+    set tids {}
+    set outfiles {}
+    set scripts {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend outfiles [makeFile "" mt.stress.2-$i.tbcx]
+        set val [expr {$i * 10}]
+        lappend scripts [string map [list %V% $val] {
+            set add [list {a b} {expr {$a + $b}}]
+            return [apply $add %V% 5]
+        }]
+        set tid [thread::create]
+        lappend tids $tid
+        thread::send $tid [list package require tbcx]
+    }
+    for {set i 0} {$i < $N} {incr i} {
+        thread::send -async [lindex $tids $i] [list apply {{script f} {
+            tbcx::save $script $f
+            set ::_result [tbcx::load $f]
+        }} [lindex $scripts $i] [lindex $outfiles $i]]
+    }
+    set results {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend results [thread::send [lindex $tids $i] {set ::_result}]
+    }
+    foreach tid $tids { thread::release $tid }
+    set results
+} -result {5 15 25 35 45 55}
+
+test mt.stress.3 {stress: threads creating child interps with OO+lambda loads} \
+    -constraints haveThread -body {
+    set out [makeFile "" mt.stress.3.tbcx]
+    tbcx::save {
+        oo::class create Calc
+        oo::define Calc method run {x} {
+            set sq [list {n} {expr {$n * $n}}]
+            return [apply $sq $x]
+        }
+        return [[Calc new] run 7]
+    } $out
+    set N 4
+    set M 3
+    set tids {}
+    for {set i 0} {$i < $N} {incr i} {
+        lappend tids [thread::create]
+    }
+    set results {}
+    foreach tid $tids {
+        set r [thread::send $tid [list apply {{f M} {
+            package require tbcx
+            set rs {}
+            for {set j 0} {$j < $M} {incr j} {
+                interp create child$j
+                interp eval child$j [list package require tbcx]
+                lappend rs [interp eval child$j [list tbcx::load $f]]
+                interp delete child$j
+            }
+            set rs
+        }} $out $M]]
+        lappend results $r
+    }
+    foreach tid $tids { thread::release $tid }
+    set allOk 1
+    foreach r $results {
+        if {$r ne "49 49 49"} { set allOk 0 }
+    }
+    list allOk=$allOk threads=$N interpsPerThread=$M
+} -result {allOk=1 threads=4 interpsPerThread=3}
+
+cleanupTests

@@ -1,4 +1,10 @@
 # -*-Tcl-*-
+# 09-threads.test — Basic threaded load test
+#
+# Verifies that tbcx::load works correctly in a separate thread.
+#
+# Optional: Thread package (tests with -constraints haveThread)
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

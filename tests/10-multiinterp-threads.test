@@ -1,4 +1,11 @@
 # -*-Tcl-*-
+# 10-multiinterp-threads.test — Thread + child interpreter combination test
+#
+# Verifies that creating a child interpreter inside a thread, loading
+# a .tbcx file, and evaluating it produces correct results.
+#
+# Optional: Thread package (tests with -constraints haveThread)
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

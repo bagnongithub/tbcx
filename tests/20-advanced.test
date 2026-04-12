@@ -1,4 +1,10 @@
 # -*-Tcl-*-
+# 20-advanced.test — Advanced language feature round-trip tests
+#
+# Exercises apply with namespaces, coroutines, tailcall, upvar/uplevel,
+# ensembles, interp aliases, dynamic proc creation, and other advanced
+# Tcl patterns across tbcx save/load cycles.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

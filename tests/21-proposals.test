@@ -6,7 +6,7 @@ package require tcltest 2.5
 namespace import ::tcltest::*
 
 # =====================================================================
-# P1: Precompile namespace eval bodies
+# Precompile namespace eval bodies
 #
 # namespace eval bodies should execute correctly after save/load.
 # The key difference from baseline is that the bodies are now compiled
@@ -103,7 +103,7 @@ test p1.5 {P1: namespace eval with list/dict manipulation} -body {
 } -result 3
 
 # =====================================================================
-# P2: Recurse into control-flow bodies
+# Recurse into control-flow bodies
 #
 # Procs defined inside if/while/for/foreach/catch/try must be captured.
 # Non-literal arguments (variable refs) must NOT be corrupted.
@@ -327,7 +327,7 @@ test p2.16 {P2: switch command (not handled—verbatim pass-through)} -body {
 } -result 2
 
 # =====================================================================
-# P3: Direct proc install (skip TclCreateProc for 2nd+ proc)
+# Direct proc install (skip TclCreateProc for 2nd+ proc)
 #
 # Correctness: many procs all callable after load.
 # Performance: implicit (tested via stress below).
@@ -409,7 +409,7 @@ test p3.5 {P3: recursive proc via direct install} -body {
 } -result {55 55}
 
 # =====================================================================
-# P4: Pre-compile ctor/dtor wrapper
+# Pre-compile ctor/dtor wrapper
 #
 # Constructors and destructors should work correctly after load.
 # =====================================================================
@@ -472,7 +472,7 @@ test p4.3 {P4: constructor with default args} -body {
 } -result {42 99}
 
 # =====================================================================
-# P5: Precompile OO builder stubs (subsumed by P1/P6)
+# Precompile OO builder stubs (subsumed by P1/P6)
 #
 # Classes using the builder form should still load correctly.
 # =====================================================================
@@ -510,7 +510,7 @@ test p5.2 {P5: builder body with non-method subcommands} -body {
 } -result child-base
 
 # =====================================================================
-# P6: Generic script detection
+# Generic script detection
 #
 # String literals that look like evaluable scripts should still work
 # correctly after save/load (they get pre-compiled in the literal pool).
@@ -561,7 +561,7 @@ test p6.3 {P6: interp eval with script (correctness)} -body {
 } -result 84
 
 # =====================================================================
-# P8: Scrub remaining string literals
+# Scrub remaining string literals
 #
 # Verify that proc/method body source code is not visible in the
 # .tbcx binary or in tbcx::dump output.
@@ -645,7 +645,7 @@ test p8.4 {P8: non-definition strings preserved} -body {
 } -result {the proc finished processing}
 
 # =====================================================================
-# P9: tbcx::gc — ApplyShim lifecycle management
+# tbcx::gc — ApplyShim lifecycle management
 # =====================================================================
 
 test p9.1 {P9: gc before any load is a no-op} -body {

@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 12-roundtrip.test — Full save/load/eval/dump round-trip tests
+#
+# Verifies the complete compile→save→load→eval pipeline, including
+# re-saving loaded bytecode and dump output integrity.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

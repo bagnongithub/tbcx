@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 14-namespaces.test — Namespace handling round-trip tests
+#
+# Verifies that procs, variables, and OO classes defined inside
+# namespaces survive save/load with correct fully-qualified names.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

@@ -2,14 +2,14 @@
 # 27-improvements.test -- verify instruction-level body precompilation
 # and self method capture.
 #
-# Improvement #1: body arguments to eval-like commands (foreach, while,
-#   for, try, dict for, lmap, catch, eval, uplevel, time) should be
-#   precompiled as bytecode instead of leaking as plaintext strings.
+# body arguments to eval-like commands (foreach, while,
+# for, try, dict for, lmap, catch, eval, uplevel, time) should be
+# precompiled as bytecode instead of leaking as plaintext strings.
 #
-# Improvement #2: "self method" definitions inside oo::class builder
-#   bodies should have their bodies captured and stubbed, preventing
-#   source text leakage.
-#
+# "self method" definitions inside oo::class builder
+# bodies should have their bodies captured and stubbed, preventing
+# source text leakage.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

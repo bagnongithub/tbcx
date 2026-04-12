@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 19-edge-cases.test — Edge case and boundary condition tests
+#
+# Covers empty scripts, whitespace-only scripts, very long strings,
+# special characters, and other degenerate inputs for tbcx save/load.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

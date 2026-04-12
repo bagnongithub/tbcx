@@ -8,7 +8,8 @@
 #     tbcx::save comprehensive.tcl out.tbcx
 #     set result [tbcx::load out.tbcx]
 #
-# Returns a flat list of {tag value} pairs.  Expected result at bottom.
+# Returns a summary string ("N passed, M failed: ...").
+# When run directly under tclsh, exits non-zero on failure.
 # ============================================================================
 
 set ::results {}
@@ -2001,8 +2002,18 @@ foreach r $::results {
     }
 }
 
-if {$fail > 0} {
-    return "$pass passed, $fail failed: $failures"
+if {[info exists ::argv0] && $::argv0 eq [info script]} {
+    if {$fail > 0} {
+        puts stderr "$pass passed, $fail failed: $failures"
+        exit 1
+    } else {
+        puts "$pass passed, 0 failed"
+        exit 0
+    }
 } else {
-    return "$pass passed, 0 failed"
+    if {$fail > 0} {
+        return "$pass passed, $fail failed: $failures"
+    } else {
+        return "$pass passed, 0 failed"
+    }
 }

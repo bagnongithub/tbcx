@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 04-procs.test — Proc compilation and body substitution tests
+#
+# Verifies that proc definitions with compiled bodies survive save/load,
+# including default arguments, variadic args, and recursive calls.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

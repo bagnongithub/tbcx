@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 03-exceptions.test — Exception range round-trip tests
+#
+# Verifies that try/catch, catch, and nested exception handlers
+# survive bytecode serialization with correct control flow.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

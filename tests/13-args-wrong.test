@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 13-args-wrong.test — Command argument validation tests
+#
+# Verifies that tbcx::save, tbcx::load, tbcx::dump, and tbcx::gc
+# reject incorrect argument counts with proper error messages.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

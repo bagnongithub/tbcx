@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 16-expressions.test — Expression and math operator round-trip tests
+#
+# Verifies arithmetic, comparison, logical, bitwise, and floating-point
+# expressions survive bytecode serialization with correct results.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

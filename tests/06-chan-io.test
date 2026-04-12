@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 06-chan-io.test — Channel-based I/O tests
+#
+# Verifies save/load via open Tcl channels (as opposed to file paths),
+# including binary-mode enforcement and channel error handling.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*

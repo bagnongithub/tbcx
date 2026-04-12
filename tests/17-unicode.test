@@ -1,4 +1,9 @@
 # -*-Tcl-*-
+# 17-unicode.test — Unicode and non-ASCII string round-trip tests
+#
+# Verifies that accented Latin, CJK ideographs, emoji, and other
+# multi-byte UTF-8 strings survive tbcx save/load correctly.
+
 package require tbcx
 package require tcltest 2.5
 namespace import ::tcltest::*
