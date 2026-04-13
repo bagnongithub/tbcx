@@ -75,10 +75,18 @@ typedef struct {
 } ProcShim;
 
 typedef struct {
-    Tcl_HashTable methodsByKey;                        /* key: STRING "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
-    char          origName[TBCX_OSHIM_NAME_MAX];       /* unique rename target for oo::define (reentrancy-safe) */
-    char          origNameObjDef[TBCX_OSHIM_NAME_MAX]; /* unique rename target for oo::objdefine */
-    int           hasObjDefine;                        /* 1 if oo::objdefine was successfully shimmed */
+    Tcl_HashTable    methodsByKey;         /* key: STRING "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
+    Command         *defineCmdPtr;         /* cached oo::define Command (NULL if invalidated by rename/delete) */
+    Command         *objdefCmdPtr;         /* cached oo::objdefine Command (NULL if invalidated) */
+    int              defineTraceInstalled; /* 1 if command trace is active on oo::define */
+    int              objdefTraceInstalled; /* 1 if command trace is active on oo::objdefine */
+    Tcl_ObjCmdProc2 *savedDefineProc;
+    Tcl_ObjCmdProc2 *savedDefineNre;
+    void            *savedDefineCD;
+    Tcl_ObjCmdProc2 *savedObjdefProc;
+    Tcl_ObjCmdProc2 *savedObjdefNre;
+    void            *savedObjdefCD;
+    int              hasObjDefine; /* 1 if oo::objdefine was successfully shimmed */
 } OOShim;
 
 /* ApplyShim — persistent interceptor on the [apply] command.
@@ -119,10 +127,10 @@ typedef struct {
  * (formerly the process-global tbcxHiddenId). */
 typedef struct {
     Tcl_Interp *interp;
-    ApplyShim   apply;          /* embedded — no separate heap allocation */
-    int         applyActive;    /* 1 once the [apply] shim has been installed */
-    Tcl_Size    loadDepth;      /* reentrancy depth for tbcx::load */
-    uint64_t    nextHiddenId;   /* per-interp OO shim rename counter */
+    ApplyShim   apply;        /* embedded — no separate heap allocation */
+    int         applyActive;  /* 1 once the [apply] shim has been installed */
+    Tcl_Size    loadDepth;    /* reentrancy depth for tbcx::load */
+    uint64_t    nextHiddenId; /* per-interp OO shim rename counter */
 } TbcxInterpState;
 
 typedef struct {
@@ -160,6 +168,8 @@ static ApplyShim  *EnsureApplyShim(Tcl_Interp *ip);
 static void        FixCompiledLocalNames(Proc *procPtr, LocalCache *lc);
 static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch);
 static int         MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name);
+static void        OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
+static void        OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static void        OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *const objv[], Tcl_Obj *clsFqn, Tcl_DString *keyDs, uint8_t *kindOut, Tcl_Size *bodyIdxOut, Tcl_Obj **runtimeArgsOut,
                                          Tcl_Obj **nameOOut, Tcl_Obj **tmpEmptyArgsOut, int *hasKeyOut);
 static void        OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut);
@@ -191,15 +201,15 @@ void               TbcxApplyShimPurgeAll(Tcl_Interp *ip);
 static ByteCode   *TbcxByteCode(Tcl_Obj *objPtr, const Tcl_ObjType *typePtr, const TBCX_CompileEnvMin *env, int setPrecompiled);
 static void        TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr);
 static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip);
-static void        TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
-static void        TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
-static void        TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
+static void             TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
+static void             TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
+static void             TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
 
 /* ==========================================================================
  * Buffered Read I/O & Utilities
  * ========================================================================== */
 
-static inline void R_Error(TbcxIn *r, const char *msg) {
+static inline void      R_Error(TbcxIn *r, const char *msg) {
     if (r->err == TCL_OK) {
         Tcl_SetObjResult(r->interp, Tcl_NewStringObj(msg, -1));
         r->err = TCL_ERROR;
@@ -482,7 +492,8 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj 
 
 static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt) {
     int      rc    = TCL_OK;
-    Tcl_Obj *argv0 = Tcl_NewStringObj(os->origName, -1);
+    /* argv0 is only used for error messages in the original handler */
+    Tcl_Obj *argv0 = Tcl_NewStringObj("oo::define", -1);
     Tcl_IncrRefCount(argv0);
 
     /* Fast path for methods (instance/class): always direct */
@@ -493,7 +504,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         Tcl_IncrRefCount(argsOpt);
         Tcl_IncrRefCount(bodyOpt);
         Tcl_Obj *av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
-        rc             = Tcl_EvalObjv(ip, 6, av, 0);
+        rc             = os->savedDefineProc(os->savedDefineCD, ip, 6, av);
         Tcl_DecrRefCount(bodyOpt);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(nameOpt);
@@ -512,8 +523,8 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         Proc                     *preProc        = pbIR ? (Proc *)pbIR->twoPtrValue.ptr1 : NULL;
 
         /* Save preProc fields BEFORE step 1 — the procbody's Proc may be
-           corrupted during oo::define evaluation (observed: numCompiledLocals
-           becomes garbage after the Tcl_EvalObjv in step 1). */
+           corrupted during oo::define handler execution (observed:
+           numCompiledLocals becomes garbage after step 1). */
         Tcl_Obj                  *savedBody      = preProc ? preProc->bodyPtr : NULL;
         Tcl_Size                  savedNumLocals = preProc ? preProc->numCompiledLocals : 0;
         if (savedBody)
@@ -529,7 +540,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         Tcl_Obj *placeholder = Tcl_NewStringObj(";", 1);
         Tcl_IncrRefCount(placeholder);
         Tcl_Obj *av[7] = {argv0, clsFqn, selfSub, methSub, nameOpt, argsOpt, placeholder};
-        rc             = Tcl_EvalObjv(ip, 7, av, 0);
+        rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
         Tcl_DecrRefCount(placeholder);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(nameOpt);
@@ -585,7 +596,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         const Tcl_ObjInternalRep *pbIR            = Tcl_FetchInternalRep(bodyOpt, tbcxTyProcBody);
         Proc                     *preProc         = pbIR ? (Proc *)pbIR->twoPtrValue.ptr1 : NULL;
 
-        /* Step 1: Create ctor/dtor with empty body via the renamed original
+        /* Step 1: Create ctor/dtor with empty body via the saved original
            oo::define.  TclOO builds the full Method/Proc/dispatch structure,
            so 'next' etc. work in the correct context. */
         /* CRITICAL: The placeholder body MUST be non-empty.  TclOO's
@@ -602,7 +613,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
             Tcl_IncrRefCount(sub);
             Tcl_IncrRefCount(argsOpt);
             Tcl_Obj *cav[5] = {argv0, clsFqn, sub, argsOpt, placeholderBody};
-            rc              = Tcl_EvalObjv(ip, 5, cav, 0);
+            rc              = os->savedDefineProc(os->savedDefineCD, ip, 5, cav);
             Tcl_DecrRefCount(argsOpt);
             Tcl_DecrRefCount(sub);
         } else /* TBCX_METH_DTOR */
@@ -610,7 +621,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
             Tcl_Obj *sub = Tcl_NewStringObj("destructor", -1);
             Tcl_IncrRefCount(sub);
             Tcl_Obj *dav[4] = {argv0, clsFqn, sub, placeholderBody};
-            rc              = Tcl_EvalObjv(ip, 4, dav, 0);
+            rc              = os->savedDefineProc(os->savedDefineCD, ip, 4, dav);
             Tcl_DecrRefCount(sub);
         }
         Tcl_DecrRefCount(placeholderBody);
@@ -668,7 +679,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         Tcl_IncrRefCount(argsOpt);
         Tcl_IncrRefCount(bodyOpt);
         Tcl_Obj *av[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
-        rc             = Tcl_EvalObjv(ip, 5, av, 0);
+        rc             = os->savedDefineProc(os->savedDefineCD, ip, 5, av);
         Tcl_DecrRefCount(bodyOpt);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(sub);
@@ -697,13 +708,13 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         if (useShort) {
             Tcl_IncrRefCount(bodyOpt);
             Tcl_Obj *dv[4] = {argv0, clsFqn, sub, bodyOpt};
-            rc             = Tcl_EvalObjv(ip, 4, dv, 0);
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 4, dv);
             Tcl_DecrRefCount(bodyOpt);
         } else {
             Tcl_IncrRefCount(argsOpt);
             Tcl_IncrRefCount(bodyOpt);
             Tcl_Obj *dv[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
-            rc             = Tcl_EvalObjv(ip, 5, dv, 0);
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 5, dv);
             Tcl_DecrRefCount(bodyOpt);
             Tcl_DecrRefCount(argsOpt);
         }
@@ -807,7 +818,7 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
         }
         const char *nameStr = q + 1; /* may be empty */
         /* Skip SELF methods — they are installed by the oo::objdefine stub
-           in the top-level bytecode, which forwards to the renamed original
+           in the top-level bytecode, which forwards to the saved original
            oo::objdefine with the precompiled body substituted.  Installing
            SELF methods here via DefOO's create-then-swap corrupts TclOO's
            dispatch chain (the Method exists in the hash but is invisible
@@ -844,24 +855,45 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     }
     /* Restore unexported method flags that were lost during DefOO body
        swaps.  DefOO re-creates methods via oo::define which resets flags
-       to PUBLIC, losing any prior "unexport" from the builder body. */
+       to PUBLIC, losing any prior "unexport" from the builder body.
+
+       The unexport subcommand requires Tcl's full command dispatch context
+       (TclOO dispatches it through an internal ensemble mechanism).  Direct
+       savedDefineProc calls bypass that context and silently fail.  We
+       temporarily restore the original handler on the Command struct so
+       that Tcl_EvalObjv("oo::define") routes to TclOO directly — no
+       recursion through CmdOOShim because the shim is temporarily removed.
+       This is safe: single-threaded, no user code executes in this loop. */
     if (rc == TCL_OK && unexportedList) {
         Tcl_Size  uLen   = 0;
         Tcl_Obj **uElems = NULL;
-        if (Tcl_ListObjGetElements(ip, unexportedList, &uLen, &uElems) == TCL_OK) {
-            Tcl_Obj *defCmd = Tcl_NewStringObj(os->origName, -1);
+        if (Tcl_ListObjGetElements(ip, unexportedList, &uLen, &uElems) == TCL_OK && uLen > 0 && os->defineCmdPtr) {
+            /* Temporarily restore original handlers */
+            os->defineCmdPtr->objProc2       = os->savedDefineProc;
+            os->defineCmdPtr->objClientData2 = os->savedDefineCD;
+            if (os->savedDefineNre)
+                os->defineCmdPtr->nreProc2 = os->savedDefineNre;
+
+            Tcl_Obj *defCmd = Tcl_NewStringObj("oo::define", -1);
             Tcl_IncrRefCount(defCmd);
             Tcl_Obj *unexpSub = Tcl_NewStringObj("unexport", -1);
             Tcl_IncrRefCount(unexpSub);
             for (Tcl_Size ui = 0; ui < uLen; ui++) {
                 Tcl_Obj *av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
-                rc = Tcl_EvalObjv(ip, 4, av, 0);
+                rc             = Tcl_EvalObjv(ip, 4, av, 0);
                 if (rc != TCL_OK) {
                     break;
                 }
             }
             Tcl_DecrRefCount(unexpSub);
             Tcl_DecrRefCount(defCmd);
+
+            /* Re-install the shim */
+            os->defineCmdPtr->objProc2       = CmdOOShim;
+            os->defineCmdPtr->objClientData2 = os;
+            if (os->savedDefineNre)
+                os->defineCmdPtr->nreProc2 = CmdOOShim;
+
             if (rc == TCL_OK) {
                 Tcl_ResetResult(ip);
             }
@@ -958,16 +990,13 @@ static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, in
 
 static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
     TBCX_ASSERT_INTERP_THREAD(ip);
-    OOShim  *os  = (OOShim *)cd;
-    int      rc  = TCL_OK;
-    Tcl_Obj *cls = NULL, *sub = NULL;
-    Tcl_Obj *nameO = NULL; /* method/classmethod name when applicable */
+    OOShim   *os  = (OOShim *)cd;
+    int       rc  = TCL_OK;
+    Tcl_Obj  *cls = NULL, *sub = NULL;
+    Tcl_Obj  *nameO = NULL; /* method/classmethod name when applicable */
 
-    /* Prepare argv for calling the renamed original command. */
-    Tcl_Obj *argv0 = Tcl_NewStringObj(os->origName, -1);
-
-    Tcl_IncrRefCount(argv0);
-    /* stack-allocate for typical command widths to avoid per-call heap alloc */
+    /* Prepare argv for calling the saved original handler.
+       argv2[0] = objv[0] (the command name the caller used). */
     Tcl_Obj  *argvStack[TBCX_ARGV_STACK];
     Tcl_Obj **argv2;
     if (objc <= TBCX_ARGV_STACK) {
@@ -975,21 +1004,19 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
     } else {
         size_t allocSz;
         if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj *), (size_t)objc, &allocSz)) {
-            Tcl_DecrRefCount(argv0);
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument count overflow in oo::define shim", -1));
             return TCL_ERROR;
         }
         argv2 = (Tcl_Obj **)Tcl_Alloc(allocSz);
     }
-    argv2[0] = argv0;
+    argv2[0] = objv[0];
     for (Tcl_Size i = 1; i < objc; i++) {
         argv2[i] = objv[i];
     }
 
     /* Fast path: if we don't even have "class subcmd ..." just forward. */
     if (objc < 3) {
-        rc = Tcl_EvalObjv(ip, objc, argv2, 0);
-        Tcl_DecrRefCount(argv0);
+        rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
         if (argv2 != argvStack)
             Tcl_Free(argv2);
         return rc;
@@ -1103,7 +1130,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 /* Forward to original; normalize the class arg to FQN */
                 argv2[1] = clsFqn;
                 Tcl_IncrRefCount(clsFqn);
-                rc = Tcl_EvalObjv(ip, objc, argv2, 0);
+                rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
                 Tcl_DecrRefCount(clsFqn);
             }
         } else {
@@ -1112,7 +1139,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 argv2[1] = clsFqn;
                 Tcl_IncrRefCount(clsFqn);
             }
-            rc = Tcl_EvalObjv(ip, objc, argv2, 0);
+            rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
             if (objc >= 2)
                 Tcl_DecrRefCount(clsFqn);
         }
@@ -1124,7 +1151,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             argv2[1] = clsFqn;
             Tcl_IncrRefCount(clsFqn);
         }
-        rc = Tcl_EvalObjv(ip, objc, argv2, 0);
+        rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
         if (objc >= 2)
             Tcl_DecrRefCount(clsFqn);
         if (rc == TCL_OK) {
@@ -1138,7 +1165,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
      * HARDENING: Even if the inline substitution above didn’t trigger,
      * ensure the precompiled body is installed. If we have a saved
      * {args,procbody} pair for this exact define form, re-apply it now
-     * using the renamed original (os->origName). This
+     * using the saved original handler. This
      * guarantees the constructor/method ends up with the compiled body
      * instead of the empty stub emitted by the saver.
      */
@@ -1185,24 +1212,21 @@ cleanup:
         Tcl_DecrRefCount(clsFqn);
     if (tmpEmptyArgs)
         Tcl_DecrRefCount(tmpEmptyArgs);
-    Tcl_DecrRefCount(argv0);
     if (argv2 != argvStack)
         Tcl_Free(argv2);
     return rc;
 }
 
 /* oo::objdefine shim — mirrors CmdOOShim logic but forwards to
-   the renamed oo::objdefine (origNameObjDef).  Uses the same
+   the saved original oo::objdefine handler.  Uses the same
    methodsByKey registry since saver stores objdefine methods
    there keyed by the object/class FQN. */
 static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
     TBCX_ASSERT_INTERP_THREAD(ip);
-    OOShim  *os    = (OOShim *)cd;
-    int      rc    = TCL_OK;
+    OOShim   *os = (OOShim *)cd;
+    int       rc = TCL_OK;
 
-    Tcl_Obj *argv0 = Tcl_NewStringObj(os->origNameObjDef, -1);
-    Tcl_IncrRefCount(argv0);
-
+    /* Prepare argv for calling the saved original handler. */
     Tcl_Obj  *argvStack[TBCX_ARGV_STACK];
     Tcl_Obj **argv2;
     if (objc <= TBCX_ARGV_STACK) {
@@ -1210,19 +1234,17 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
     } else {
         size_t allocSz;
         if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj *), (size_t)objc, &allocSz)) {
-            Tcl_DecrRefCount(argv0);
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument count overflow in oo::objdefine shim", -1));
             return TCL_ERROR;
         }
         argv2 = (Tcl_Obj **)Tcl_Alloc(allocSz);
     }
-    argv2[0] = argv0;
+    argv2[0] = objv[0];
     for (Tcl_Size i = 1; i < objc; i++)
         argv2[i] = objv[i];
 
     if (objc < 3) {
-        rc = Tcl_EvalObjv(ip, objc, argv2, 0);
-        Tcl_DecrRefCount(argv0);
+        rc = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
         if (argv2 != argvStack)
             Tcl_Free(argv2);
         return rc;
@@ -1321,11 +1343,10 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
                     } else {
                         /* Substitute the body argument and forward */
                         argv2[bodyIdx] = preBody;
-                        rc             = Tcl_EvalObjv(ip, objc, argv2, 0);
+                        rc             = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
                         Tcl_DStringFree(&keyDs);
                         if (objFqn != obj)
                             Tcl_DecrRefCount(objFqn);
-                        Tcl_DecrRefCount(argv0);
                         if (argv2 != argvStack)
                             Tcl_Free(argv2);
                         return rc;
@@ -1338,95 +1359,106 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
 
 objdefine_forward:
     /* Builder form or unmatched: forward to real oo::objdefine */
-    rc = Tcl_EvalObjv(ip, objc, argv2, 0);
+    rc = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
 
     /* After builder form execution, apply precompiled bodies.
-       Use oo::define (the renamed original) for body installation via PrecompClass,
+       Use the saved oo::define handler for body installation via PrecompClass,
        since per-object methods can also be set through oo::define on the object. */
     if (isBuilderForm && rc == TCL_OK) {
         int patchRc = PrecompClass(ip, os, objFqn);
         if (patchRc != TCL_OK) {
-            rc = patchRc;   /* preserve PrecompClass() error/result */
+            rc = patchRc; /* preserve PrecompClass() error/result */
         }
     }
 
     if (objFqn != obj)
         Tcl_DecrRefCount(objFqn);
-    Tcl_DecrRefCount(argv0);
     if (argv2 != argvStack)
         Tcl_Free(argv2);
     return rc;
 }
 
+/* OOShimDefineCmdTrace — called when "oo::define" is renamed or deleted
+ * while the shim is active.  Invalidates the cached Command* to prevent
+ * stale-pointer writes in DelOOShim. */
+static void OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
+    OOShim *os = (OOShim *)cd;
+    (void)interp;
+    (void)oldName;
+    (void)newName;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
+        os->defineCmdPtr         = NULL;
+        os->defineTraceInstalled = 0;
+    }
+}
+
+/* OOShimObjdefCmdTrace — same for "oo::objdefine". */
+static void OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
+    OOShim *os = (OOShim *)cd;
+    (void)interp;
+    (void)oldName;
+    (void)newName;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
+        os->objdefCmdPtr         = NULL;
+        os->objdefTraceInstalled = 0;
+    }
+}
+
 /* AddOOShim — intercept [oo::define] and [oo::objdefine] to substitute
  * precompiled method/constructor/destructor bodies.
  *
+ * Patches the existing Command handlers in place (like ProcShim and
+ * ApplyShim) instead of renaming commands.  Installs rename/delete
+ * traces to detect if the shimmed commands are moved or destroyed
+ * during top-level script execution.
+ *
  * Thread safety / lock ordering:
- *   Calls TclRenameCommand and Tcl_CreateObjCommand2, both of which may
- *   acquire Tcl-internal mutexes.  No TBCX mutex is held during this call.
+ *   No TBCX mutex is held during this call.
  *   Must be called from the interp-owning thread only. */
 static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
     memset(os, 0, sizeof(*os));
     Tcl_InitHashTable(&os->methodsByKey, TCL_STRING_KEYS);
 
-    /* Generate a unique rename target so nested tbcx::load calls don't
-       collide.  Each nesting level gets its own orig command name.
-       The counter is per-interpreter (no mutex needed). */
-    TbcxInterpState *st = TbcxGetInterpState(ip);
-    if (st->nextHiddenId == UINT64_MAX) {
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: OO shim ID counter exhausted"));
+    /* Find and patch oo::define */
+    Tcl_Command defToken = Tcl_FindCommand(ip, "oo::define", NULL, 0);
+    if (!defToken) {
+        Tcl_DeleteHashTable(&os->methodsByKey);
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: oo::define not found", -1));
         return TCL_ERROR;
     }
-    uint64_t myId = st->nextHiddenId++;
+    os->defineCmdPtr    = (Command *)defToken;
+    os->savedDefineProc = os->defineCmdPtr->objProc2;
+    os->savedDefineNre  = os->defineCmdPtr->nreProc2;
+    os->savedDefineCD   = os->defineCmdPtr->objClientData2;
 
-    /* Build unique rename targets using Tcl_ObjPrintf instead of raw snprintf */
-    {
-        Tcl_Obj *tmp = Tcl_ObjPrintf("::tbcx::__oo_define_orig_%" PRIu64 "__", myId);
-        Tcl_IncrRefCount(tmp);
-        Tcl_Size    len = 0;
-        const char *s   = Tbcx_GetStringFromObjSafe(tmp, &len);
-        if (!s) {
-            Tcl_DecrRefCount(tmp);
-            return TCL_ERROR;
-        }
-        if (len >= (Tcl_Size)sizeof(os->origName))
-            len = (Tcl_Size)(sizeof(os->origName) - 1);
-        memcpy(os->origName, s, (size_t)len);
-        os->origName[len] = '\0';
-        Tcl_DecrRefCount(tmp);
-
-        tmp = Tcl_ObjPrintf("::tbcx::__oo_objdef_orig_%" PRIu64 "__", myId);
-        Tcl_IncrRefCount(tmp);
-        s = Tbcx_GetStringFromObjSafe(tmp, &len);
-        if (!s) {
-            Tcl_DecrRefCount(tmp);
-            return TCL_ERROR;
-        }
-        if (len >= (Tcl_Size)sizeof(os->origNameObjDef))
-            len = (Tcl_Size)(sizeof(os->origNameObjDef) - 1);
-        memcpy(os->origNameObjDef, s, (size_t)len);
-        os->origNameObjDef[len] = '\0';
-        Tcl_DecrRefCount(tmp);
-    }
-
-    if (TclRenameCommand(ip, "oo::define", os->origName) != TCL_OK) {
+    if (Tcl_TraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os) != TCL_OK) {
         Tcl_DeleteHashTable(&os->methodsByKey);
         return TCL_ERROR;
     }
-    if (!Tcl_CreateObjCommand2(ip, "oo::define", CmdOOShim, os, NULL)) {
-        /* Shim creation failed after rename — restore original command name */
-        (void)TclRenameCommand(ip, os->origName, "oo::define");
-        Tcl_DeleteHashTable(&os->methodsByKey);
-        return TCL_ERROR;
+    os->defineTraceInstalled         = 1;
+
+    os->defineCmdPtr->objProc2       = CmdOOShim;
+    os->defineCmdPtr->objClientData2 = os;
+    if (os->defineCmdPtr->nreProc2) {
+        os->defineCmdPtr->nreProc2 = CmdOOShim;
     }
 
     /* Also shim oo::objdefine if it exists */
-    os->hasObjDefine = 0;
-    if (TclRenameCommand(ip, "oo::objdefine", os->origNameObjDef) == TCL_OK) {
-        if (!Tcl_CreateObjCommand2(ip, "oo::objdefine", CmdOOShimObjDef, os, NULL)) {
-            /* Restore objdefine and continue — define shim is still active */
-            (void)TclRenameCommand(ip, os->origNameObjDef, "oo::objdefine");
-        } else {
+    os->hasObjDefine        = 0;
+    Tcl_Command objdefToken = Tcl_FindCommand(ip, "oo::objdefine", NULL, 0);
+    if (objdefToken) {
+        os->objdefCmdPtr    = (Command *)objdefToken;
+        os->savedObjdefProc = os->objdefCmdPtr->objProc2;
+        os->savedObjdefNre  = os->objdefCmdPtr->nreProc2;
+        os->savedObjdefCD   = os->objdefCmdPtr->objClientData2;
+
+        if (Tcl_TraceCommand(ip, "oo::objdefine", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os) == TCL_OK) {
+            os->objdefTraceInstalled         = 1;
+            os->objdefCmdPtr->objProc2       = CmdOOShimObjDef;
+            os->objdefCmdPtr->objClientData2 = os;
+            if (os->objdefCmdPtr->nreProc2) {
+                os->objdefCmdPtr->nreProc2 = CmdOOShimObjDef;
+            }
             os->hasObjDefine = 1;
         }
     }
@@ -1434,12 +1466,34 @@ static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
 }
 
 static void DelOOShim(Tcl_Interp *ip, OOShim *os) {
-    Tcl_DeleteCommand(ip, "oo::define");
-    (void)TclRenameCommand(ip, os->origName, "oo::define");
-    if (os->hasObjDefine) {
-        Tcl_DeleteCommand(ip, "oo::objdefine");
-        (void)TclRenameCommand(ip, os->origNameObjDef, "oo::objdefine");
+    /* Remove traces before restoring handlers */
+    if (os->defineTraceInstalled) {
+        Tcl_UntraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os);
+        os->defineTraceInstalled = 0;
     }
+    /* Restore oo::define handlers only if the Command is still alive */
+    if (os->defineCmdPtr) {
+        os->defineCmdPtr->objProc2       = os->savedDefineProc;
+        os->defineCmdPtr->objClientData2 = os->savedDefineCD;
+        if (os->savedDefineNre) {
+            os->defineCmdPtr->nreProc2 = os->savedDefineNre;
+        }
+    }
+
+    if (os->hasObjDefine) {
+        if (os->objdefTraceInstalled) {
+            Tcl_UntraceCommand(ip, "oo::objdefine", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os);
+            os->objdefTraceInstalled = 0;
+        }
+        if (os->objdefCmdPtr) {
+            os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+            os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
+            if (os->savedObjdefNre) {
+                os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
+            }
+        }
+    }
+
     Tcl_HashSearch s;
     Tcl_HashEntry *e;
     for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s)) {
@@ -1451,10 +1505,21 @@ static void DelOOShim(Tcl_Interp *ip, OOShim *os) {
 }
 
 Tcl_Namespace *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn) {
-    Tcl_Namespace *nsPtr = NULL;
-    /* use flag 0 to avoid leaving error messages that linger
-     * when the namespace doesn't exist but will be created */
-    nsPtr                = Tcl_FindNamespace(ip, fqn, NULL, 0);
+    /* Validate the namespace string at the API boundary rather than
+       relying on each call site to validate beforehand.
+       Note: embedded NULs cannot be detected from a plain const char*;
+       that check belongs at the wire-reading sites (Tbcx_ValidateKeyString). */
+    if (!fqn || fqn[0] == '\0') {
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: empty namespace path", -1));
+        return NULL;
+    }
+    if (!(fqn[0] == ':' && fqn[1] == ':')) {
+        if (ip)
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: namespace must be absolute: \"%s\"", fqn));
+        return NULL;
+    }
+    Tcl_Namespace *nsPtr = Tcl_FindNamespace(ip, fqn, NULL, 0);
     if (!nsPtr) {
         nsPtr = Tcl_CreateNamespace(ip, fqn, NULL, NULL);
     }
@@ -4141,8 +4206,7 @@ static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
 static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
     TbcxInterpState *st = TbcxGetInterpState(ip);
     if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH) {
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d",
-                                            st->loadDepth, TBCX_MAX_LOAD_DEPTH));
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d", st->loadDepth, TBCX_MAX_LOAD_DEPTH));
         return TCL_ERROR;
     }
     st->loadDepth++;

@@ -1300,11 +1300,14 @@ lambda_cleanup:
         Tcl_Free((char *)procPtr);
     }
     /* OWNERSHIP (compiled_ok == true):
-     *   procPtr → owned by ByteCode via bc->procPtr = procPtr
-     *   ByteCode → owned by bodyObj (or procPtr->bodyPtr) via internal rep
-     *   bodyObj  → on the Tcl stack, refcount held by caller (Tcl_IncrRefCount
-     *              at line above), will be freed when that refcount drops.
-     *   TclCleanupByteCode frees both the ByteCode and the attached Proc.
+     *   bodyObj holds the procbody/bytecode internal rep, which owns
+     *   the Proc reference (via Proc.refCount).
+     *   bc->procPtr is a non-owning backpointer used at execution time;
+     *   ByteCode cleanup does NOT free the Proc.
+     *   Proc lifetime ends through TclProcCleanupProc() when the owning
+     *   object or command drops the last reference.
+     *   bodyObj is on the Tcl stack, refcount held by caller (Tcl_IncrRefCount
+     *   at line above), will be freed when that refcount drops.
      *
      *   If w->err was set after compiled_ok (e.g. by WriteCompiledBlock or
      *   W_LPString), the ByteCode Tcl_Obj is still alive — the write error
@@ -1446,9 +1449,11 @@ static int CompileProcLike(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *nsFQN, Tcl_Obj *ar
         WriteCompiledBlock(w, ctx, bcObj);
     }
     Tcl_DecrRefCount(bodyObj);
-    /* The Tcl compiler attaches procPtr to the ByteCode (bc->procPtr = procPtr).
-       The ByteCode owns the Proc and will free it when cleaned up via
-       TclCleanupByteCode.  Do NOT free procPtr or its locals here. */
+    /* The Tcl compiler sets bc->procPtr = procPtr as a non-owning
+       backpointer.  The Proc's lifetime is managed by refCount — the
+       procbody/lambda internal rep holds the owning reference, and
+       TclProcCleanupProc is the cleanup path.  Do NOT free procPtr
+       or its locals here. */
     return (w->err == TCL_OK) ? TCL_OK : TCL_ERROR;
 
 cple_fail:
@@ -2335,7 +2340,7 @@ static unsigned char tbcxStartCmdBytes = 0; /* numBytes for startCommand */
  * Called from TbcxInitTypes() inside the type-init mutex, before the
  * tbcxTypesLoaded flag is published.  Must NOT be called concurrently.
  * Not declared in tbcx.h — only accessible via file-local extern in tbcx.c. */
-void TbcxSaveInitOpcodesLocked(void) {
+void                 TbcxSaveInitOpcodesLocked(void) {
     if (tbcxOpMapReady)
         return;
 
@@ -2350,9 +2355,7 @@ void TbcxSaveInitOpcodesLocked(void) {
         switch (nm[0]) {
         case 'p':
             if (InstrIs(nm, "push")) {
-                tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP :
-                                    nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH
-                                                                                           : OP_PUSH1_NOPOP);
+                tbcxOpMap[i] = (nm[4] == 'R' ? OP_PUSH1_NOPOP : nm[4] == '\0' || nm[4] == '1' || nm[4] == '4' ? OP_PUSH : OP_PUSH1_NOPOP);
             } else if (InstrIs(nm, "pop"))
                 tbcxOpMap[i] = OP_POP;
             break;
@@ -2406,9 +2409,9 @@ void TbcxSaveInitOpcodesLocked(void) {
                 tbcxOpMap[i] = OP_STRCAT_N;
             else if (InstrIs(nm, "swap"))
                 tbcxOpMap[i] = OP_SWAP;
-            else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") ||
-                     InstrIs(nm, "strfind") || InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") ||
-                     InstrIs(nm, "strcaseUpper") || InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
+            else if (InstrIs(nm, "sub") || InstrIs(nm, "streq") || InstrIs(nm, "strlen") || InstrIs(nm, "strmatch") || InstrIs(nm, "strindex") || InstrIs(nm, "strclass") || InstrIs(nm, "strfind") ||
+                     InstrIs(nm, "strrfind") || InstrIs(nm, "strrangeImm") || InstrIs(nm, "strreplace") || InstrIs(nm, "strtrim") || InstrIs(nm, "strcaseLower") || InstrIs(nm, "strcaseUpper") ||
+                     InstrIs(nm, "strlt") || InstrIs(nm, "strgt") || InstrIs(nm, "strle") || InstrIs(nm, "strge"))
                 tbcxOpMap[i] = OP_ARITH;
             break;
         case 'a':
@@ -2538,15 +2541,18 @@ void TbcxSaveInitOpcodesLocked(void) {
             break;
         }
     }
-    /* Cache startCommand, nop, and jump1 opcodes for stripping */
+    /* Cache startCommand, nop, and jump1 opcodes for stripping.
+       Use exact strcmp (not prefix InstrIs) because these must resolve
+       to the precise opcode, not a hypothetical future instruction
+       whose name starts with the same prefix. */
     for (unsigned i = 0; i <= LAST_INST_OPCODE; i++) {
         const char *nm = instTable[i].name;
         if (!nm)
             continue;
-        if (InstrIs(nm, "startCommand")) {
+        if (strcmp(nm, "startCommand") == 0) {
             tbcxOpStartCmd    = (unsigned char)i;
             tbcxStartCmdBytes = (unsigned char)instTable[i].numBytes;
-        } else if (InstrIs(nm, "nop")) {
+        } else if (strcmp(nm, "nop") == 0) {
             tbcxOpNop = (unsigned char)i;
         } else if (strcmp(nm, "jump1") == 0 && instTable[i].numBytes == 2) {
             tbcxOpJump1 = (unsigned char)i;
@@ -2555,7 +2561,7 @@ void TbcxSaveInitOpcodesLocked(void) {
     tbcxOpMapReady = 1;
 }
 
-static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
+static void InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *phase2marks) {
     if (!bc || !ctx || !ctx->instrBodyInit)
         return;
     if (!bc->codeStart || bc->numCodeBytes <= 0)
@@ -2572,7 +2578,7 @@ static void          InstrScanBodyLiterals(ByteCode *bc, TbcxCtx *ctx, char *pha
        are never pushed are "dead references" -- source text kept for error
        reporting by Tcl's compiler for inline-compiled bodies (foreach,
        while, for, lmap, dict for).  These should also be precompiled. */
-    char *pushed = NULL;
+    char                  *pushed    = NULL;
     if (numLits <= 4096) {
         pushed = (char *)Tcl_Alloc((size_t)numLits);
         memset(pushed, 0, (size_t)numLits);
