@@ -1,7 +1,7 @@
 /* ==========================================================================
  * tbcxload.c — TBCX load+eval for Tcl 9.1
  *
- * Thread safety model (Proposal #8):
+ * Thread safety model:
  *
  *   All public entry points (Tbcx_LoadObjCmd, TbcxApplyShimPurgeAll)
  *   MUST be called from the thread that owns the Tcl_Interp.  This is
@@ -18,10 +18,10 @@
  *   are per-interp and NEVER shared across interpreters or threads.  Their
  *   refCount fields are therefore safe to manipulate without a mutex.
  *
- *   FixLiteralPoolProcPtr increments procPtr->refCount on shared Proc
- *   structs.  This is safe because the sharing is only within a single
- *   interp's ByteCode literal pool — all references are created and
- *   destroyed on the same thread.
+ *   FixLiteralPoolProcPtr propagates procPtr as a non-owning backpointer
+ *   to nested bytecode literals in the same literal pool.  No refCount
+ *   manipulation is needed because ByteCode.procPtr is a non-owning
+ *   backpointer — TclReleaseByteCode does not decrement it.
  *
  *   Global state (tbcxTyBytecode, opcode cache, etc.) is initialized
  *   under tbcxTypeMutex with acquire/release fencing on tbcxTypesLoaded.
@@ -114,7 +114,7 @@ typedef struct {
     Tcl_ObjCmdProc2 *savedApplyNre; /* saved nreProc2 handler (may be NULL) */
     void            *savedApplyCD;
     Tcl_HashTable    lambdaRegistry; /* key: ONE_WORD (Tcl_Obj *), val: ApplyLambdaEntry* */
-    Tcl_Size         numRegistered;  /* Proposal #17: count of registered lambdas.
+    Tcl_Size         numRegistered;  /* Count of registered lambdas.
                                         When 0, CmdApplyShim bypasses hash lookup
                                         and forwards directly to savedApplyProc. */
 } ApplyShim;
@@ -122,9 +122,7 @@ typedef struct {
 /* TbcxInterpState — consolidated per-interpreter state.
  * Attached via Tcl_SetAssocData under TBCX_INTERP_STATE_KEY.
  * Created lazily on first tbcx::load; destroyed when the interpreter
- * is deleted.  Replaces the former separate assocdata keys for
- * ApplyShim, load depth, and the OO shim hidden-ID counter
- * (formerly the process-global tbcxHiddenId). */
+ * is deleted. */
 typedef struct {
     Tcl_Interp *interp;
     ApplyShim   apply;        /* embedded — no separate heap allocation */
@@ -186,6 +184,7 @@ static int         ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os);
 static int         ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx);
 static inline void RefreshBC(ByteCode *bcPtr, Tcl_Interp *ip, Namespace *nsPtr);
 static void        FixLiteralPoolProcPtr(ByteCode *bcPtr);
+static void        NullLiteralPoolProcPtr(ByteCode *bcPtr, Proc *target);
 static void        RegisterPrecompiledLambda(Tcl_Interp *ip, Tcl_Obj *lambda, Proc *procPtr, Tcl_Obj *nsObj);
 Tcl_Namespace     *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn);
 int                Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
@@ -337,36 +336,50 @@ static inline void RefreshBC(ByteCode *bcPtr, Tcl_Interp *ip, Namespace *nsPtr) 
  * If procPtr is NULL, this crashes at address 0x30 (offset of firstLocalPtr
  * in the Proc struct on 64-bit).
  *
- * This function fixes the issue by sharing the parent ByteCode's procPtr
- * with all NULL-procPtr bytecode literals, matching the semantic that these
+ * This function propagates the parent ByteCode's procPtr to all
+ * NULL-procPtr bytecode literals, matching the semantic that these
  * body literals execute in the enclosing proc's context.
  *
- * The procPtr refcount is incremented for each literal that borrows it,
- * so Tcl's TclCleanupByteCode will correctly decrement when the inner
- * ByteCode is freed.
- *
- * Thread safety: procPtr->refCount is manipulated without
- * a mutex.  This is safe because:
- *   (a) Proc structs created by TBCX are per-interp, never shared;
- *   (b) all tbcx::load operations run on the interp-owning thread;
- *   (c) Tcl interpreters are single-threaded by design.
- * The assert below verifies (b) in debug builds. */
+ * ByteCode.procPtr is a non-owning backpointer — TclReleaseByteCode
+ * does not decrement it.  Proc lifetime is managed by the procbody/
+ * lambda internal rep via TclProcCleanupProc.  The inner bytecode
+ * literals live in the parent's literal pool and are freed when the
+ * parent ByteCode is freed, so the backpointers cannot outlive the
+ * Proc they point to.  No refCount increment is needed. */
 static void FixLiteralPoolProcPtr(ByteCode *bcPtr) {
     if (!bcPtr || !bcPtr->procPtr || bcPtr->numLitObjects <= 0 || !bcPtr->objArrayPtr)
         return;
-    /* verify we're on the interp-owning thread */
     assert(bcPtr->procPtr->iPtr != NULL && "FixLiteralPoolProcPtr: procPtr->iPtr must be non-NULL");
     Tcl_Obj **litObjv = bcPtr->objArrayPtr;
     for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++) {
         if (!litObjv[i])
             continue;
-        ByteCode *litBC = NULL;
-        litBC           = TbcxGetByteCode(litObjv[i]);
+        ByteCode *litBC = TbcxGetByteCode(litObjv[i]);
         if (litBC && !litBC->procPtr) {
-            litBC->procPtr = bcPtr->procPtr;
-            bcPtr->procPtr->refCount++;
-            /* Recurse: the literal may itself contain bytecode literals */
+            litBC->procPtr = bcPtr->procPtr; /* non-owning backpointer */
             FixLiteralPoolProcPtr(litBC);
+        }
+    }
+}
+
+/* NullLiteralPoolProcPtr — recursively null out non-owning procPtr
+ * backpointers that match `target` in a bytecode's literal pool.
+ *
+ * This is the cleanup counterpart to FixLiteralPoolProcPtr.  Before
+ * freeing a Proc that was propagated into nested bytecode literals,
+ * call this to eliminate all dangling backpointers — not just the
+ * immediate children but the full recursive tree. */
+static void NullLiteralPoolProcPtr(ByteCode *bcPtr, Proc *target) {
+    if (!bcPtr || !target || bcPtr->numLitObjects <= 0 || !bcPtr->objArrayPtr)
+        return;
+    Tcl_Obj **litObjv = bcPtr->objArrayPtr;
+    for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++) {
+        if (!litObjv[i])
+            continue;
+        ByteCode *litBC = TbcxGetByteCode(litObjv[i]);
+        if (litBC && litBC->procPtr == target) {
+            litBC->procPtr = NULL;
+            NullLiteralPoolProcPtr(litBC, target);
         }
     }
 }
@@ -954,7 +967,9 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
     }
     /* oo::define CLS self method NAME ARGS BODY  (objc >= 7) */
     else if (strcmp(subc, "self") == 0 && objc >= 7) {
-        const char *selfSub = Tcl_GetString(objv[3]);
+        const char *selfSub = Tbcx_GetStringStrict(NULL, objv[3]);
+        if (!selfSub)
+            return;
         if (strcmp(selfSub, "method") == 0) {
             *kindOut        = TBCX_METH_SELF;
             /* objv: [0]=oo::define [1]=CLS [2]=self [3]=method [4]=NAME [5]=ARGS [6]=BODY */
@@ -1883,8 +1898,8 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
         memcpy(repl->name, nm, (size_t)nameLen);
         repl->name[nameLen] = '\0';
         repl->nameLength    = nameLen;
-        /* Splice replacement into the linked list using tracked predecessor
-           (O(1) instead of the previous O(n) predecessor search). */
+        /* Splice replacement into the linked list using the tracked
+           predecessor (O(1) splice). */
         repl->nextPtr       = cl->nextPtr;
         if (prev)
             prev->nextPtr = repl;
@@ -1899,12 +1914,11 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
 }
 
 /* ==========================================================================
- * Proposal #3: Centralized ByteCode fixup
+ * Centralized ByteCode fixup
  *
  * Every code path that links a ByteCode to a Proc must perform the same
  * sequence: set procPtr, refresh epochs, propagate to literal pool,
- * optionally fix the LocalCache.  Having this in one function prevents
- * the bug pattern where a new path forgets a step.
+ * optionally fix the LocalCache.  A single function ensures consistency.
  * ========================================================================== */
 void TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode) {
     if (!bc)
@@ -2248,6 +2262,11 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
     /* Read argument specifications */
     uint32_t numArgs = 0;
     if (!Tbcx_R_U32(r, &numArgs)) {
+        Tcl_DecrRefCount(nsObj);
+        return NULL;
+    }
+    if (numArgs > TBCX_MAX_LOCALS) {
+        R_Error(r, "tbcx: too many lambda arguments");
         Tcl_DecrRefCount(nsObj);
         return NULL;
     }
@@ -3494,12 +3513,11 @@ static int AddProcShim(Tcl_Interp *ip, ProcShim *ps) {
     ps->traceInstalled             = 1;
 
     /* Intercept BOTH objProc2 AND nreProc2.
-       In Tcl 9.1, "proc" is registered via Tcl_NRCreateCommand, which
+       Tcl 9.1's "proc" is registered via Tcl_NRCreateCommand, which
        sets nreProc2 to a non-NULL value.  The bytecode engine (TEBC)
        dispatches through nreProc2 when non-NULL, completely bypassing
-       objProc2.  The old code only swapped objProc2, so the shim was
-       never called from bytecode — the original handler ran unintercepted,
-       clobbered bodyPtr, and the proc crashed at invocation time.
+       objProc2.  Both must be swapped so the shim intercepts all
+       invocations — bytecode-compiled and direct alike.
 
        proc's handler (TclNRProcObjCmd) creates the proc synchronously
        and does NOT enqueue NRE callbacks, so it is safe for our shim
@@ -4054,10 +4072,10 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
             Tcl_DecrRefCount(pair);
             Tcl_IncrRefCount(procBodyObj);
             Tcl_DecrRefCount(procBodyObj);
-            procPtr->refCount--;
-            Tcl_DecrRefCount(procPtr->bodyPtr);
-            Tbcx_FreeLocals(procPtr->firstLocalPtr);
-            Tcl_Free((char *)procPtr);
+            /* procBodyObj's freeProc already did procPtr->refCount-- (2→1).
+               TclProcCleanupProc does another refCount-- (1→0) and then
+               frees locals, bodyPtr, and struct. */
+            TclProcCleanupProc(procPtr);
             goto cleanup_fqn;
         }
         Tcl_IncrRefCount(pair);
@@ -4353,18 +4371,13 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
         TopLocals_End(ip, &_sv);
 
         if (topProc) {
-            if (top && top->numLitObjects > 0 && top->objArrayPtr) {
-                for (Tcl_Size _fi = 0; _fi < top->numLitObjects; _fi++) {
-                    if (!top->objArrayPtr[_fi])
-                        continue;
-                    ByteCode *litBC = TbcxGetByteCode(top->objArrayPtr[_fi]);
-                    if (litBC && litBC->procPtr == topProc) {
-                        litBC->procPtr = NULL;
-                        assert(topProc->refCount > 0 && "topProc refCount underflow in literal pool fixup");
-                        topProc->refCount--;
-                    }
-                }
-            }
+            /* Recursively null out non-owning procPtr backpointers in
+               literal pool bytecodes before freeing topProc.  This
+               covers the full descendant tree, not just immediate
+               children.  No refCount adjustment needed — these are
+               non-owning backpointers. */
+            if (top)
+                NullLiteralPoolProcPtr(top, topProc);
             if (top)
                 top->procPtr = NULL;
             Tcl_DecrRefCount(topProc->bodyPtr);

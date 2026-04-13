@@ -4,9 +4,9 @@
 
 #include "tbcx.h"
 
-/* Monotonic counter for unique temp-file naming (Finding #8).
- * Two concurrent tbcx::save calls to the same target no longer
- * clobber each other's staging file.
+/* Monotonic counter for unique temp-file naming.
+ * Ensures concurrent tbcx::save calls to the same target use
+ * distinct staging files.
  * uint64_t to prevent wrap-around in long-running processes. */
 static uint64_t tbcxSaveTmpId = 0;
 /* tbcxSaveTmpMutex: protects tbcxSaveTmpId.  Lock-order position: leaf —
@@ -305,7 +305,7 @@ static void CtxAddStripBody(TbcxCtx *ctx, Tcl_Obj *body) {
     if (!ctx || !ctx->stripInit || !body)
         return;
     Tcl_Size    len = 0;
-    const char *s   = Tbcx_GetStringFromObjSafe(body, &len);
+    const char *s   = Tcl_GetStringFromObj(body, &len);
     if (!s)
         return;
     /* TCL_STRING_KEYS truncates at embedded NUL — skip optimization for
@@ -324,7 +324,7 @@ static int ShouldStripBody(TbcxCtx *ctx, Tcl_Obj *obj) {
     if (!ctx || !ctx->stripInit || !ctx->stripActive || !obj)
         return 0;
     Tcl_Size    len = 0;
-    const char *s   = Tbcx_GetStringFromObjSafe(obj, &len);
+    const char *s   = Tcl_GetStringFromObj(obj, &len);
     if (!s)
         return 0;
     /* TCL_STRING_KEYS truncates at embedded NUL — never match binary bodies. */
@@ -1500,7 +1500,8 @@ static void WriteLocalNames(TbcxOut *w, ByteCode *bc, uint32_t numLocals) {
     /* For top-level bytecode, the LocalCache is the authoritative source
        of variable names.  It is populated during TclSetByteCodeFromAny and
        contains the correct names even when bc->procPtr is NULL.
-       This fixes "can't read '': no such variable" for scan/regexp/dict/uplevel. */
+       Ensures variable names survive correctly for commands like
+       scan, regexp, dict, and uplevel that reference locals by name. */
     if (bc && bc->localCachePtr && bc->localCachePtr->numVars > 0) {
         Tcl_Obj *const *names = (Tcl_Obj *const *)&bc->localCachePtr->varName0;
         Tcl_Size        nVars = bc->localCachePtr->numVars;

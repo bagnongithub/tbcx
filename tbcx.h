@@ -36,11 +36,10 @@
  * Fires assert() on violation — use for internal helpers and void-
  * returning callbacks where TCL_ERROR cannot be propagated. */
 #if defined(TBCX_THREAD_CHECKS) || !defined(NDEBUG)
-#define TBCX_ASSERT_INTERP_THREAD(ip) \
-    do { \
-        Interp *_tbcx_iPtr = (Interp *)(ip); \
-        assert(_tbcx_iPtr->threadId == Tcl_GetCurrentThread() \
-               && "TBCX: must be called from the interp-owning thread"); \
+#define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                                                                                                  \
+    do {                                                                                                                                                                                               \
+        Interp *_tbcx_iPtr = (Interp *)(ip);                                                                                                                                                           \
+        assert(_tbcx_iPtr->threadId == Tcl_GetCurrentThread() && "TBCX: must be called from the interp-owning thread");                                                                                \
     } while (0)
 #else
 #define TBCX_ASSERT_INTERP_THREAD(ip) ((void)0)
@@ -54,13 +53,12 @@
  *
  * Cost: one pointer comparison + one Tcl_GetCurrentThread() call per
  * command invocation — negligible relative to I/O and compilation. */
-#define TBCX_CHECK_INTERP_THREAD(ip) \
-    do { \
-        if (((Interp *)(ip))->threadId != Tcl_GetCurrentThread()) { \
-            Tcl_SetObjResult((ip), Tcl_NewStringObj( \
-                "tbcx: called from non-owning thread", -1)); \
-            return TCL_ERROR; \
-        } \
+#define TBCX_CHECK_INTERP_THREAD(ip)                                                                                                                                                                   \
+    do {                                                                                                                                                                                               \
+        if (((Interp *)(ip))->threadId != Tcl_GetCurrentThread()) {                                                                                                                                    \
+            Tcl_SetObjResult((ip), Tcl_NewStringObj("tbcx: called from non-owning thread", -1));                                                                                                       \
+            return TCL_ERROR;                                                                                                                                                                          \
+        }                                                                                                                                                                                              \
     } while (0)
 
 #define TBCX_LIT_BIGNUM 0u
@@ -131,10 +129,10 @@ uint32_t           Tbcx_PackTclVersion(void);
 
 /* Hardened Tcl object accessors.
  *
- * The project review spec treats Tcl string/bytearray accessors as fallible.
- * These helpers guarantee a non-NULL pointer and zero length on failure so
- * callers can safely treat the value as an empty string/byte-array in
- * non-fatal scanning/rewrite paths.
+ * Tcl string/bytearray accessors can return NULL on corrupted or
+ * pure-bytearray objects.  These helpers guarantee a non-NULL pointer
+ * and zero length on failure so callers can safely treat the value as
+ * an empty string/byte-array in non-fatal scanning/rewrite paths.
  */
 static inline const char *Tbcx_GetStringFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *lenPtr) {
     const char *s;
