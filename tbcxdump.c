@@ -158,11 +158,11 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
         }
 
         /* Decode operands — offset past the 1-byte opcode */
-        const unsigned char *op           = code + pc + 1;
-        int                  opOff        = 0;  /* byte offset into operand area */
-        Tcl_Size             lvtIdx       = -1; /* LVT index for variable annotation */
-        int                  jumpTarget   = -1; /* computed jump target for offset annotation */
-        int                  firstUintVal = -1; /* first UINT operand value (for push detection) */
+        const unsigned char *op         = code + pc + 1;
+        int                  opOff      = 0;  /* byte offset into operand area */
+        Tcl_Size             lvtIdx     = -1; /* LVT index for variable annotation */
+        int                  jumpTarget = -1; /* computed jump target for offset annotation */
+        Tcl_Size             litIdx     = -1; /* literal pool index for value annotation */
 
         for (int i = 0; i < desc->numOperands; i++) {
             switch (desc->opTypes[i]) {
@@ -181,16 +181,12 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
             case OPERAND_UINT1: {
                 unsigned val = op[opOff];
                 Tcl_AppendPrintfToObj(dst, " %u", val);
-                if (i == 0 && firstUintVal < 0)
-                    firstUintVal = (int)val;
                 opOff += 1;
                 break;
             }
             case OPERAND_UINT4: {
                 uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
                 Tcl_AppendPrintfToObj(dst, " %u", val);
-                if (i == 0 && firstUintVal < 0)
-                    firstUintVal = (int)val;
                 opOff += 4;
                 break;
             }
@@ -234,6 +230,22 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
                 opOff += 4;
                 break;
             }
+            case OPERAND_LIT1: {
+                unsigned val = op[opOff];
+                Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
+                if (litIdx < 0)
+                    litIdx = (Tcl_Size)val;
+                opOff += 1;
+                break;
+            }
+            case OPERAND_LIT4: {
+                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
+                if (litIdx < 0)
+                    litIdx = (Tcl_Size)val;
+                opOff += 4;
+                break;
+            }
             case OPERAND_SCLS1: {
                 unsigned val = op[opOff];
                 Tcl_AppendPrintfToObj(dst, " scls=%u", val);
@@ -248,12 +260,12 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
 
         /* ---- Inline annotations ---- */
 
-        /* Literal value preview for push-family instructions.
-           Detect by instruction name (covers "push1", "push4", "push")
-           rather than opcode constants which are deprecated in Tcl 9.1. */
-        if (firstUintVal >= 0 && desc->name[0] == 'p' && desc->name[1] == 'u' && desc->name[2] == 's' && desc->name[3] == 'h' && firstUintVal < bc->numLitObjects && bc->objArrayPtr[firstUintVal]) {
+        /* Literal value preview for any instruction with a literal-pool
+           operand (OPERAND_LIT1/LIT4).  Operand-type-driven — no
+           instruction name checks needed. */
+        if (litIdx >= 0 && litIdx < bc->numLitObjects && bc->objArrayPtr[litIdx]) {
             Tcl_AppendToObj(dst, " \t# ", -1);
-            AppendLitPreview(dst, bc->objArrayPtr[firstUintVal], 48);
+            AppendLitPreview(dst, bc->objArrayPtr[litIdx], 48);
         }
 
         /* Variable name annotation for LVT operands */
