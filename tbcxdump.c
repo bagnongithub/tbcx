@@ -252,8 +252,21 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
                 opOff += 1;
                 break;
             }
+            case OPERAND_NONE:
+                /* Padding slot — no bytes to consume, nothing to print. */
+                break;
             default:
-                Tcl_AppendToObj(dst, " ???", -1);
+                /* Unknown operand type — print the raw byte value and
+                   the numeric type ID for diagnostic purposes.  Consume
+                   1 byte (the most common size for flag/mode operands
+                   added in newer Tcl versions). */
+                if (opOff < desc->numBytes - 1) {
+                    unsigned val = op[opOff];
+                    Tcl_AppendPrintfToObj(dst, " %u", val);
+                    opOff += 1;
+                } else {
+                    Tcl_AppendToObj(dst, " ???", -1);
+                }
                 break;
             }
         }
@@ -429,9 +442,9 @@ static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst) {
         if (isDictUpd) {
             DictUpdateInfo *info = (DictUpdateInfo *)cd;
             Tcl_AppendToObj(dst, " (dictupdate)\n", -1);
-            Tcl_AppendPrintfToObj(dst, "      %ld variable indices:", (long)info->length);
+            Tcl_AppendPrintfToObj(dst, "      %" TCL_Z_MODIFIER "d variable indices:", info->length);
             for (Tcl_Size k = 0; k < info->length; k++) {
-                Tcl_AppendPrintfToObj(dst, " %ld", (long)info->varIndices[k]);
+                Tcl_AppendPrintfToObj(dst, " %" TCL_Z_MODIFIER "d", info->varIndices[k]);
             }
             Tcl_AppendToObj(dst, "\n", 1);
             continue;
@@ -440,13 +453,14 @@ static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst) {
         if (isNewFor) {
             ForeachInfo *info = (ForeachInfo *)cd;
             Tcl_AppendToObj(dst, " (newForeach)\n", -1);
-            Tcl_AppendPrintfToObj(dst, "      lists=%ld, firstTmp=%d, loopCtTmp=%d\n", (long)info->numLists, (int)info->firstValueTemp, (int)info->loopCtTemp);
+            Tcl_AppendPrintfToObj(dst, "      lists=%" TCL_Z_MODIFIER "d, firstTmp=%" TCL_Z_MODIFIER "d, loopCtTmp=%" TCL_Z_MODIFIER "d\n", info->numLists, info->firstValueTemp, info->loopCtTemp);
             for (Tcl_Size L = 0; L < info->numLists; L++) {
                 ForeachVarList *vl = info->varLists[L];
-                Tcl_AppendPrintfToObj(dst, "      list#%ld vars:", (long)L);
+                Tcl_AppendPrintfToObj(dst, "      list#%" TCL_Z_MODIFIER "d vars:", L);
                 if (vl) {
                     for (Tcl_Size j = 0; j < vl->numVars; j++) {
-                        Tcl_AppendPrintfToObj(dst, " %d", (int)vl->varIndexes[j]);
+                        Tcl_Size vi = vl->varIndexes[j];
+                        Tcl_AppendPrintfToObj(dst, " %" TCL_Z_MODIFIER "d", vi);
                     }
                 }
                 Tcl_AppendToObj(dst, "\n", 1);
@@ -740,7 +754,14 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         }
 
         Tcl_IncrRefCount(bodyBC);
-        DisassembleBCObj(bodyBC, out, Tbcx_GetStringSafe(nameObj));
+        /* Use method name for the disassembly title; for constructors
+           and destructors the name field is empty, so fall back to the
+           kind label (e.g. "constructor", "destructor"). */
+        const char *disTitle  = Tbcx_GetStringSafe(nameObj);
+        const char *kindLabel = (kind == TBCX_METH_CTOR) ? "constructor" : (kind == TBCX_METH_DTOR) ? "destructor" : NULL;
+        if ((!disTitle || !disTitle[0]) && kindLabel)
+            disTitle = kindLabel;
+        DisassembleBCObj(bodyBC, out, disTitle);
         DumpBCDetails(bodyBC, out);
 
         Tcl_DecrRefCount(bodyBC);
