@@ -10,6 +10,7 @@
 
 static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n);
 static void AppendLitPreview(Tcl_Obj *dst, Tcl_Obj *lit, Tcl_Size maxChars);
+static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len);
 static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title);
 static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst);
 static void DumpBCDetails(Tcl_Obj *bcObj, Tcl_Obj *dst);
@@ -44,6 +45,58 @@ static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n) {
     }
     Tcl_AppendToObj(dst, Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
     Tcl_DStringFree(&ds);
+}
+
+/* Append a proc or method body's source text to the dump output, indented
+ * consistently and with a trailing newline.  Called from DumpProcsSection
+ * and DumpMethodsSection when the srcText LPString is non-empty (i.e.
+ * when the artifact was built with -include-source).
+ *
+ * Each source line is prefixed with a fixed six-space indent ("      ")
+ * so the text visually nests under the "source: (N bytes)" summary line.
+ * No truncation — the body is emitted in full because (a) it's only
+ * present when the author deliberately asked for -include-source, and
+ * (b) having the actual body visible in dumps is the whole point of
+ * preserving it.
+ *
+ * The six-space indent is applied by scanning the input for '\n' and
+ * inserting the indent after each newline (except for a trailing one).
+ * A final '\n' is always emitted so the following output starts on a
+ * fresh line. */
+static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len) {
+    static const char kIndent[]    = "      ";
+    static const size_t kIndentLen = sizeof(kIndent) - 1;
+
+    /* Leading indent for the first line. */
+    Tcl_AppendToObj(out, kIndent, (Tcl_Size)kIndentLen);
+    uint32_t i = 0;
+    while (i < len) {
+        /* Find the next newline (or end of buffer). */
+        uint32_t j = i;
+        while (j < len && src[j] != '\n') {
+            j++;
+        }
+        /* Emit [i, j) — the line contents without its trailing '\n'. */
+        if (j > i) {
+            Tcl_AppendToObj(out, src + i, (Tcl_Size)(j - i));
+        }
+        if (j < len) {
+            /* Hit a newline: emit it, then indent the next line unless
+             * this was the final byte (avoid a trailing indent + blank). */
+            Tcl_AppendToObj(out, "\n", 1);
+            if (j + 1 < len) {
+                Tcl_AppendToObj(out, kIndent, (Tcl_Size)kIndentLen);
+            }
+            i = j + 1;
+        } else {
+            i = j; /* end of input */
+        }
+    }
+    /* Ensure output ends with a newline regardless of whether the
+     * source text itself had a final newline. */
+    if (len == 0 || src[len - 1] != '\n') {
+        Tcl_AppendToObj(out, "\n", 1);
+    }
 }
 
 /* Append a short preview of a literal value for inline annotation.
@@ -618,6 +671,27 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
+        /* Body source text.  Empty indicates the artifact was
+         * built without -include-source (the default for tbcx,
+         * matching tclcompiler).  Printed as a separate "source:"
+         * section truncated at a readable width so large bodies
+         * don't blow up dumps. */
+        char    *bodySrcC   = NULL;
+        uint32_t bodySrcL   = 0;
+        if (!Tbcx_R_LPString(r, &bodySrcC, &bodySrcL)) {
+            Tcl_DecrRefCount(argsObj);
+            Tcl_DecrRefCount(nsObj);
+            Tcl_DecrRefCount(nameFqn);
+            return TCL_ERROR;
+        }
+        if (bodySrcL == 0) {
+            Tcl_AppendToObj(out, "    source: <stripped at save time>\n", -1);
+        } else {
+            Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", bodySrcL);
+            AppendBodySource(out, bodySrcC, bodySrcL);
+        }
+        Tcl_Free(bodySrcC);
+
         Namespace *nsPtr = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(nsObj), NULL, 0);
         if (!nsPtr)
             nsPtr = (Namespace *)Tcl_GetGlobalNamespace(interp);
@@ -741,6 +815,23 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
+        /* Body source text — see proc loop above. */
+        char    *bodySrcC = NULL;
+        uint32_t bodySrcL = 0;
+        if (!Tbcx_R_LPString(r, &bodySrcC, &bodySrcL)) {
+            Tcl_DecrRefCount(argsObj);
+            Tcl_DecrRefCount(nameObj);
+            Tcl_DecrRefCount(clsFqn);
+            return TCL_ERROR;
+        }
+        if (bodySrcL == 0) {
+            Tcl_AppendToObj(out, "    source: <stripped at save time>\n", -1);
+        } else {
+            Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", bodySrcL);
+            AppendBodySource(out, bodySrcC, bodySrcL);
+        }
+        Tcl_Free(bodySrcC);
+
         Namespace *clsNs = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(clsFqn), NULL, 0);
         if (!clsNs)
             clsNs = (Namespace *)Tcl_GetGlobalNamespace(interp);
@@ -800,7 +891,11 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     TbcxIn r;
     Tbcx_R_Init(&r, interp, in);
     TbcxHeader H;
+    memset(&H, 0, sizeof(H));
     if (!Tbcx_ReadHeader(&r, &H) || r.err) {
+        if (H.sourcePath) {
+            Tcl_DecrRefCount(H.sourcePath);
+        }
         Tcl_Close(interp, in);
         return TCL_ERROR;
     }
@@ -817,6 +912,13 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
                           (unsigned)(H.tcl_version & 0xFFu));
     Tcl_AppendPrintfToObj(out, "  top: code=%" PRIu64 ", except=%u, lits=%u, aux=%u, locals=%u, stack=%u\n", (unsigned long long)H.codeLenTop, H.numExceptTop, H.numLitsTop, H.numAuxTop,
                           H.numLocalsTop, H.maxStackTop);
+    if (H.sourcePath) {
+        Tcl_Size pl = 0;
+        const char *ps = Tbcx_GetStringFromObjSafe(H.sourcePath, &pl);
+        Tcl_AppendPrintfToObj(out, "  source = %s\n", ps);
+    } else {
+        Tcl_AppendToObj(out, "  source = <inline or channel>\n", -1);
+    }
 
     /* Top-level block */
     Namespace *curNs   = (Namespace *)Tcl_GetGlobalNamespace(interp);
@@ -842,6 +944,10 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
 cleanup:
     Tcl_DecrRefCount(topBC);
 cleanup_no_topbc:
+    if (H.sourcePath) {
+        Tcl_DecrRefCount(H.sourcePath);
+        H.sourcePath = NULL;
+    }
     if (Tcl_Close(interp, in) != TCL_OK)
         rc = TCL_ERROR;
     if (rc == TCL_OK) {

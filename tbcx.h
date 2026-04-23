@@ -27,14 +27,37 @@
 #include "tclTomMath.h"
 
 #define TBCX_MAGIC 0x58434254u
-#define TBCX_FORMAT 91u
+/* TBCX_FORMAT bump history:
+ *   91 (v1.0/1.1) — original Tcl 9.1 format; proc/method bodies serialized
+ *                   without source text.  Consequence: info body, TIP #280
+ *                   source attribution, and any idiom that round-trips a
+ *                   proc body via its string rep (e.g. ooxml's cloneRule /
+ *                   installTocRule using `info body $src` + `proc $new ...
+ *                   $body`) silently produced empty/no-op procs.
+ *   92 (v1.2)     — each proc record and each method record can carry an
+ *                   LPString body-source field immediately before its
+ *                   compiled block.  The loader attaches that text as the
+ *                   body Tcl_Obj's string rep (via Tcl_InitStringRep)
+ *                   without touching the ByteCode internal rep.  By
+ *                   default body source is STRIPPED from the artifact
+ *                   (matching the 25-year TclPro/tbcload tradition for
+ *                   Tcl AOT compile output) and the loader substitutes
+ *                   a diagnostic sentinel so `info body` returns a
+ *                   loud string instead of silently returning empty.
+ *                   The optional save-time flag `-include-source`
+ *                   writes the original body text as an LPString on
+ *                   the wire, preserving byte-for-byte `info body`
+ *                   round-trip for artifacts where introspection
+ *                   idioms (cloneRule, info class definition, TIP #280
+ *                   source attribution, etc.) must work. */
 
-/* Thread-ownership assertion.  Verifies that the current thread is the
- * one that created the interpreter, which is the only thread permitted
- * to use it under Tcl's threading model.  Active only in debug builds
- * (NDEBUG not defined) unless TBCX_THREAD_CHECKS is also defined.
- * Fires assert() on violation — use for internal helpers and void-
- * returning callbacks where TCL_ERROR cannot be propagated. */
+#define TBCX_FORMAT 92u
+
+#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u 
+#define TBCX_STRIPPED_SOURCE_SENTINEL                                                \
+    "# tbcx: body source stripped at save time; info body unavailable\n"             \
+    "error \"tbcx: introspection-based cloning is not supported for this artifact\""
+
 #if defined(TBCX_THREAD_CHECKS) || !defined(NDEBUG)
 #define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                                                                                                  \
     do {                                                                                                                                                                                               \
@@ -45,14 +68,6 @@
 #define TBCX_ASSERT_INTERP_THREAD(ip) ((void)0)
 #endif
 
-/* Thread-ownership check for Tcl command entry points.  Always active
- * in all builds (debug and release).  Returns TCL_ERROR with a
- * diagnostic message instead of crashing — use at the four public
- * Tcl commands (save, load, dump, gc) where the caller can handle
- * the error through the normal Tcl result channel.
- *
- * Cost: one pointer comparison + one Tcl_GetCurrentThread() call per
- * command invocation — negligible relative to I/O and compilation. */
 #define TBCX_CHECK_INTERP_THREAD(ip)                                                                                                                                                                   \
     do {                                                                                                                                                                                               \
         if (((Interp *)(ip))->threadId != Tcl_GetCurrentThread()) {                                                                                                                                    \
@@ -92,8 +107,6 @@
 #define TBCX_PROC_MARKER_PFX "\x01TBCX"
 #define TBCX_PROC_MARKER_PFX_LEN 5
 
-/* TbcxHeader: wire-format documentation & local staging area.
- * Serialized field-by-field via W_U32/W_U64; never memcpy'd as a block. */
 typedef struct TbcxHeader {
     uint32_t magic;       /* "TBCX" */
     uint32_t format;      /* format version */
@@ -104,6 +117,9 @@ typedef struct TbcxHeader {
     uint32_t numAuxTop;
     uint32_t numLocalsTop;
     uint32_t maxStackTop;
+    /* Staging fields — NOT serialized as fixed-size.  sourcePath is
+     * written/read as an LPString immediately after maxStackTop. */
+    Tcl_Obj *sourcePath;  /* LPString; NULL or empty = no path */
 } TbcxHeader;
 
 extern _Atomic int tbcxHostIsLE;

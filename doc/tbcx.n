@@ -1,9 +1,9 @@
-.TH tbcx 3 "Apr 12, 2026" "tbcx 1.1" "Tcl Bytecode eXchange"
+.TH tbcx 3 "Apr 23, 2026" "tbcx 1.1" "Tcl Bytecode eXchange"
 .SH NAME
 tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.
 .SH SYNOPSIS
 .nf
-\fBtbcx::save\fR \fIin out\fR
+\fBtbcx::save\fR \fIin out\fR ?\fB\-include\-source\fR?
 \fBtbcx::load\fR \fIin\fR
 \fBtbcx::dump\fR \fIfilename\fR
 \fBtbcx::gc\fR
@@ -17,7 +17,8 @@ remaining functionally equivalent to \fBsource\fR of the original script.
 .PP
 Artifacts store the compiled top\-level, precompiled \fBproc\fR bodies, TclOO method/ctor/dtor
 bodies, and \fBlambda\fR literals for use with \fBapply\fR. Loading installs these into the current
-interpreter and executes the top\-level block with \fBTCL_EVAL_GLOBAL\fR.
+interpreter and executes the top\-level block in the caller's current namespace, with source\-equivalent
+semantics for variable scope, frame identity, and \fBinfo script\fR.
 .PP
 In safe interpreters, \fBtbcx_SafeInit\fR provides the package and type
 infrastructure but does \fBnot\fR register any \fBtbcx::*\fR commands.
@@ -25,7 +26,7 @@ A parent interpreter may selectively grant access with
 \fBinterp alias\fR or \fBinterp expose\fR.
 
 .SH COMMANDS
-.SS "tbcx::save in out"
+.SS "tbcx::save in out ?-include-source?"
 .B Synopsis
 .PP
 Compile a script and write a \fB.tbcx\fR artifact.
@@ -38,9 +39,9 @@ Resolved in this order:
 .IP "1." 3
 \fIOpen channel name\fR \- if the value names an existing open channel, it is read as text (the caller controls encoding; TBCX does not alter it).
 .IP "2." 3
-\fIReadable file path\fR \- if the value is a path to a readable file, it is opened in text mode (default UTF\-8), read, and closed by \fBtbcx::save\fR.
+\fIReadable file path\fR \- if the value is a path to a readable file, it is opened in text mode (default UTF\-8), read, and closed by \fBtbcx::save\fR. The normalized path is recorded in the artifact header for \fBinfo script\fR restoration at load time.
 .IP "3." 3
-\fILiteral script text\fR \- otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file\-open error.
+\fILiteral script text\fR \- otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file\-open error. No source path is recorded.
 .RE
 .TP
 .I out
@@ -51,6 +52,22 @@ One of:
 .IP \(bu 2
 \fIWritable path\fR \- a filesystem path; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.
 .RE
+.TP
+.B \-include\-source
+Optional flag.  Embeds the authored source text of every \fBproc\fR and TclOO method body
+in the artifact as an LPString.  Required when consumers depend on \fBinfo body\fR,
+\fBinfo class definition\fR, TIP #280 line attribution in stack traces, disassembly
+annotations, or introspection\-based clone idioms (e.g. \fBcloneRule\fR,
+\fBinstallTocRule\fR) to return the original authored text.  Artifact size grows
+proportional to the aggregate source text of all procs and methods.
+.PP
+\fBDefault behavior (no \-include\-source):\fR Every proc/method body source field is
+emitted as an empty LPString.  At load time the loader substitutes the diagnostic
+sentinel described in \fBSOURCE PRESERVATION\fR below, so \fBinfo body\fR returns a
+loud string instead of silently returning empty.  This matches the 25\-year
+\fItclcompiler\fR/\fItbcload\fR precedent for Tcl AOT compile output: deployment
+artifacts are typically distributed instead of source, and stripping keeps the
+artifact smaller and preserves the IP\-protection angle.
 .PP
 .B Behavior
 .RS
@@ -69,7 +86,9 @@ Detects bytearray literals (bytes \[>=] 0x80) and emits them as \fBTBCX_LIT_BYTE
 .IP \(bu 2
 Body literals are emitted as \fBTBCX_LIT_BYTESRC\fR (source text + compiled bytecode) enabling cross\-interpreter recompilation.
 .IP \(bu 2
-Serializes the header, top\-level block, Procs table, Classes catalog (advisory), and Methods table (including kind 4 for self methods).
+When the input is a readable file path, the normalized path is recorded in the header via \fBTcl_FSGetNormalizedPath\fR so the loader can restore \fBinfo script\fR to the authored value.
+.IP \(bu 2
+Serializes the header, top\-level block, Procs table (with per\-proc source\-text LPString), Classes catalog (advisory), and Methods table (with per\-method source\-text LPString and kind 4 for self methods).
 .IP \(bu 2
 Lambda literals (\fBapply\fR forms) are compiled and serialized as lambda\-bytecode literals.
 .IP \(bu 2
@@ -94,13 +113,17 @@ The interpreter result contains a descriptive message.
 .IP \(bu 2
 Input channels retain their encoding settings; output channels are set to binary mode.
 .IP \(bu 2
-The produced artifact targets Tcl 9.1 (format version 91); other versions are rejected at load time.
+The produced artifact targets Tcl 9.1 (format version 92); other versions are rejected at load time.
 .RE
 .PP
 .B Examples
 .nf
-# Save from path \-> path
+# Save from path \-> path (default: source stripped)
 set path [tbcx::save ./app.tcl ./app.tbcx]
+
+# Save from path \-> path with body source preserved for info body /
+# info class definition / TIP #280 line attribution.
+tbcx::save ./app.tcl ./app.tbcx -include-source
 
 # Save from string value \-> path
 set script {proc hi {} {puts Hello}; hi}
@@ -121,7 +144,7 @@ try {
 .SS "tbcx::load in"
 .B Synopsis
 .PP
-Load a \fB.tbcx\fR artifact, install precompiled entities, and execute the top\-level block.
+Load a \fB.tbcx\fR artifact, install precompiled entities, and execute the top\-level block in the caller's current namespace.
 .PP
 .B Parameters
 .TP
@@ -139,19 +162,30 @@ One of:
 .IP \(bu 2
 Validates header and producer version (exact major.minor match required); deserializes sections.
 .IP \(bu 2
+If the header carries a recorded authored source path, reads it into a Tcl_Obj for \fBinfo script\fR restoration.
+.IP \(bu 2
 Installs a temporary \fBProcShim\fR that intercepts the \fBproc\fR command to substitute
-precompiled bodies when the name and argument signature match.
+precompiled bodies when the name and argument signature match.  The body's string
+representation is set to either the preserved source text (artifacts built with
+\fB\-include\-source\fR) or the diagnostic sentinel (default stripped mode).
 .IP \(bu 2
 Installs a temporary \fBOOShim\fR that intercepts \fBoo::define\fR and \fBoo::objdefine\fR
 to substitute precompiled method/constructor/destructor bodies. Self methods (kind 4,
 \fBTBCX_METH_SELF\fR) are installed via \fBoo::define\fR with a \fBself method\fR builder
-body to preserve metaclass inheritance for subclasses.
+body to preserve metaclass inheritance for subclasses.  Method body string
+representations follow the same preserved\-or\-sentinel rule as proc bodies.
 .IP \(bu 2
 Registers precompiled lambdas in a persistent per\-interpreter \fBApplyShim\fR that
 recovers the compiled representation if type shimmer evicts it.
 .IP \(bu 2
-Executes the precompiled top\-level block with \fBTCL_EVAL_GLOBAL\fR.
-A top\-level \fBreturn\fR is handled identically to \fBsource\fR.
+Executes the precompiled top\-level block via \fBTcl_EvalObjEx\fR with flags \fB0\fR
+(no \fBTCL_EVAL_GLOBAL\fR), evaluating in the caller's current namespace.
+\fBiPtr->scriptFile\fR is saved, set to the header's source path (or the tbcx
+artifact path as a fallback), and restored after evaluation \(em matching
+\fBTcl_FSEvalFileEx\fR's handling in \fBtclIOUtil.c\fR.
+Compiled locals for the top\-level frame are installed on the caller's active
+variable frame by linking named variables to existing same\-name variables in
+the caller's scope.  A top\-level \fBreturn\fR is handled identically to \fBsource\fR.
 .IP \(bu 2
 Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter's lifetime.
 .RE
@@ -170,7 +204,16 @@ size limit exceeded; short read; class or namespace creation errors during top\-
 .B Notes
 .RS
 .IP \(bu 2
-The top\-level block executes with \fBTCL_EVAL_GLOBAL\fR; compiled locals for the global frame are linked to existing global variables.
+The top\-level block executes in the \fIcaller's\fR current namespace, with
+compiled locals linked to the caller's variable frame.  When \fBtbcx::load\fR
+is wrapped inside a proc that the user invokes externally, the caller should
+use \fBuplevel 1 [list tbcx::load $path]\fR to pop to the outer frame \(em
+identical to the pattern already required for \fBsource\fR in the same position.
+.IP \(bu 2
+\fBinfo script\fR inside the loaded top\-level block returns the authored
+\fB.tcl\fR source path when the artifact was built from a file, matching what
+\fBsource\fR would have set.  This supports both \fB[file dirname [info script]]\fR
+(for sibling asset lookup) and \fB[info script] eq $::argv0\fR (self\-invocation guards).
 .IP \(bu 2
 Loading executes code; only load artifacts from trusted sources.
 .RE
@@ -188,6 +231,17 @@ try {
 } finally {
     close $ch
 }
+
+# Drop-in replacement for source, inside a module loader proc.
+# Both branches use uplevel 1 so they reach the caller's frame.
+proc moduleLoad {path} {
+    set tbcxPath [file join [file dirname $path] ../tbcx [file tail $path].tbcx]
+    if {[file exists $tbcxPath]} {
+        uplevel 1 [list tbcx::load $tbcxPath]
+    } else {
+        uplevel 1 [list source $path]
+    }
+}
 .fi
 
 .SS "tbcx::dump filename"
@@ -202,8 +256,12 @@ A readable path to a \fB.tbcx\fR file.
 .PP
 .B Behavior
 .RS
-Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;
-and a disassembly of the top\-level, proc, method, and lambda bodies.
+Reads the artifact and prints: header fields (including the authored source path
+when recorded); section summaries; literals and AuxData; exception ranges;
+disassembly of the top\-level, proc, method, and lambda bodies; and the
+preserved body source text (indented inline, no truncation) for each proc and
+method when the artifact was built with \fB\-include\-source\fR.  For stripped
+artifacts (the default), each body record shows \fBsource: <stripped at save time>\fR.
 .RE
 .PP
 .B Returns
@@ -219,17 +277,26 @@ Unreadable file; bad header; malformed section; short read.
 .B Examples
 .nf
 % package require tbcx
-% tbcx::save {set a 1} out
-% tbcx::dump out
+% tbcx::save hello.tcl hello.tbcx -include-source
+% puts [tbcx::dump hello.tbcx]
 TBCX Header:
   magic = 0x58434254 ('T''B''C''X')
-  format = 91
+  format = 92
   tcl_version = 9.1.0 (type 0)
   top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
+  source = /path/to/hello.tcl
 
 Top-level block:
   Disassembly (top-level):
-...
+    ...
+
+Procs: 1
+  - proc hi  (ns=::)
+    args:
+    source: (14 bytes)
+      puts Hello
+    Disassembly (hi):
+    ...
 .fi
 
 .SS "tbcx::gc"
@@ -261,20 +328,50 @@ None.
 Empty string.
 .RE
 
+.SH SOURCE PRESERVATION
+.PP
+Without \fB\-include\-source\fR, every proc and method body is emitted with an
+empty source\-text field on the wire, and the loader installs a two\-line
+diagnostic sentinel as the body's string representation:
+.PP
+.nf
+    # tbcx: body source stripped at save time; info body unavailable
+    error "tbcx: introspection-based cloning is not supported for this artifact"
+.fi
+.PP
+The shape matches the canonical \fItclcompiler\fR pattern (Compiler8.html,
+\"Example 1: Cloning Procedures\"):
+.IP \(bu 2
+A \fB#\fR comment line \(em shows up at the top of any error traceback,
+making the cause visible at a glance.
+.IP \(bu 2
+An \fBerror\fR call \(em so that if downstream code does
+\fCproc new [info args orig] [info body orig]\fR and invokes \fCnew\fR,
+the clone fails loudly rather than silently running as a no\-op.
+.PP
+With \fB\-include\-source\fR, the authored source text is preserved in the
+artifact and attached as the body Tcl_Obj's string representation via
+\fBTcl_InvalidateStringRep\fR + \fBTcl_InitStringRep\fR.  The ByteCode
+internal representation is untouched; execution still uses the precompiled
+bytecode.  \fBinfo body\fR, \fBinfo class definition\fR,
+\fBinfo class constructor\fR, and TIP #280 source attribution round\-trip
+byte\-for\-byte.
+
 .SH FILE FORMAT (OVERVIEW)
 .PP
-This section summarizes the on\-disk structure. Format version is 91 (Tcl 9.1).
+This section summarizes the on\-disk structure. Format version is 92 (Tcl 9.1).
 All integers are little\-endian.
 .TP
 .B Header
-Magic (0x58434254) + format version (91) + producing Tcl version; size/count metadata for the top\-level block
-(code length, exception ranges, literal count, AuxData count, locals, max stack).
+Magic (0x58434254) + format version (92) + producing Tcl version; size/count metadata for the top\-level block
+(code length, exception ranges, literal count, AuxData count, locals, max stack); authored source path LPString
+(empty for inline/channel inputs).
 .TP
 .B Sections (order)
 (1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue);
-(2) Procs (FQN, ns, arg spec, compiled block);
+(2) Procs (FQN, ns, arg spec, body\-source LPString, compiled block);
 (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top\-level script);
-(4) Methods (class, kind, name, args, compiled block).
+(4) Methods (class, kind, name, args, body\-source LPString, compiled block).
 .TP
 .B Literal kinds
 boolean, (wide)int/uint, double, bignum, string, bytearray, list, dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
@@ -299,7 +396,8 @@ Artifacts are portable across little\- and big\-endian hosts. The loader detects
 once and applies a tight in\-place swap over bulk sections that require conversion, avoiding
 per\-field branching so cross\-endian loads remain close to native performance.
 .PP
-Loading executes the precompiled top\-level (with \fBTCL_EVAL_GLOBAL\fR), then installs
+Loading evaluates the precompiled top\-level in the caller's current namespace with
+\fBiPtr->scriptFile\fR set to the authored source path (if recorded), then installs
 precompiled proc/method bodies and rehydrates lambda literals. The intent is to be
 functionally indistinguishable from \fBsource\fR of the original script, with the benefit
 of faster startup due to avoided parsing/compilation.
@@ -323,6 +421,12 @@ Tested scenarios include class methods, self methods, per\-object methods,
 private methods, inheritance (including diamond), mixins, filters, forwards,
 abstract/singleton metaclasses, method rename/delete/export changes,
 metaclasses with \fBself method\fR, and \fBnext\fR\-based constructor chaining.
+.PP
+With \fB\-include\-source\fR, \fBinfo class definition\fR, \fBinfo class constructor\fR,
+\fBinfo class destructor\fR, and \fBinfo object method\fR all return the authored body
+text byte\-for\-byte, enabling introspection\-based idioms such as
+\fCcloneMethod src dst\fR patterns to work identically to the
+\fBsource\fR\-based baseline.
 
 .SH MULTI\-INTERPRETER AND THREAD SUPPORT
 .PP
@@ -359,7 +463,8 @@ interpreter to prevent runaway recursive loading.
 .PP
 Representative messages include: "bad header", "incompatible Tcl version", "short read/write",
 "unsupported AuxData kind", "input is neither an open channel nor a readable file",
-"runaway serialization detected", and Tcl errors from top\-level evaluation.
+"runaway serialization detected", "tbcx::save: unknown option \"\fI...\fR\"; expected -include-source",
+and Tcl errors from top\-level evaluation.
 
 .SH SECURITY
 .PP
@@ -369,9 +474,9 @@ Safe interpreters receive no \fBtbcx::*\fR commands by default; use
 grant selective access.
 
 .SH SEE ALSO
-source(n), TclOO(n)
+source(n), TclOO(n), info(n), tclcompiler (historical Tcl 8.x AOT tool)
 
 .SH COPYRIGHT
-\[co] 2025-2026 Miguel Banon
+\[co] 2025\-2026 Miguel Banon
 
 MIT License.

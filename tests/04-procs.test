@@ -277,4 +277,105 @@ test proc.18 {proc using apply/lambda} -body {
     tbcx::load $out
 } -result {1 4 9 16}
 
+# v92 regression tests: body source preservation, default-strip, info script
+# --------------------------------------------------------------------------
+
+# proc.v92.1: with -include-source, info body returns original source
+test proc.v92.1 {v92: -include-source preserves info body round-trip} -body {
+    set in  [makeFile {
+        proc hello {name} {return "Hello, $name!"}
+    } v92-1-in.tcl]
+    set out [makeFile "" v92-1-out.tbcx]
+    tbcx::save $in $out -include-source
+    set ip [interp create]
+    $ip eval [list load [info loaded {} tbcx]]
+    $ip eval {package require tbcx}
+    $ip eval [list tbcx::load $out]
+    set body [$ip eval {info body hello}]
+    set result [$ip eval {hello World}]
+    interp delete $ip
+    list $body $result
+} -result {{return "Hello, $name!"} {Hello, World!}}
+
+# proc.v92.2: default (no flag) strips source; loader installs sentinel;
+# proc still executes correctly via the bytecode path
+test proc.v92.2 {v92: default save strips source, proc still runs via sentinel} -body {
+    set in  [makeFile {
+        proc hello {name} {return "Hi $name"}
+    } v92-2-in.tcl]
+    set out [makeFile "" v92-2-out.tbcx]
+    tbcx::save $in $out
+    set ip [interp create]
+    $ip eval [list load [info loaded {} tbcx]]
+    $ip eval {package require tbcx}
+    $ip eval [list tbcx::load $out]
+    set body [$ip eval {info body hello}]
+    set exec [$ip eval {hello World}]
+    set hasSentinelMarker [string match "*body source stripped*" $body]
+    set hasLoudError [string match "*error *introspection*" $body]
+    interp delete $ip
+    list $hasSentinelMarker $hasLoudError $exec
+} -result {1 1 {Hi World}}
+
+# proc.v92.3: cloning a default-save body into a new proc fails loudly at
+# invocation (the sentinel's `error` line raises)
+test proc.v92.3 {v92: default sentinel fails loudly when cloned} -body {
+    set in  [makeFile {
+        proc hello {name} {return "Hi $name"}
+    } v92-3-in.tcl]
+    set out [makeFile "" v92-3-out.tbcx]
+    tbcx::save $in $out
+    set ip [interp create]
+    $ip eval [list load [info loaded {} tbcx]]
+    $ip eval {package require tbcx}
+    $ip eval [list tbcx::load $out]
+    # Clone the stripped body into a new proc and invoke it — must raise
+    # the sentinel's error, not silently run as no-op.
+    $ip eval {proc cloned {name} [info body hello]}
+    set rc [catch {$ip eval {cloned World}} err]
+    set hasSentinelText [string match "*introspection*" $err]
+    interp delete $ip
+    list $rc $hasSentinelText
+} -result {1 1}
+
+# proc.v92.4: info script returns the authored source path during tbcx::load
+# (not the .tbcx path, not the outer argv0) — matches source semantics.
+# Independent of source-preservation flag.
+test proc.v92.4 {v92: info script returns authored source path} -body {
+    set in  [makeFile {
+        set ::captured_info_script [info script]
+    } v92-4-in.tcl]
+    set out [makeFile "" v92-4-out.tbcx]
+    tbcx::save $in $out
+    set ip [interp create]
+    $ip eval [list load [info loaded {} tbcx]]
+    $ip eval {package require tbcx}
+    $ip eval [list tbcx::load $out]
+    set seenPath [$ip eval {set ::captured_info_script}]
+    interp delete $ip
+    # The script path inside the load should equal the input path (what
+    # `source` would have returned), normalized.
+    expr {$seenPath eq [file normalize $in]}
+} -result 1
+
+# proc.v92.5: with -include-source, info class definition round-trips
+# the original method body
+test proc.v92.5 {v92: -include-source preserves info class definition round-trip} -body {
+    set in  [makeFile {
+        oo::class create Greeter {
+            method hi {who} {return "Hi $who"}
+        }
+    } v92-5-in.tcl]
+    set out [makeFile "" v92-5-out.tbcx]
+    tbcx::save $in $out -include-source
+    set ip [interp create]
+    $ip eval [list load [info loaded {} tbcx]]
+    $ip eval {package require tbcx}
+    $ip eval [list tbcx::load $out]
+    set def [$ip eval {info class definition Greeter hi}]
+    set exec [$ip eval {[Greeter create g] hi World}]
+    interp delete $ip
+    list $def $exec
+} -result {{who {return "Hi $who"}} {Hi World}}
+
 cleanupTests

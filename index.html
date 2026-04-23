@@ -2,7 +2,7 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Apr 12, 2026'>
+  <meta name='date' content='Apr 23, 2026'>
   <meta name='generator' content='tbcx 1.1'>
   <style>
     :root{
@@ -58,7 +58,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.1 Apr 12, 2026</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.1 Apr 23, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -68,6 +68,7 @@
             <li><a href='#synopsis'>SYNOPSIS</a></li>
             <li><a href='#description'>DESCRIPTION</a></li>
             <li><a href='#commands'>COMMANDS</a></li>
+            <li><a href='#source-preservation'>SOURCE PRESERVATION</a></li>
             <li><a href='#file-format-overview'>FILE FORMAT (OVERVIEW)</a></li>
             <li><a href='#lambda-support'>LAMBDA SUPPORT</a></li>
             <li><a href='#semantics-and-performance'>SEMANTICS AND PERFORMANCE</a></li>
@@ -84,7 +85,7 @@
         <nav class='index-top'>
           <h2>Index</h2>
           <ul class='index-list'>
-            <li><a href='#tbcx-save-in-out'>tbcx::save in out</a></li>
+            <li><a href='#tbcx-save-in-out'>tbcx::save in out ?-include-source?</a></li>
             <li><a href='#tbcx-load-in'>tbcx::load in</a></li>
             <li><a href='#tbcx-dump-filename'>tbcx::dump filename</a></li>
             <li><a href='#tbcx-gc'>tbcx::gc</a></li>
@@ -97,7 +98,7 @@
         OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.</p>
 
       <h2 id='synopsis'>SYNOPSIS</h2>
-      <pre><code>tbcx::save in out
+      <pre><code>tbcx::save in out ?-include-source?
 tbcx::load in
 tbcx::dump filename
 tbcx::gc</code></pre>
@@ -114,7 +115,8 @@ tbcx::gc</code></pre>
         Artifacts store the compiled top-level, precompiled <b>proc</b> bodies, TclOO
         method/ctor/dtor bodies, and <b>lambda</b> literals for use with <b>apply</b>.
         Loading installs these into the current interpreter and executes the top-level
-        block with <b>TCL_EVAL_GLOBAL</b>.</p>
+        block in the caller&rsquo;s current namespace, with source-equivalent semantics
+        for variable scope, frame identity, and <b>info script</b>.</p>
       <p>
         In safe interpreters, <b>tbcx_SafeInit</b> provides the package and type
         infrastructure but does <b>not</b> register any <b>tbcx::*</b> commands.
@@ -123,7 +125,7 @@ tbcx::gc</code></pre>
 
       <h2 id='commands'>COMMANDS</h2>
 
-      <h3 id='tbcx-save-in-out'>tbcx::save <i>in out</i></h3>
+      <h3 id='tbcx-save-in-out'>tbcx::save <i>in out</i> ?<b>-include-source</b>?</h3>
       <p><b>Synopsis</b> &mdash; Compile a script and write a <code>.tbcx</code> artifact.</p>
       <dl class='deflist'>
         <dt>Parameters</dt>
@@ -131,14 +133,16 @@ tbcx::gc</code></pre>
           <p><i>in</i> &mdash; Resolved in this order:</p>
           <ol class='param-list'>
             <li><i>Open channel name</i> &mdash; if the value names an existing open channel, it is read as text (the caller controls encoding; TBCX does not alter it).</li>
-            <li><i>Readable file path</i> &mdash; if the value is a path to a readable file, it is opened in text mode (default UTF-8), read, and closed by <b>tbcx::save</b>.</li>
-            <li><i>Literal script text</i> &mdash; otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file-open error.</li>
+            <li><i>Readable file path</i> &mdash; if the value is a path to a readable file, it is opened in text mode (default UTF-8), read, and closed by <b>tbcx::save</b>. The normalized path is recorded in the artifact header for <b>info script</b> restoration at load time.</li>
+            <li><i>Literal script text</i> &mdash; otherwise the value is treated as inline Tcl script text. Consequently, a value that looks like a path but is not currently readable is compiled as script text, not reported as a file-open error. No source path is recorded.</li>
           </ol>
           <p><i>out</i> &mdash; One of:</p>
           <ul>
             <li><i>Writable channel</i> &mdash; an open channel; binary mode (<code>-translation binary -eofchar {}</code>) is enforced. The caller&rsquo;s channel settings are mutated and <i>not</i> restored. The channel is <i>not</i> closed.</li>
             <li><i>Writable path</i> &mdash; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.</li>
           </ul>
+          <p><b>-include-source</b> &mdash; Optional flag. Embeds the authored source text of every <b>proc</b> and TclOO method body in the artifact as an LPString. Required when consumers depend on <b>info body</b>, <b>info class definition</b>, TIP #280 line attribution in stack traces, disassembly annotations, or introspection-based clone idioms (e.g. <b>cloneRule</b>, <b>installTocRule</b>) to return the original authored text. Artifact size grows proportional to the aggregate source text of all procs and methods.</p>
+          <p><b>Default behavior (no -include-source):</b> Every proc/method body source field is emitted as an empty LPString. At load time the loader substitutes the diagnostic sentinel described in <a href='#source-preservation'>SOURCE PRESERVATION</a> below, so <b>info body</b> returns a loud string instead of silently returning empty. This matches the 25-year <i>tclcompiler</i>/<i>tbcload</i> precedent for Tcl AOT compile output: deployment artifacts are typically distributed instead of source, and stripping keeps the artifact smaller and preserves the IP-protection angle.</p>
         </dd>
         <dt>Behavior</dt>
         <dd>
@@ -160,8 +164,8 @@ tbcx::gc</code></pre>
                 to prevent UTF-8 encoding corruption.</li>
             <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
                 enabling cross-interpreter recompilation.</li>
-            <li>Serializes the header, top-level block, Procs table, Classes catalog (advisory), and Methods table
-                (including kind 4 for self methods).</li>
+            <li>When the input is a readable file path, the normalized path is recorded in the header via <b>Tcl_FSGetNormalizedPath</b> so the loader can restore <b>info script</b> to the authored value.</li>
+            <li>Serializes the header, top-level block, Procs table (with per-proc source-text LPString), Classes catalog (advisory), and Methods table (with per-method source-text LPString and kind 4 for self methods).</li>
             <li>Lambda literals (<b>apply</b> forms) are compiled and serialized as lambda-bytecode literals.</li>
             <li>Conflicting proc definitions across if/else branches are handled via indexed markers,
                 enabling position-based matching at load time.</li>
@@ -178,13 +182,17 @@ tbcx::gc</code></pre>
         <dd>
           <ul>
             <li>Input channels retain their encoding settings; output channels are set to binary mode (and not restored).</li>
-            <li>The produced artifact targets Tcl 9.1 (format version 91); other versions are rejected at load time.</li>
+            <li>The produced artifact targets Tcl 9.1 (format version 92); other versions are rejected at load time.</li>
           </ul>
         </dd>
       </dl>
       <p><b>Examples</b></p>
-      <pre><code># Save from path &rarr; path
+      <pre><code># Save from path &rarr; path (default: source stripped)
 set path [tbcx::save ./app.tcl ./app.tbcx]
+
+# Save from path &rarr; path with body source preserved for
+# info body / info class definition / TIP #280 line attribution.
+tbcx::save ./app.tcl ./app.tbcx -include-source
 
 # Save from string value &rarr; path
 set script {proc hi {} {puts Hello}; hi}
@@ -202,7 +210,7 @@ try {
 }</code></pre>
 
       <h3 id='tbcx-load-in'>tbcx::load <i>in</i></h3>
-      <p><b>Synopsis</b> &mdash; Load a <code>.tbcx</code> artifact, install precompiled entities, and execute the top-level block.</p>
+      <p><b>Synopsis</b> &mdash; Load a <code>.tbcx</code> artifact, install precompiled entities, and execute the top-level block in the caller&rsquo;s current namespace.</p>
       <dl class='deflist'>
         <dt>Parameters</dt>
         <dd>
@@ -216,16 +224,26 @@ try {
         <dd>
           <ul>
             <li>Validates header and producer version (exact major.minor match required); deserializes sections.</li>
+            <li>If the header carries a recorded authored source path, reads it into a Tcl_Obj for <b>info script</b> restoration.</li>
             <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command to substitute
-                precompiled bodies when the name and argument signature match.</li>
+                precompiled bodies when the name and argument signature match. The body&rsquo;s string
+                representation is set to either the preserved source text (artifacts built with
+                <b>-include-source</b>) or the diagnostic sentinel (default stripped mode).</li>
             <li>Installs a temporary <b>OOShim</b> that intercepts <b>oo::define</b> and <b>oo::objdefine</b>
                 to substitute precompiled method/constructor/destructor bodies. Self methods (kind 4,
                 <b>TBCX_METH_SELF</b>) are installed via <b>oo::define { self method }</b> to preserve
-                metaclass inheritance for subclasses.</li>
+                metaclass inheritance for subclasses. Method body string representations follow the
+                same preserved-or-sentinel rule as proc bodies.</li>
             <li>Registers precompiled lambdas in a persistent per-interpreter <b>ApplyShim</b> that
                 recovers the compiled representation if type shimmer evicts it.</li>
-            <li>Executes the precompiled top-level block with <b>TCL_EVAL_GLOBAL</b>.
-                A top-level <b>return</b> is handled identically to <b>source</b>.</li>
+            <li>Executes the precompiled top-level block via <b>Tcl_EvalObjEx</b> with flags <b>0</b>
+                (no <b>TCL_EVAL_GLOBAL</b>), evaluating in the caller&rsquo;s current namespace.
+                <b>iPtr-&gt;scriptFile</b> is saved, set to the header&rsquo;s source path (or the tbcx
+                artifact path as a fallback), and restored after evaluation &mdash; matching
+                <b>Tcl_FSEvalFileEx</b>&rsquo;s handling in <b>tclIOUtil.c</b>.
+                Compiled locals for the top-level frame are installed on the caller&rsquo;s active
+                variable frame by linking named variables to existing same-name variables in
+                the caller&rsquo;s scope. A top-level <b>return</b> is handled identically to <b>source</b>.</li>
             <li>Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter&rsquo;s lifetime.</li>
           </ul>
         </dd>
@@ -237,7 +255,8 @@ try {
         <dt>Notes</dt>
         <dd>
           <ul>
-            <li>The top-level block executes with <b>TCL_EVAL_GLOBAL</b>; compiled locals for the global frame are linked to existing global variables.</li>
+            <li>The top-level block executes in the <i>caller&rsquo;s</i> current namespace, with compiled locals linked to the caller&rsquo;s variable frame. When <b>tbcx::load</b> is wrapped inside a proc that the user invokes externally, the caller should use <code>uplevel 1 [list tbcx::load $path]</code> to pop to the outer frame &mdash; identical to the pattern already required for <b>source</b> in the same position.</li>
+            <li><b>info script</b> inside the loaded top-level block returns the authored <code>.tcl</code> source path when the artifact was built from a file, matching what <b>source</b> would have set. This supports both <code>[file dirname [info script]]</code> (for sibling asset lookup) and <code>[info script] eq $::argv0</code> (self-invocation guards).</li>
             <li>Loading executes code; only load artifacts from trusted sources.</li>
           </ul>
         </dd>
@@ -253,6 +272,17 @@ try {
     tbcx::load $ch
 } finally {
     close $ch
+}
+
+# Drop-in replacement for source, inside a module loader proc.
+# Both branches use uplevel 1 so they reach the caller&rsquo;s frame.
+proc moduleLoad {path} {
+    set tbcxPath [file join [file dirname $path] ../tbcx [file tail $path].tbcx]
+    if {[file exists $tbcxPath]} {
+        uplevel 1 [list tbcx::load $tbcxPath]
+    } else {
+        uplevel 1 [list source $path]
+    }
 }</code></pre>
 
       <h3 id='tbcx-dump-filename'>tbcx::dump <i>filename</i></h3>
@@ -261,13 +291,36 @@ try {
         <dt>Parameters</dt>
         <dd><i>filename</i> &mdash; A readable path to a <code>.tbcx</code> file.</dd>
         <dt>Behavior</dt>
-        <dd>Reads the artifact and prints: header fields; section summaries; literals and AuxData; exception ranges;
-            and a disassembly of the top-level, proc, method, and lambda bodies.</dd>
+        <dd>Reads the artifact and prints: header fields (including the authored source path when recorded); section summaries; literals and AuxData; exception ranges;
+            disassembly of the top-level, proc, method, and lambda bodies; and the
+            preserved body source text (indented inline, no truncation) for each proc and method when the artifact was built with <b>-include-source</b>. For stripped artifacts (the default), each body record shows <code>source: &lt;stripped at save time&gt;</code>.</dd>
         <dt>Returns</dt>
         <dd>A string containing the formatted dump.</dd>
         <dt>Errors</dt>
         <dd>Unreadable file; bad header; malformed section; short read.</dd>
       </dl>
+      <p><b>Examples</b></p>
+      <pre><code>% package require tbcx
+% tbcx::save hello.tcl hello.tbcx -include-source
+% puts [tbcx::dump hello.tbcx]
+TBCX Header:
+  magic = 0x58434254 ('T''B''C''X')
+  format = 92
+  tcl_version = 9.1.0 (type 0)
+  top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
+  source = /path/to/hello.tcl
+
+Top-level block:
+  Disassembly (top-level):
+    ...
+
+Procs: 1
+  - proc hi  (ns=::)
+    args:
+    source: (14 bytes)
+      puts Hello
+    Disassembly (hi):
+    ...</code></pre>
 
       <h3 id='tbcx-gc'>tbcx::gc</h3>
       <p><b>Synopsis</b> &mdash; Purge stale entries from the per-interpreter lambda shimmer-recovery registry.</p>
@@ -286,19 +339,46 @@ try {
         <dd>Empty string.</dd>
       </dl>
 
+      <h2 id='source-preservation'>SOURCE PRESERVATION</h2>
+      <p>
+        Without <b>-include-source</b>, every proc and method body is emitted with an
+        empty source-text field on the wire, and the loader installs a two-line
+        diagnostic sentinel as the body&rsquo;s string representation:</p>
+      <pre><code># tbcx: body source stripped at save time; info body unavailable
+error "tbcx: introspection-based cloning is not supported for this artifact"</code></pre>
+      <p>
+        The shape matches the canonical <i>tclcompiler</i> pattern (Compiler8.html,
+        &ldquo;Example 1: Cloning Procedures&rdquo;):</p>
+      <ul>
+        <li>A <b>#</b> comment line &mdash; shows up at the top of any error traceback,
+            making the cause visible at a glance.</li>
+        <li>An <b>error</b> call &mdash; so that if downstream code does
+            <code>proc new [info args orig] [info body orig]</code> and invokes <code>new</code>,
+            the clone fails loudly rather than silently running as a no-op.</li>
+      </ul>
+      <p>
+        With <b>-include-source</b>, the authored source text is preserved in the
+        artifact and attached as the body Tcl_Obj&rsquo;s string representation via
+        <b>Tcl_InvalidateStringRep</b> + <b>Tcl_InitStringRep</b>. The ByteCode
+        internal representation is untouched; execution still uses the precompiled
+        bytecode. <b>info body</b>, <b>info class definition</b>,
+        <b>info class constructor</b>, and TIP #280 source attribution round-trip
+        byte-for-byte.</p>
+
       <h2 id='file-format-overview'>FILE FORMAT (OVERVIEW)</h2>
-      <p>This section summarizes the on-disk structure. Format version is <b>91</b> (Tcl 9.1).
+      <p>This section summarizes the on-disk structure. Format version is <b>92</b> (Tcl 9.1).
          All integers are little-endian.</p>
       <dl class='deflist'>
         <dt>Header</dt>
-        <dd>Magic (<code>0x58434254</code>) + format version (91) + producing Tcl version;
+        <dd>Magic (<code>0x58434254</code>) + format version (92) + producing Tcl version;
             size/count metadata for the top-level block (code length, exception ranges,
-            literal count, AuxData count, locals, max stack).</dd>
+            literal count, AuxData count, locals, max stack); authored source path LPString
+            (empty for inline/channel inputs).</dd>
         <dt>Sections (order)</dt>
         <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue);
-            (2) Procs (FQN, ns, arg spec, compiled block);
+            (2) Procs (FQN, ns, arg spec, body-source LPString, compiled block);
             (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top-level script);
-            (4) Methods (class, kind 0&ndash;4, name, args, compiled block).</dd>
+            (4) Methods (class, kind 0&ndash;4, name, args, body-source LPString, compiled block).</dd>
         <dt>Literal kinds</dt>
         <dd>boolean, (wide)int/uint, double, bignum, string, bytearray, list,
             dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
@@ -323,7 +403,8 @@ try {
         order once and applies a tight in-place swap over bulk sections that require conversion,
         avoiding per-field branching so cross-endian loads remain close to native performance.</p>
       <p>
-        Loading executes the precompiled top-level (with <b>TCL_EVAL_GLOBAL</b>), then installs
+        Loading evaluates the precompiled top-level in the caller&rsquo;s current namespace with
+        <b>iPtr-&gt;scriptFile</b> set to the authored source path (if recorded), then installs
         precompiled proc/method bodies and rehydrates lambda literals. The intent is to be
         functionally indistinguishable from <b>source</b> of the original script, with the
         benefit of faster startup due to avoided parsing/compilation.</p>
@@ -347,13 +428,25 @@ try {
         (including diamond), mixins, filters, forwards, abstract/singleton metaclasses,
         method rename/delete/export changes, metaclasses with <b>self method</b>, and
         <b>next</b>-based constructor chaining.</p>
+      <p>
+        With <b>-include-source</b>, <b>info class definition</b>, <b>info class constructor</b>,
+        <b>info class destructor</b>, and <b>info object method</b> all return the authored body
+        text byte-for-byte, enabling introspection-based idioms such as <code>cloneMethod src dst</code>
+        patterns to work identically to the <b>source</b>-based baseline.</p>
 
       <h2 id='multi-interpreter-and-thread-support'>MULTI-INTERPRETER AND THREAD SUPPORT</h2>
       <p>
+        TBCX follows Tcl&rsquo;s standard threading model: only the thread that created
+        an interpreter may call <b>tbcx::save</b>, <b>tbcx::load</b>, <b>tbcx::dump</b>,
+        or <b>tbcx::gc</b> on that interpreter. Multi-thread support means multiple
+        independent interpreters, each used by its owning thread &mdash; not sharing one
+        interpreter across threads. Calling a TBCX command from a non-owning thread
+        returns <b>TCL_ERROR</b> with a diagnostic message.</p>
+      <p>
         Artifacts are designed to load into interpreters other than the originating one.
-        The bundled tests cover child interpreters and threaded scenarios.
-        Interpreter-specific state such as the ApplyShim lambda registry remains
-        per-interpreter.</p>
+        Interpreter-specific state (ApplyShim lambda registry, load depth, OO shim
+        hidden-ID counter) remains strictly per-interpreter and is cleaned up
+        automatically when the interpreter is deleted.</p>
 
       <h2 id='limits'>LIMITS</h2>
       <p>
@@ -370,7 +463,9 @@ try {
         Representative messages include: &ldquo;bad header&rdquo;, &ldquo;incompatible Tcl version&rdquo;,
         &ldquo;short read/write&rdquo;, &ldquo;unsupported AuxData kind&rdquo;,
         &ldquo;input is neither an open channel nor a readable file&rdquo;,
-        &ldquo;runaway serialization detected&rdquo;, and Tcl errors from top-level evaluation.</p>
+        &ldquo;runaway serialization detected&rdquo;,
+        &ldquo;tbcx::save: unknown option &hellip;; expected -include-source&rdquo;,
+        and Tcl errors from top-level evaluation.</p>
 
       <h2 id='security'>SECURITY</h2>
       <p>Loading executes code. Only load artifacts you trust.
@@ -379,13 +474,13 @@ try {
          grant selective access.</p>
 
       <h2 id='see-also'>SEE ALSO</h2>
-      <p>source(n), TclOO(n)</p>
+      <p>source(n), TclOO(n), info(n), tclcompiler (historical Tcl 8.x AOT tool)</p>
 
       <h2 id='copyright'>COPYRIGHT</h2>
-      <p>&copy; 2025–2026 Miguel Banon</p>
+      <p>&copy; 2025&ndash;2026 Miguel Banon</p>
       <p>MIT License.</p>
 
-      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.1</div>
+      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.1 (format v92)</div>
     </div>
     <a href='#top' class='back-to-top'>&uarr; Top</a>
   </body>

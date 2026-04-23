@@ -136,6 +136,12 @@ typedef struct {
     Tcl_Size    oldNum;
     LocalCache *oldCache;
     Var        *allocated;
+    /* Frame pointer captured at TopLocals_Begin so TopLocals_End can
+     * restore the exact same frame.  Begin chooses varFramePtr (the
+     * active frame at eval time), but between Begin and End the interp
+     * may push/pop frames.  Recording the pointer here avoids using
+     * whichever frame is active at End time. */
+    CallFrame  *frame;
 } TbcxTopFrameSave;
 
 /* Runaway detection limits */
@@ -164,7 +170,7 @@ static void        DelOOShim(Tcl_Interp *ip, OOShim *os);
 static void        DelProcShim(Tcl_Interp *ip, ProcShim *ps);
 static ApplyShim  *EnsureApplyShim(Tcl_Interp *ip);
 static void        FixCompiledLocalNames(Proc *procPtr, LocalCache *lc);
-static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch);
+static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePath);
 static int         MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name);
 static void        OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static void        OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
@@ -2065,17 +2071,54 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         }
     }
 
+    /* Body source text.  Read before the compiled block so we can
+     * attach it to the fresh body Tcl_Obj with Tcl_InitStringRep — that
+     * restores `info class method -body` / `info object method -body`
+     * round-trip fidelity.  Length==0 means the artifact was written
+     * without -include-source (the default for tbcx, matching the
+     * tclcompiler/tbcload tradition for Tcl AOT output); substitute
+     * the diagnostic sentinel so introspection is loud rather than
+     * silently empty. */
+    char    *bodySrc = NULL;
+    uint32_t bodySrcLen = 0;
+    if (!Tbcx_R_LPString(r, &bodySrc, &bodySrcLen)) {
+        Tcl_DecrRefCount(argsObj);
+        Tcl_DecrRefCount(nameObj);
+        Tcl_DecrRefCount(clsFqn);
+        return TCL_ERROR;
+    }
+
     /* compiled block (namespace default: class namespace) + receive numLocals */
     Namespace *clsNs  = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(clsFqn));
     uint32_t   nLoc   = 0;
     Tcl_Obj   *bodyBC = Tbcx_ReadBlock(r, ip, clsNs, &nLoc, 1, 0);
     if (!bodyBC) {
+        Tcl_Free(bodySrc);
         Tcl_DecrRefCount(argsObj);
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     Tcl_IncrRefCount(bodyBC);
+
+    /* Attach source text as string rep.  bodyBC->bytes is
+     * &tclEmptyString (TclNewObj default), not NULL — so we must
+     * Tcl_InvalidateStringRep() first to force Tcl_InitStringRep down
+     * its allocate-and-copy branch (bytes==NULL).  The other two
+     * branches (empty-string singleton and allocated-nonempty) are
+     * "allocate only" and do not memcpy from src.  Neither call
+     * touches the internal rep.  See ReadProc Stage 4.5 for the
+     * detailed branch analysis. */
+    Tcl_InvalidateStringRep(bodyBC);
+    if (bodySrcLen > 0) {
+        Tcl_InitStringRep(bodyBC, bodySrc, (size_t)bodySrcLen);
+    } else {
+        Tcl_InitStringRep(bodyBC,
+            TBCX_STRIPPED_SOURCE_SENTINEL,
+            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+    }
+    Tcl_Free(bodySrc);
+    bodySrc = NULL;
     /* Build Proc + compiled locals from argsObj */
     Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
     memset(procPtr, 0, sizeof(Proc));
@@ -3933,6 +3976,25 @@ int Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H) {
     if (!Tbcx_R_U32(r, &H->maxStackTop))
         return 0;
 
+    /* source path LPString, immediately after fixed-size fields.
+     * Empty string means the artifact was built from an inline script
+     * or channel (no path to preserve).  Non-empty means set
+     * iPtr->scriptFile to this during top-level eval so `info script`
+     * returns the authored source path. */
+    {
+        char    *srcP = NULL;
+        uint32_t srcL = 0;
+        if (!Tbcx_R_LPString(r, &srcP, &srcL))
+            return 0;
+        if (srcL > 0) {
+            H->sourcePath = Tcl_NewStringObj(srcP, (Tcl_Size)srcL);
+            Tcl_IncrRefCount(H->sourcePath);
+        } else {
+            H->sourcePath = NULL;
+        }
+        Tcl_Free(srcP);
+    }
+
     if (H->magic != TBCX_MAGIC || H->format != TBCX_FORMAT) {
         R_Error(r, "tbcx: bad header (unknown magic or format)");
         return 0;
@@ -4003,13 +4065,51 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
             goto cleanup_objs;
     }
 
+    /* ---- Stage 3.5: body source text ----
+     * Read before the compiled block so we can attach it as the body
+     * Tcl_Obj's string rep without a second allocation.  Length==0
+     * indicates the artifact was built without -include-source (the
+     * default, matching tclcompiler/tbcload); the loader then
+     * installs a diagnostic sentinel so `info body` is loud rather
+     * than silently empty. */
+    char    *bodySrc    = NULL;
+    uint32_t bodySrcLen = 0;
+    if (!Tbcx_R_LPString(r, &bodySrc, &bodySrcLen))
+        goto cleanup_objs;
+
     /* ---- Stage 4: read body bytecode ---- */
     Namespace *nsPtr  = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
     uint32_t   nLoc   = 0;
     Tcl_Obj   *bodyBC = Tbcx_ReadBlock(r, ip, nsPtr, &nLoc, 1, 0);
-    if (!bodyBC)
+    if (!bodyBC) {
+        Tcl_Free(bodySrc);
         goto cleanup_objs;
+    }
     Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
+
+    /* ---- Stage 4.5: attach source text ----
+     * Tbcx_ReadBlock produces a tbcxTyBytecode-typed Tcl_Obj whose
+     * string-rep bytes field is &tclEmptyString (TclNewObj's default —
+     * see tclInt.h:4292, not NULL).  Tcl_InitStringRep's three branches
+     * behave very differently by bytes-starting-value; the only branch
+     * that *copies* from the src argument is the bytes==NULL branch.
+     * The bytes==&tclEmptyString branch allocates a new buffer of the
+     * requested length but does NOT memcpy from src — Tcl treats that
+     * call shape as "allocate space, caller will fill it".
+     *
+     * We therefore invalidate first (zeroing bytes to NULL), then call
+     * Tcl_InitStringRep which follows the allocate-and-copy branch.
+     * Neither call touches the internal rep. */
+    Tcl_InvalidateStringRep(bodyBC);
+    if (bodySrcLen > 0) {
+        Tcl_InitStringRep(bodyBC, bodySrc, (size_t)bodySrcLen);
+    } else {
+        Tcl_InitStringRep(bodyBC,
+            TBCX_STRIPPED_SOURCE_SENTINEL,
+            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+    }
+    Tcl_Free(bodySrc);
+    bodySrc = NULL;
 
     /* ---- Stage 5: build FQN key ---- */
     Tcl_Obj    *fqnKey = NULL;
@@ -4122,15 +4222,28 @@ cleanup_strings:
 static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv) {
     Interp    *iPtr = (Interp *)ip;
 
-    /* The top-level bytecode is evaluated with TCL_EVAL_GLOBAL, which
-       executes on iPtr->rootFramePtr.  We must set up compiled locals on
-       that same frame — NOT iPtr->varFramePtr, which may differ when
-       tbcx::load is called from non-global context (tcltest, uplevel, etc). */
-    CallFrame *f    = iPtr->rootFramePtr;
+    /* The top-level bytecode is evaluated without TCL_EVAL_GLOBAL (so it
+     * matches plain-source `source` semantics: runs in the caller's
+     * namespace), which means the engine uses iPtr->varFramePtr — the
+     * active frame at eval time — not iPtr->rootFramePtr.  We must
+     * install compiled locals on that same frame, otherwise the
+     * bytecode's slot-based variable ops find an empty LocalCache and
+     * the fall-through to namespace resolution never happens the way
+     * the compiler expected.
+     *
+     * Prior code targeted rootFramePtr because TCL_EVAL_GLOBAL forced
+     * the engine onto the root frame; that assumption no longer holds
+     * after the namespace fix.  varFramePtr is correct regardless of
+     * whether tbcx::load was called from global, namespace-eval, or
+     * proc-body context. */
+    CallFrame *f    = iPtr->varFramePtr;
+    if (!f)
+        f = iPtr->rootFramePtr; /* very-early-init defensive fallback */
 
     memset(sv, 0, sizeof(*sv));
     if (!f)
         return; /* shouldn't happen, but be defensive */
+    sv->frame = f;
 
     /* Save old state */
     sv->oldLocals    = f->compiledLocals;
@@ -4150,7 +4263,10 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
         return;
     }
     /* Allocate compiled locals and directly link each slot to the target Var
-     * in the global namespace (no extra compilation, no upvar command call). */
+     * in the caller's namespace — NOT the global namespace.  Before the
+     * namespace fix this linked against :: because top-level bytecode was
+     * forced to run at :: via TCL_EVAL_GLOBAL; now that the eval scope is
+     * the caller's, the linkage targets must follow. */
     {
         size_t varBytes;
         if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes)) {
@@ -4167,8 +4283,12 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
     sv->allocated        = f->compiledLocals;
 
     if (f->localCachePtr) {
-        Tcl_Obj *const *names = (Tcl_Obj *const *)&f->localCachePtr->varName0; /* Tcl 9.x trailing array */
-        Tcl_Namespace  *gNs   = Tcl_GetGlobalNamespace(ip);
+        Tcl_Obj *const *names    = (Tcl_Obj *const *)&f->localCachePtr->varName0; /* Tcl 9.x trailing array */
+        Tcl_Namespace  *targetNs = (Tcl_Namespace *)f->nsPtr;
+        if (!targetNs)
+            targetNs = Tcl_GetCurrentNamespace(ip);
+        if (!targetNs)
+            targetNs = Tcl_GetGlobalNamespace(ip);
         for (Tcl_Size i = 0; i < n; i++) {
             Tcl_Obj *nm = names ? names[i] : NULL;
             if (!nm)
@@ -4179,10 +4299,11 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
                 continue; /* temp / unnamed */
             if (memchr(s, ':', (size_t)len))
                 continue; /* skip qualified */
-            /* Link to existing global variable if it exists.
-               Do NOT create the variable — that would differ from source semantics
-               where variables are only created on first assignment. */
-            Tcl_Var vHandle = Tcl_FindNamespaceVar(ip, s, gNs, 0);
+            /* Link to existing variable in the caller's namespace if it
+               exists.  Do NOT create the variable — that would differ
+               from source semantics where variables are only created on
+               first assignment. */
+            Tcl_Var vHandle = Tcl_FindNamespaceVar(ip, s, targetNs, 0);
             if (vHandle) {
                 Var *target = (Var *)vHandle; /* internal Var*, OK here */
                 Var *dst    = &f->compiledLocals[i];
@@ -4195,10 +4316,11 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
 }
 
 static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
-    Interp    *iPtr = (Interp *)ip;
-    /* Restore the same frame that TopLocals_Begin modified —
-       iPtr->rootFramePtr, not iPtr->varFramePtr. */
-    CallFrame *f    = iPtr->rootFramePtr;
+    (void)ip;
+    /* Restore the exact same frame that TopLocals_Begin modified
+     * (recorded in sv->frame at Begin time).  Using iPtr->varFramePtr
+     * here would be wrong if the eval pushed/popped frames in between. */
+    CallFrame *f    = sv->frame;
     if (!f)
         return; /* defensive */
 
@@ -4221,7 +4343,7 @@ static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
 
 #define TBCX_MAX_LOAD_DEPTH 8
 
-static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
+static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePath) {
     TbcxInterpState *st = TbcxGetInterpState(ip);
     if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH) {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d", st->loadDepth, TBCX_MAX_LOAD_DEPTH));
@@ -4232,6 +4354,7 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
     TbcxIn r;
     Tbcx_R_Init(&r, ip, ch);
     TbcxHeader H;
+    memset(&H, 0, sizeof(H));  /* zero H.sourcePath for the early-exit path */
 
     if (Tbcx_CheckBinaryChan(ip, ch) != TCL_OK) {
         st->loadDepth--;
@@ -4239,11 +4362,44 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
     }
 
     if (!Tbcx_ReadHeader(&r, &H) || r.err) {
+        if (H.sourcePath) {
+            Tcl_DecrRefCount(H.sourcePath);
+        }
         st->loadDepth--;
         return TCL_ERROR;
     }
 
-    Namespace *curNs   = (Namespace *)Tbcx_EnsureNamespace(ip, "::");
+    /* Resolve the namespace where the top-level block should run.
+     *
+     * Plain-source equivalence: the canonical `moduleLoad`-style wrapper
+     * for tbcx looks like
+     *     uplevel 1 [list source $path]    ;# plain-source branch
+     *     tbcx::load $path                  ;# tbcx branch
+     * and callers expect the two branches to be semantically identical.
+     * Tcl's `source` evaluates the file's top-level commands in the
+     * caller's current namespace — a bare `$dir` inside the sourced
+     * file resolves against that namespace, not against ::.
+     *
+     * For the tbcx branch to match, LoadTbcxStream must:
+     *   (a) associate the top-level ByteCode with the caller's current
+     *       namespace (so codePtr->nsPtr reflects the scope the code
+     *       will actually run in — important for the recompile-check
+     *       in TclProcCompileProc et al., and for lookupNsPtr resolution
+     *       of variables and commands), and
+     *   (b) evaluate the top-level block without TCL_EVAL_GLOBAL, so
+     *       the engine does not switch to global scope before running
+     *       the first opcode.
+     *
+     * Before this change both points were wrong: `::` was hard-coded
+     * here and TCL_EVAL_GLOBAL was passed below.  The combined effect
+     * forced every top-level block to execute at `::` regardless of
+     * the caller's namespace, which meant that any tbcx-loaded script
+     * with bare `$var` or `variable x` at its top — including the
+     * ooxml scripts/text module and the `namespace eval ::wg3 {...}`
+     * blocks in scripts/xml and scripts/toc — resolved those against
+     * the wrong namespace and failed with `can't read "<name>": no
+     * such variable`. */
+    Namespace *curNs   = (Namespace *)Tcl_GetCurrentNamespace(ip);
     uint32_t   dummyNL = 0;
 
     Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, ip, curNs, &dummyNL, 1, 0);
@@ -4366,7 +4522,40 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
 
         TopLocals_Begin(ip, top, &_sv);
 
-        rc = Tcl_EvalObjEx(ip, topBC, TCL_EVAL_GLOBAL);
+        /* Save and set iPtr->scriptFile around the top-level eval so
+         * that `info script` inside the loaded bytecode returns the
+         * authored source path — matching Tcl's Tcl_FSEvalFileEx
+         * behavior (tclIOUtil.c:1806-1807) for sourced scripts.
+         *
+         * Priority: use H.sourcePath (the path the artifact was built
+         * from) when the save side recorded one, because that's what
+         * `source` would have returned.  Only if the artifact has no
+         * recorded source path (empty LPString — built from inline
+         * script or channel) do we fall back to the tbcx artifact path
+         * passed in as scriptFilePath; this still satisfies the
+         * self-invocation guard idiom `[info script] eq $::argv0`
+         * because the .tbcx path differs from the outer argv0.
+         *
+         * Both common idioms then work for tbcx-loaded modules:
+         *     set dir [file dirname [info script]]      ;# asset-relative
+         *     if {[info script] eq $::argv0} { ... }    ;# self-guard
+         */
+        Interp  *iPtrLocal    = (Interp *)ip;
+        Tcl_Obj *oldScript    = iPtrLocal->scriptFile;
+        Tcl_Obj *effectivePath = H.sourcePath ? H.sourcePath : scriptFilePath;
+        if (effectivePath) {
+            iPtrLocal->scriptFile = effectivePath;
+            Tcl_IncrRefCount(iPtrLocal->scriptFile);
+        }
+
+        rc = Tcl_EvalObjEx(ip, topBC, 0);
+
+        if (effectivePath) {
+            if (iPtrLocal->scriptFile) {
+                Tcl_DecrRefCount(iPtrLocal->scriptFile);
+            }
+            iPtrLocal->scriptFile = oldScript;
+        }
 
         TopLocals_End(ip, &_sv);
 
@@ -4395,6 +4584,10 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch) {
     }
 
 cleanup:
+    if (H.sourcePath) {
+        Tcl_DecrRefCount(H.sourcePath);
+        H.sourcePath = NULL;
+    }
     Tcl_DecrRefCount(topBC);
     if (ooshimInited)
         DelOOShim(ip, &ooshim);
@@ -4430,7 +4623,11 @@ int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     Tcl_Channel inCh  = NULL;
 
     if (Tbcx_ProbeOpenChannel(interp, inObj, &inCh)) {
-        return LoadTbcxStream(interp, inCh);
+        /* Channel branch: no reliable path to use for iPtr->scriptFile;
+         * pass NULL so LoadTbcxStream leaves scriptFile alone.  Callers
+         * that use an already-open channel typically don't care about
+         * `info script` anyway. */
+        return LoadTbcxStream(interp, inCh, NULL);
     }
 
     if (Tbcx_ProbeReadableFile(interp, inObj)) {
@@ -4438,7 +4635,14 @@ int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         if (!ch) {
             return TCL_ERROR;
         }
-        int rc = LoadTbcxStream(interp, ch);
+        /* File branch: pass the .tbcx path so `info script` inside
+         * the loaded top-level block returns the artifact's path —
+         * matching Tcl_FSEvalFileEx's scriptFile handling (tclIOUtil.c
+         * lines 1806-1807).  This is what `source` does, and any
+         * sourced script that checks `[info script] eq $::argv0` as
+         * a self-invocation guard (standard Tcl idiom) depends on
+         * that value being distinct from the outer script's path. */
+        int rc = LoadTbcxStream(interp, ch, inObj);
         if (Tcl_Close(interp, ch) != TCL_OK) {
             rc = TCL_ERROR;
         }

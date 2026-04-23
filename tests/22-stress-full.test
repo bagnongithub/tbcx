@@ -360,7 +360,7 @@ test sf.14 {stress: dump contains structural sections} -body {
     tbcx::save $script $out
     set dump [tbcx::dump $out]
     set checks 0
-    foreach pat {"*TBCX Header:*" "*magic = 0x58434254*" "*format = 91*"
+    foreach pat {"*TBCX Header:*" "*magic = 0x58434254*" "*format = 92*"
                  "*Top-level block:*" "*Procs:*" "*Classes:*" "*Methods:*"} {
         if {[string match $pat $dump]} { incr checks }
     }

@@ -58,6 +58,15 @@ typedef struct TbcxCtx {
     int           blockDepth;    /* current WriteCompiledBlock recursion depth */
     int           maxBlockDepth; /* high-water mark */
     int           runaway;       /* set to 1 when a limit is hit */
+    /* Save-time flags (TBCX_SAVE_FL_*).  Copied from Tbcx_SaveObjCmd so
+     * that lower-level writers can consult them without threading the
+     * flag set through every call site. */
+    unsigned      saveFlags;
+    /* Original source file path when tbcx::save was given a filesystem
+     * path (not an inline script or channel).  Written into the header
+     * as an LPString so the loader can set iPtr->scriptFile to match
+     * what `source` would have done.  NULL when no path is available. */
+    Tcl_Obj      *sourcePath;
 } TbcxCtx;
 
 typedef struct {
@@ -139,7 +148,7 @@ static Tcl_Obj                *RecurseScriptBody(Tcl_Interp *ip, const Tcl_Token
 static void                    DV_Free(DefVec *dv);
 static void                    DV_Init(DefVec *dv);
 static void                    DV_Push(DefVec *dv, DefRec r);
-static int                     EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w);
+static int                     EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tcl_Obj *sourcePath);
 static Tcl_Obj                *FqnUnder(Tcl_Interp *ip, Tcl_Obj *curNs, Tcl_Obj *name);
 static int                     IsPureOodefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Size len);
 static void                    Lit_Bignum(TbcxOut *w, Tcl_Obj *o);
@@ -3218,6 +3227,13 @@ static void WriteHeaderTop(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *topObj) {
     W_U32(w, H.numAuxTop);
     W_U32(w, H.numLocalsTop);
     W_U32(w, H.maxStackTop);
+    if (ctx->sourcePath) {
+        Tcl_Size    pLen = 0;
+        const char *pStr = Tbcx_GetStringFromObjSafe(ctx->sourcePath, &pLen);
+        W_LPString(w, pStr, pLen);
+    } else {
+        W_LPString(w, "", 0);
+    }
 }
 
 static void DV_Init(DefVec *dv) {
@@ -5174,10 +5190,12 @@ static Tcl_Obj *CaptureAndRewriteScript(Tcl_Interp *ip, const char *script, Tcl_
     return rew;
 }
 
-static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w) {
+static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tcl_Obj *sourcePath) {
     int     rc  = TCL_ERROR; /* set to TCL_OK only on success */
     TbcxCtx ctx = {0};
-    ctx.interp  = w->interp;
+    ctx.interp     = w->interp;
+    ctx.saveFlags  = saveFlags;
+    ctx.sourcePath = sourcePath;
     CtxInitStripBodies(&ctx);
     CtxInitCompiled(&ctx);
     CtxInitNsEval(&ctx);
@@ -5295,7 +5313,14 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w) {
     if (w->err)
         goto cleanup;
 
-    /* 5. Procs section (nameFqn, namespace, args, block) */
+    /* 5. Procs section: nameFqn, namespace, args, srcText, block
+     *    srcText is the original proc body as authored — attached at load
+     *    time via Tcl_InitStringRep so `info body`, TIP #280 attribution,
+     *    stack-trace line numbers, and introspection-based clones
+     *    (ooxml's cloneRule / installTocRule pattern) all round-trip
+     *    correctly.  Only emitted when -include-source was specified;
+     *    otherwise the field is written empty and the loader
+     *    substitutes a diagnostic sentinel. */
     uint32_t numProcs = 0;
     for (Tcl_Size i = 0; i < defs.n; i++) {
         if (defs.v[i].kind == DEF_KIND_PROC)
@@ -5313,6 +5338,17 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w) {
             W_LPString(w, s, ln);
             s = Tbcx_GetStringFromObjSafe(defs.v[i].args, &ln);
             W_LPString(w, s, ln);
+
+            /* Body source text.  Emitted before the compiled block
+             * so the loader can read+allocate the string up front and
+             * attach it without an extra pass.  Length==0 means
+             * "stripped" and is the loader's cue to install a sentinel. */
+            if (ctx.saveFlags & TBCX_SAVE_FL_INCLUDE_SOURCE) {
+                s = Tbcx_GetStringFromObjSafe(defs.v[i].body, &ln);
+                W_LPString(w, s, ln);
+            } else {
+                W_LPString(w, "", 0);
+            }
 
             /* Compile body offline (proc semantics) and emit */
             {
@@ -5389,6 +5425,19 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w) {
             /* args */
             s = Tbcx_GetStringFromObjSafe(defs.v[i].args, &ln);
             W_LPString(w, s, ln);
+
+            /* Body source text — see Procs-section comment above.
+             * Applies identically to inst, class, ctor, dtor, and self
+             * methods; TclOO's ProcedureMethod wraps a Proc* whose
+             * bodyPtr's string rep is read by TclOOGetMethodBody,
+             * info class method, info object method, etc.  Source
+             * inclusion is all-or-nothing per artifact. */
+            if (ctx.saveFlags & TBCX_SAVE_FL_INCLUDE_SOURCE) {
+                s = Tbcx_GetStringFromObjSafe(defs.v[i].body, &ln);
+                W_LPString(w, s, ln);
+            } else {
+                W_LPString(w, "", 0);
+            }
 
             /* Compile & emit block (proc semantics) */
             if (CompileProcLike(w, &ctx, defs.v[i].cls, defs.v[i].args, defs.v[i].body, "body of method") != TCL_OK)
@@ -5525,17 +5574,56 @@ int Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj) {
 
 int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
     TBCX_CHECK_INTERP_THREAD(interp);
-    if (objc != 3) {
-        Tcl_WrongNumArgs(interp, 1, objv, "in out");
+
+    /* Argument grammar:
+     *     tbcx::save in out ?-include-source?
+     *
+     * The optional flag is positional-after-args.  Any unrecognized
+     * trailing token is reported with the same error style as
+     * Tcl_WrongNumArgs.
+     *
+     * DEFAULT BEHAVIOR (no -include-source):
+     *     Every proc/method body source field is emitted as an empty
+     *     LPString on the wire.  The loader substitutes a diagnostic
+     *     sentinel (TBCX_STRIPPED_SOURCE_SENTINEL) so `info body`
+     *     returns a loud string instead of silently returning empty.
+     *     This matches the 25-year TclPro/tbcload precedent for Tcl
+     *     AOT compile output — deployment artifacts are typically
+     *     distributed instead of source, and stripping keeps the
+     *     artifact smaller and preserves the IP-protection angle.
+     *
+     * -include-source : emit the original body source text as an
+     *                   LPString for every proc/method.  Opt in
+     *                   when the artifact consumers need correct
+     *                   `info body`, TIP #280 attribution, disassembly
+     *                   annotations, or any introspection-based clone
+     *                   (cloneRule / `info class definition` / etc.).
+     *                   Artifact size grows proportional to the
+     *                   aggregate source text of all procs + methods. */
+    if (objc < 3 || objc > 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "in out ?-include-source?");
         return TCL_ERROR;
+    }
+    unsigned saveFlags = 0;
+    for (Tcl_Size i = 3; i < objc; i++) {
+        const char *flag = Tcl_GetString(objv[i]);
+        if (strcmp(flag, "-include-source") == 0) {
+            saveFlags |= TBCX_SAVE_FL_INCLUDE_SOURCE;
+        } else {
+            Tcl_SetObjResult(interp,
+                Tcl_ObjPrintf("tbcx::save: unknown option \"%s\"; "
+                              "expected -include-source", flag));
+            return TCL_ERROR;
+        }
     }
 
     Tcl_Obj    *inObj  = objv[1];
     Tcl_Obj    *outObj = objv[2];
 
-    Tcl_Channel inCh   = NULL;
-    Tcl_Obj    *script = NULL;
-    int         rc     = TCL_ERROR;
+    Tcl_Channel inCh      = NULL;
+    Tcl_Obj    *script    = NULL;
+    int         rc        = TCL_ERROR;
+    Tcl_Obj    *sourcePath = NULL;
 
     if (Tbcx_ProbeOpenChannel(interp, inObj, &inCh)) {
         /* Input is a caller-provided channel.  Do NOT change its encoding
@@ -5560,6 +5648,13 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
             Tcl_DecrRefCount(script);
             return TCL_ERROR;
         }
+        /* Record the normalized source path so `info script` returns the
+         * authored .tcl path at load time — matching source semantics. */
+        sourcePath = Tcl_FSGetNormalizedPath(interp, inObj);
+        if (!sourcePath) {
+            sourcePath = inObj; /* fallback to as-given */
+        }
+        Tcl_IncrRefCount(sourcePath);
     } else {
         script = inObj;
         Tcl_IncrRefCount(script);
@@ -5615,8 +5710,12 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
 
     TbcxOut w;
     Tbcx_W_Init(&w, interp, outCh);
-    rc = EmitTbcxStream(script, &w);
+    rc = EmitTbcxStream(script, &w, saveFlags, sourcePath);
     Tcl_DecrRefCount(script);
+    if (sourcePath) {
+        Tcl_DecrRefCount(sourcePath);
+        sourcePath = NULL;
+    }
 
     if (weOpenedOut) {
         if (Tcl_Close(interp, outCh) != TCL_OK)

@@ -591,7 +591,15 @@ test p8.1 {P8: proc body source statements not in dump} -body {
     list $found $result
 } -result {0 333}
 
-test p8.2 {P8: proc body source not in raw binary} -body {
+test p8.2 {P8: proc body source stripped by default (v92), preserved with -include-source} -body {
+    # v92 STRIPS proc body source text by default — matching the 25-year
+    # TclPro/tbcload precedent for Tcl AOT compile output.  The loader
+    # substitutes a diagnostic sentinel so `info body` returns a loud
+    # string rather than silently returning empty.  The `-include-source`
+    # flag opts in to preserving source, required for introspection
+    # idioms (cloneRule, info class definition, TIP #280 attribution).
+    # This test validates both modes: default (source absent, sentinel
+    # installed) and -include-source (source present).
     set in [makeFile {
         proc p8secret2 {} {
             set P8Y_A "alpha"
@@ -600,17 +608,24 @@ test p8.2 {P8: proc body source not in raw binary} -body {
         }
         return [p8secret2]
     } p8.2-in.tcl]
-    set out [makeFile "" p8.2-out.tbcx]
-    tbcx::save $in $out
-    # Read the raw binary and search for a source code statement.
-    # "set P8Y_A" is a Tcl statement that only exists in uncompiled source.
-    set fd [open $out rb]
-    set raw [read $fd]
+    # Default save: body source is ABSENT from the binary (intentional).
+    set outDefault [makeFile "" p8.2-default.tbcx]
+    tbcx::save $in $outDefault
+    set fd [open $outDefault rb]
+    set rawDefault [read $fd]
     close $fd
-    set found [string match "*set P8Y_A*" $raw]
-    set result [tbcx::load $out]
-    list $found $result
-} -result {0 alpha_beta}
+    set defaultHasSource [string match "*set P8Y_A*" $rawDefault]
+    set defaultExec [tbcx::load $outDefault]
+    # Include-source mode: body source is embedded on the wire.
+    set outIncluded [makeFile "" p8.2-included.tbcx]
+    tbcx::save $in $outIncluded -include-source
+    set fd [open $outIncluded rb]
+    set rawIncluded [read $fd]
+    close $fd
+    set includedHasSource [string match "*set P8Y_A*" $rawIncluded]
+    set includedExec [tbcx::load $outIncluded]
+    list $defaultHasSource $defaultExec $includedHasSource $includedExec
+} -result {0 alpha_beta 1 alpha_beta}
 
 test p8.3 {P8: method body source not in dump} -body {
     set in [makeFile {
