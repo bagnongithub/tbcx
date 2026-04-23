@@ -1,0 +1,85 @@
+# -*- tcl -*-
+# 30-rename-uaf.test — regression test for the internal-review rename-UAF
+# bug.  Before the fix, ProcCmdDeleteTrace / OOShimDefineCmdTrace /
+# OOShimObjdefCmdTrace / ApplyCmdDeleteTrace treated TCL_TRACE_RENAME
+# identically to TCL_TRACE_DELETE: null the cached Command* and skip
+# the handler restore in teardown.  After a rename, the Command struct
+# survives with CmdProcShim / CmdOOShim / CmdApplyShim still wired
+# into objProc2 and the client data still pointing at the
+# stack-allocated ProcShim / OOShim (or heap-allocated ApplyShim).
+# Invoking the renamed command post-load then dereferenced freed
+# memory and crashed with "called Tcl_FindHashEntry on deleted table"
+# / illegal instruction.
+#
+# Fix: on TCL_TRACE_RENAME, restore the original handlers in-place
+# while the Command struct is still accessible via the old name.
+
+package require tcltest
+namespace import ::tcltest::*
+
+package require tbcx
+
+test uaf.1 {rename proc during load, then use renamed command post-load} -setup {
+    set in  [makeFile {
+        proc cheerful {} { return "hello" }
+        cheerful
+        rename proc myproc
+        myproc after_rename {} { return "after" }
+    } uaf.1-in.tcl]
+    set out [makeFile "" uaf.1-out.tbcx]
+} -body {
+    tbcx::save $in $out
+    tbcx::load $out
+    # Post-load: proc has been renamed to myproc.  Before the fix, this
+    # call would UAF.  After the fix, the shim has been restored during
+    # the rename, so myproc now behaves as vanilla [proc].
+    myproc later_proc {} { return "done" }
+    later_proc
+} -result "done" -cleanup {
+    if {[info commands myproc] ne ""} { rename myproc proc }
+    removeFile $in
+    removeFile $out
+}
+
+test uaf.2 {rename oo::define during load, then use renamed command post-load} -setup {
+    set in  [makeFile {
+        oo::class create Greeter { method greet {} { return "hi" } }
+        [Greeter new] greet
+        rename oo::define mydef
+    } uaf.2-in.tcl]
+    set out [makeFile "" uaf.2-out.tbcx]
+} -body {
+    tbcx::save $in $out
+    tbcx::load $out
+    # Post-load, mydef must behave as vanilla oo::define
+    oo::class create X
+    mydef X { method m {} { return "xyz" } }
+    [X new] m
+} -result "xyz" -cleanup {
+    if {[info commands mydef] ne ""} { rename mydef oo::define }
+    catch { X destroy }
+    catch { Greeter destroy }
+    removeFile $in
+    removeFile $out
+}
+
+test uaf.3 {rename apply during load does not poison the interp} -setup {
+    set in  [makeFile {
+        # Force the apply shim install path via a registered lambda
+        set f [apply {{x} { expr {$x * 2} }} 21]
+        # Then rename apply
+        rename apply myapply
+    } uaf.3-in.tcl]
+    set out [makeFile "" uaf.3-out.tbcx]
+} -body {
+    tbcx::save $in $out
+    tbcx::load $out
+    # myapply should work as vanilla apply
+    myapply {{y} { expr {$y + 1} }} 10
+} -result "11" -cleanup {
+    if {[info commands myapply] ne ""} { rename myapply apply }
+    removeFile $in
+    removeFile $out
+}
+
+cleanupTests

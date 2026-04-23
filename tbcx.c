@@ -9,7 +9,7 @@
  * ========================================================================== */
 
 #define PKG_TBCX "tbcx"
-#define PKG_TBCX_VER "1.1"
+#define PKG_TBCX_VER "1.11"
 
 /* Runtime type pointers — initialized once under tbcxTypeMutex, thereafter
  * immutable.  Read-safety on weakly-ordered architectures is guaranteed by

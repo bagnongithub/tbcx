@@ -418,9 +418,6 @@ static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
     Tcl_Size    numVars = old->numVars;
     Tcl_Size    numArgs = procPtr->numArgs;
 
-    /* Allocate new cache with the extras area.
-     * F1 fix: overflow-safe arithmetic — numVars and numArgs derive from
-     * Proc fields set from wire data; unchecked multiply can wrap on 32-bit. */
     size_t      nameBytes, extraBytes, bytes;
     if (!tbcx_checked_mul((size_t)numVars, sizeof(Tcl_Obj *), &nameBytes) || !tbcx_checked_mul((size_t)numArgs, sizeof(Var), &extraBytes))
         return; /* overflow — skip cache fix; Tcl rebuilds on first call */
@@ -1407,6 +1404,20 @@ static void OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldNa
     (void)interp;
     (void)oldName;
     (void)newName;
+    if (flags & TCL_TRACE_RENAME) {
+        /* Same UAF-avoidance as ProcCmdDeleteTrace: the Command struct
+         * survives the rename, so we must restore its handlers *now*
+         * while it's still accessible — otherwise the renamed command
+         * retains our CmdOOShim with a dangling os pointer once
+         * LoadTbcxStream returns. */
+        if (os->defineCmdPtr) {
+            os->defineCmdPtr->objProc2       = os->savedDefineProc;
+            os->defineCmdPtr->objClientData2 = os->savedDefineCD;
+            if (os->savedDefineNre) {
+                os->defineCmdPtr->nreProc2 = os->savedDefineNre;
+            }
+        }
+    }
     if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
         os->defineCmdPtr         = NULL;
         os->defineTraceInstalled = 0;
@@ -1419,6 +1430,15 @@ static void OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldNa
     (void)interp;
     (void)oldName;
     (void)newName;
+    if (flags & TCL_TRACE_RENAME) {
+        if (os->objdefCmdPtr) {
+            os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+            os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
+            if (os->savedObjdefNre) {
+                os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
+            }
+        }
+    }
     if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
         os->objdefCmdPtr         = NULL;
         os->objdefTraceInstalled = 0;
@@ -1813,6 +1833,11 @@ read_fail:
         Tcl_Free(env.objArrayPtr);
     }
 
+    /* env.auxDataArrayPtr: this is a temporary shallow copy of the
+     * caller's auxArr.  The clientData payloads are owned by the caller
+     * (or, on TbcxByteCode success, by the packed ByteCode via the
+     * memcpy in TbcxByteCode) — never by env.auxDataArrayPtr itself.
+     * A shallow free here is correct. */
     if (env.auxDataArrayPtr)
         Tcl_Free(env.auxDataArrayPtr);
     if (env.exceptArrayPtr)
@@ -1984,14 +2009,15 @@ int TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label) {
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx verify: %s — PRECOMPILED flag not set (flags=0x%x)", label ? label : "?", (unsigned)bc->flags));
         return TCL_ERROR;
     }
-    /* Check interpHandle validity */
-    Interp *iPtr = (Interp *)ip;
-    if (bc->interpHandle != TclHandlePreserve(iPtr->handle)) {
-        TclHandleRelease(bc->interpHandle); /* undo the test preserve */
-        /* Not an error per se — could be a different interp.  Log only. */
-    } else {
-        TclHandleRelease(bc->interpHandle); /* undo the test preserve */
+    /* Check interpHandle validity.  Preserve a temporary handle for the
+     * comparison and release *the temporary*; bc->interpHandle itself is
+     * owned by the ByteCode and must not be touched here. */
+    Interp   *iPtr = (Interp *)ip;
+    TclHandle tmp  = TclHandlePreserve(iPtr->handle);
+    if (bc->interpHandle != tmp) {
+        /* Different interp binding — diagnostic-only path.  No error. */
     }
+    TclHandleRelease(tmp);
 
     /* Recursively check literal pool */
     if (bc->numLitObjects > 0 && bc->objArrayPtr) {
@@ -2169,8 +2195,15 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_DString keyDs;
     if (!MethodKeyBuf(&keyDs, clsFqn, kind, (mnL ? nameObj : NULL))) {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
-        Tcl_DecrRefCount(procBodyObj);
-        Tcl_DecrRefCount(bodyBC); /* local reference */
+        /* Release procBodyObj first — its freeIntRep drops
+         * procPtr->refCount from 2 to 1.  Then call TclProcCleanupProc
+         * (which decrements to 0 and frees the Proc + its locals +
+         * releases its own ref on bodyBC).  Finally drop our local
+         * bodyBC reference and the rest.  Without this sequence the
+         * Proc leaked on every malformed-key input. */
+        Tcl_DecrRefCount(procBodyObj); /* procPtr: 2 -> 1 */
+        TclProcCleanupProc(procPtr);   /* procPtr: 1 -> 0, frees Proc */
+        Tcl_DecrRefCount(bodyBC);      /* local reference */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2185,8 +2218,12 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_IncrRefCount(pair);
     if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK) {
         Tcl_DecrRefCount(pair);
-        Tcl_DecrRefCount(procBodyObj);
-        Tcl_DecrRefCount(bodyBC); /* local reference */
+        /* Same procPtr ownership discipline as the MethodKeyBuf failure
+         * path above: drop procBodyObj (2->1), then cleanup procPtr
+         * (1->0), then drop local bodyBC reference. */
+        Tcl_DecrRefCount(procBodyObj); /* procPtr: 2 -> 1 */
+        TclProcCleanupProc(procPtr);   /* procPtr: 1 -> 0, frees Proc */
+        Tcl_DecrRefCount(bodyBC);      /* local reference */
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         Tcl_DecrRefCount(argsObj);
@@ -2700,6 +2737,26 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly) 
     }
 }
 
+/* FreeAuxArrayOwned — deep-free an AuxData array, invoking each entry's
+ * type->freeProc on its clientData before releasing the array itself.
+ *
+ * Shallow `Tcl_Free(arr)` on a post-ReadAuxArray failure path leaks every
+ * clientData payload (hash tables for JumptableInfo/JumptableNumInfo,
+ * local-index arrays for DictUpdateInfo, ForeachInfo struct).  Use this
+ * helper on every failure path BEFORE ownership transfers into the
+ * packed ByteCode via ByteCodeObj(). */
+static void FreeAuxArrayOwned(AuxData *arr, uint32_t n) {
+    if (!arr)
+        return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (arr[i].type && arr[i].type->freeProc && arr[i].clientData) {
+            arr[i].type->freeProc(arr[i].clientData);
+            arr[i].clientData = NULL;
+        }
+    }
+    Tcl_Free(arr);
+}
+
 static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
     uint32_t n = 0;
     if (!Tbcx_R_U32(r, &n))
@@ -2973,6 +3030,18 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
                 Tcl_Free(arr);
             return 0;
         }
+        /* Reject out-of-enum exception-range types from the wire.
+         * Tcl's evaluator treats everything that is not CATCH as
+         * loop-like control metadata, so a crafted `.tbcx` with e.g.
+         * type8 = 99 could alter break/continue unwinding behaviour
+         * even when offsets are in range. */
+        if (type8 != (uint8_t)LOOP_EXCEPTION_RANGE &&
+            type8 != (uint8_t)CATCH_EXCEPTION_RANGE) {
+            R_Error(r, "tbcx: invalid exception range type");
+            if (arr)
+                Tcl_Free(arr);
+            return 0;
+        }
         arr[i].type           = (ExceptionRangeType)type8;
         /* Store in Tcl_Size domain (matches Tcl 9.1 headers).
          * Preserve -1 sentinel encoded as 0xFFFFFFFF on the wire. */
@@ -2982,10 +3051,292 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
         arr[i].continueOffset = (cont == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cont;
         arr[i].breakOffset    = (brk == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)brk;
         arr[i].catchOffset    = (cat == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cat;
+        /* Tighten the metadata shape: LOOP ranges must not carry a catch
+         * offset, CATCH ranges must not carry break/continue offsets. */
+        if (arr[i].type == LOOP_EXCEPTION_RANGE) {
+            if (arr[i].catchOffset != (Tcl_Size)-1) {
+                R_Error(r, "tbcx: LOOP exception range with non-sentinel catchOffset");
+                if (arr)
+                    Tcl_Free(arr);
+                return 0;
+            }
+        } else {
+            if (arr[i].breakOffset != (Tcl_Size)-1 ||
+                arr[i].continueOffset != (Tcl_Size)-1) {
+                R_Error(r, "tbcx: CATCH exception range with non-sentinel break/continueOffset");
+                if (arr)
+                    Tcl_Free(arr);
+                return 0;
+            }
+        }
     }
     *exOut  = arr;
     *numOut = n;
     return 1;
+}
+
+/* ValidateBlockOperands — semantic validation pass over the raw instruction
+ * stream from the wire.  Runs after the literal/aux/exception sections have
+ * been parsed and sized, BEFORE TbcxByteCode() hands the block to Tcl's
+ * evaluator.
+ *
+ * Validates:
+ *   1) opcode byte <= LAST_INST_OPCODE;
+ *   2) each instruction is fully contained within [0, codeLen);
+ *   3) every LIT1/LIT4 operand is < numLits;
+ *   4) every LVT1/LVT4 operand is < numLocals;
+ *   5) every AUX4 operand is < numAux;
+ *   6) every OFFSET1/OFFSET4 operand produces a target in [0, codeLen)
+ *      AND lands on a recorded instruction boundary;
+ *   7) every JumptableInfo/JumptableNumInfo hash entry's stored offset
+ *      satisfies the same in-range + on-boundary constraint.
+ *
+ * Without this pass, a crafted .tbcx with e.g. INST_PUSH <huge> can cause
+ * an out-of-bounds read of codePtr->objArrayPtr at runtime inside Tcl's
+ * evaluator.  The evaluator itself does not revalidate operands (by
+ * design — the compiler is trusted), so revalidation MUST happen at
+ * load time for untrusted artifacts.
+ *
+ * Returns TCL_OK on success; on failure, sets an interpreter result
+ * describing the offending instruction and returns TCL_ERROR. */
+static int ValidateBlockOperands(
+    Tcl_Interp *ip,
+    const unsigned char *code, uint32_t codeLen,
+    uint32_t numLits, uint32_t numAux, uint32_t numLocals,
+    AuxData *auxArr)
+{
+    const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
+    unsigned char *boundary = NULL;
+
+    /* Empty blocks are trivially valid. */
+    if (codeLen == 0) {
+        return TCL_OK;
+    }
+
+    boundary = (unsigned char *)Tcl_AttemptAlloc((size_t)codeLen);
+    if (!boundary) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (boundary map)", -1));
+        return TCL_ERROR;
+    }
+    memset(boundary, 0, (size_t)codeLen);
+
+    /* Pass 1: walk instruction stream, validate opcode and length,
+     * populate boundary map. */
+    uint32_t pc = 0;
+    while (pc < codeLen) {
+        unsigned int op = code[pc];
+        if (op > LAST_INST_OPCODE) {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                "tbcx: invalid opcode 0x%02x at pc %u", op, pc));
+            Tcl_Free(boundary);
+            return TCL_ERROR;
+        }
+        const InstructionDesc *desc = &instTable[op];
+        if (desc->numBytes <= 0 ||
+            (uint32_t)desc->numBytes > codeLen ||
+            pc + (uint32_t)desc->numBytes > codeLen) {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                "tbcx: truncated instruction %s (opcode 0x%02x) at pc %u",
+                desc->name ? desc->name : "?", op, pc));
+            Tcl_Free(boundary);
+            return TCL_ERROR;
+        }
+        boundary[pc] = 1;
+        pc += (uint32_t)desc->numBytes;
+    }
+    if (pc != codeLen) {
+        /* Final instruction ran past end; already reported above, but
+         * guard defensively. */
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: code stream does not end on instruction boundary", -1));
+        Tcl_Free(boundary);
+        return TCL_ERROR;
+    }
+
+    /* Pass 2: walk operands per instruction and validate each by
+     * InstOperandType.  Use the core's InstructionDesc.opTypes array
+     * rather than opcode-name matching so new opcodes are handled
+     * automatically. */
+    pc = 0;
+    while (pc < codeLen) {
+        unsigned int op = code[pc];
+        const InstructionDesc *desc = &instTable[op];
+        uint32_t off = 1; /* skip the opcode byte */
+        for (int oi = 0; oi < desc->numOperands; oi++) {
+            InstOperandType ot = desc->opTypes[oi];
+            switch (ot) {
+            case OPERAND_NONE:
+                break;
+            case OPERAND_INT1:
+            case OPERAND_UINT1:
+            case OPERAND_SCLS1:
+            case OPERAND_UNSF1:
+            case OPERAND_CLK1:
+            case OPERAND_LRPL1:
+                /* 1-byte immediate / flag / small-table-index operands.
+                 * No range check needed — the payload is just a bit
+                 * pattern interpreted by the opcode itself. */
+                off += 1;
+                break;
+            case OPERAND_LVT1: {
+                unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
+                if (idx >= numLocals) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: local index %u >= %u at pc %u",
+                        desc->name, idx, numLocals, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 1;
+                break;
+            }
+            case OPERAND_LIT1: {
+                unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
+                if (idx >= numLits) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: literal index %u >= %u at pc %u",
+                        desc->name, idx, numLits, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 1;
+                break;
+            }
+            case OPERAND_OFFSET1: {
+                int rel = TclGetInt1AtPtr(code + pc + off);
+                int64_t tgt = (int64_t)pc + rel;
+                if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64 ")",
+                        desc->name, rel, pc, tgt));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 1;
+                break;
+            }
+            case OPERAND_INT4:
+            case OPERAND_UINT4:
+            case OPERAND_IDX4:
+                off += 4;
+                break;
+            case OPERAND_LVT4: {
+                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                if (idx >= numLocals) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: local index %u >= %u at pc %u",
+                        desc->name, idx, numLocals, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 4;
+                break;
+            }
+            case OPERAND_LIT4: {
+                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                if (idx >= numLits) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: literal index %u >= %u at pc %u",
+                        desc->name, idx, numLits, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 4;
+                break;
+            }
+            case OPERAND_AUX4: {
+                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                if (idx >= numAux) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: aux index %u >= %u at pc %u",
+                        desc->name, idx, numAux, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 4;
+                break;
+            }
+            case OPERAND_OFFSET4: {
+                int rel = TclGetInt4AtPtr(code + pc + off);
+                int64_t tgt = (int64_t)pc + rel;
+                if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                        "tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64 ")",
+                        desc->name, rel, pc, tgt));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+                }
+                off += 4;
+                break;
+            }
+            default:
+                /* Unknown operand type — bail out safely rather than
+                 * silently accept.  Tcl may add new operand kinds in
+                 * future; this coerces us to revisit the validator. */
+                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                    "tbcx: %s: unknown operand type %d at pc %u (update validator)",
+                    desc->name, (int)ot, pc));
+                Tcl_Free(boundary);
+                return TCL_ERROR;
+            }
+        }
+        pc += (uint32_t)desc->numBytes;
+    }
+
+    /* Pass 3: walk jump-table aux payloads and validate stored targets.
+     * The stored value is the relative offset added to the jumpTable
+     * opcode's PC (see tclExecute.c processJumpTableEntry: "new pc =
+     * PC_REL + jumpOffset").  We need to locate each jumpTable /
+     * jumpTableNum opcode in the code stream and validate its aux's
+     * hash entries against THAT opcode's PC, not against 0.  Any aux
+     * index appearing more than once in the code stream (in the weird
+     * case of shared aux) is validated against each occurrence. */
+    for (uint32_t i = 0; i < numAux; i++) {
+        if (auxArr[i].type != tbcxAuxJTStr && auxArr[i].type != tbcxAuxJTNum)
+            continue;
+        Tcl_HashTable *ht = (Tcl_HashTable *)auxArr[i].clientData;
+
+        /* Find every jumpTable / jumpTableNum opcode pointing at this
+         * aux entry, and validate each hash entry's target against
+         * its PC. */
+        int validated = 0;
+        pc = 0;
+        while (pc < codeLen) {
+            unsigned int op = code[pc];
+            const InstructionDesc *desc = &instTable[op];
+            const char *nm = desc->name;
+            if (nm && (strcmp(nm, "jumpTable") == 0 || strcmp(nm, "jumpTableNum") == 0)) {
+                /* Single AUX4 operand at pc+1. */
+                unsigned int auxIdx = TclGetUInt4AtPtr(code + pc + 1);
+                if (auxIdx == i) {
+                    Tcl_HashSearch hs;
+                    Tcl_HashEntry *he;
+                    for (he = Tcl_FirstHashEntry(ht, &hs); he;
+                         he = Tcl_NextHashEntry(&hs)) {
+                        intptr_t rel = (intptr_t)PTR2INT(Tcl_GetHashValue(he));
+                        int64_t  tgt = (int64_t)pc + rel;
+                        if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
+                            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
+                                "tbcx: jump-table aux %u: target pc+%" PRIdPTR
+                                " = %" PRId64 " out of range or off-boundary"
+                                " (jumpTable at pc %u, codeLen %u)",
+                                i, (intptr_t)rel, tgt, pc, codeLen));
+                            Tcl_Free(boundary);
+                            return TCL_ERROR;
+                        }
+                    }
+                    validated = 1;
+                }
+            }
+            pc += (uint32_t)desc->numBytes;
+        }
+        (void)validated;
+        /* An aux slot that is never referenced is harmless at load time
+         * — it will be freed with the ByteCode and never dispatched to.
+         * We do not require that every aux entry be reachable. */
+    }
+
+    Tcl_Free(boundary);
+    return TCL_OK;
 }
 
 Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly) {
@@ -3072,8 +3423,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
     ExceptionRange *exArr = NULL;
     uint32_t        numEx = 0;
     if (!ReadExceptions(r, &exArr, &numEx)) {
-        if (auxArr)
-            Tcl_Free(auxArr);
+        FreeAuxArrayOwned(auxArr, numAux);
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]); /* refcount 1→0, freed */
         if (litsOnHeap)
@@ -3087,8 +3437,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
     if (!Tbcx_R_U32(r, &maxStack) || !Tbcx_R_U32(r, &reserved) || !Tbcx_R_U32(r, &numLocals)) {
         if (exArr)
             Tcl_Free(exArr);
-        if (auxArr)
-            Tcl_Free(auxArr);
+        FreeAuxArrayOwned(auxArr, numAux);
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]); /* refcount 1→0, freed */
         if (litsOnHeap)
@@ -3106,8 +3455,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: maxStack %u exceeds limit %u", maxStack, TBCX_MAX_STACK));
         if (exArr)
             Tcl_Free(exArr);
-        if (auxArr)
-            Tcl_Free(auxArr);
+        FreeAuxArrayOwned(auxArr, numAux);
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
@@ -3119,8 +3467,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: numLocals %u exceeds limit %u", numLocals, TBCX_MAX_LOCALS));
         if (exArr)
             Tcl_Free(exArr);
-        if (auxArr)
-            Tcl_Free(auxArr);
+        FreeAuxArrayOwned(auxArr, numAux);
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
@@ -3144,8 +3491,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
                 R_Error(r, "tbcx: allocation failed (local names)");
                 if (exArr)
                     Tcl_Free(exArr);
-                if (auxArr)
-                    Tcl_Free(auxArr);
+                FreeAuxArrayOwned(auxArr, numAux);
                 for (uint32_t j = 0; j < numLits; j++)
                     Tcl_DecrRefCount(lits[j]);
                 if (litsOnHeap)
@@ -3167,8 +3513,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
                 }
                 if (exArr)
                     Tcl_Free(exArr);
-                if (auxArr)
-                    Tcl_Free(auxArr);
+                FreeAuxArrayOwned(auxArr, numAux);
                 /* Release the protective refcounts taken on literal objects
                  * before freeing the lits array — otherwise they leak. */
                 for (uint32_t j = 0; j < numLits; j++)
@@ -3184,13 +3529,48 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
         }
     }
 
+    /* Validate untrusted bytecode operands BEFORE handing them to
+     * Tcl's evaluator.  Tcl core trusts compiler output and does NOT
+     * revalidate at runtime, so a crafted .tbcx can OOB-read literals
+     * or jump off-boundary without this pass.  Rejection here is the
+     * canonical place to stop a hostile artifact. */
+    if (ValidateBlockOperands(ip, code, codeLen, numLits, numAux,
+                              numLocals, auxArr) != TCL_OK) {
+        /* Same cleanup as any other post-aux failure in this function. */
+        if (nameObjs) {
+            for (uint32_t k = 0; k < numLocals; k++)
+                Tcl_DecrRefCount(nameObjs[k]);
+            if (nameOnHeap)
+                Tcl_Free(nameObjs);
+        }
+        if (exArr)
+            Tcl_Free(exArr);
+        FreeAuxArrayOwned(auxArr, numAux);
+        for (uint32_t j = 0; j < numLits; j++)
+            Tcl_DecrRefCount(lits[j]);
+        if (litsOnHeap)
+            Tcl_Free(lits);
+        Tcl_Free((char *)code);
+        return NULL;
+    }
+
     /* Build bytecode object */
     Tcl_Obj *bc = ByteCodeObj(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack, setPrecompiled);
 
     if (exArr)
         Tcl_Free(exArr);
-    if (auxArr)
-        Tcl_Free(auxArr);
+    /* On success, ownership of each auxArr[i].clientData payload has
+     * transferred into the packed ByteCode (via the memcpy in
+     * TbcxByteCode).  Free only the outer array then — the packed
+     * ByteCode will call each aux type's freeProc at destruction time.
+     * On failure no ownership transferred; deep-free the payloads here
+     * to avoid leaking them. */
+    if (bc) {
+        if (auxArr)
+            Tcl_Free(auxArr);
+    } else {
+        FreeAuxArrayOwned(auxArr, numAux);
+    }
     /* Drop our protective refcount on literals — ByteCodeObj has its own */
     for (uint32_t j = 0; j < numLits; j++)
         Tcl_DecrRefCount(lits[j]);
@@ -3507,15 +3887,45 @@ static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const o
 }
 
 /* ProcCmdDeleteTrace — called when the "proc" command is renamed or deleted.
- * Invalidates the cached Command* to prevent stale-pointer writes in
- * DelProcShim.  Without this trace, a loaded script that renames or deletes
- * "proc" during execution would cause DelProcShim to write through a
- * freed Command struct (use-after-free / process crash). */
+ *
+ * The DELETE case is simple: the Command struct is about to be freed; we
+ * just null our cached pointer so DelProcShim skips the restore.
+ *
+ * The RENAME case is subtler and was the site of an internal-review UAF:
+ * Tcl keeps the Command struct alive across a rename (it just re-keys the
+ * hash-table entry).  The struct's objProc2 field still holds
+ * CmdProcShim, and its objClientData2 still points at *our* ProcShim —
+ * which is stack-allocated inside LoadTbcxStream and disappears when
+ * LoadTbcxStream returns.
+ *
+ * If we merely null ps->procCmdPtr here (as the old code did), DelProcShim
+ * sees the NULL and skips the in-place restore.  The renamed command
+ * is then left with a dangling clientData pointer; invoking it after
+ * tbcx::load returns produces a stack-use-after-return that typically
+ * crashes with "called Tcl_FindHashEntry on deleted table / illegal
+ * instruction" or worse.
+ *
+ * The correct RENAME handling is to do the in-place restore *now*,
+ * while ps->procCmdPtr is still valid, and THEN null it so DelProcShim
+ * knows the work is done. */
 static void ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
     ProcShim *ps = (ProcShim *)cd;
     (void)interp;
     (void)oldName;
     (void)newName;
+    if (flags & TCL_TRACE_RENAME) {
+        /* Restore original handlers while the Command struct is still
+         * accessible — the rename keeps the struct alive but moves it
+         * to a new name, and our shim's client data (ps) is about to
+         * become invalid once LoadTbcxStream returns. */
+        if (ps->procCmdPtr) {
+            ps->procCmdPtr->objProc2       = ps->savedObjProc2;
+            ps->procCmdPtr->objClientData2 = ps->savedClientData2;
+            if (ps->savedNreProc2) {
+                ps->procCmdPtr->nreProc2 = ps->savedNreProc2;
+            }
+        }
+    }
     if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
         ps->procCmdPtr     = NULL;
         ps->traceInstalled = 0; /* trace auto-removed on delete */
@@ -3695,6 +4105,26 @@ static void ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldNam
     (void)interp;
     (void)oldName;
     (void)newName;
+    if (flags & TCL_TRACE_RENAME) {
+        /* Same in-place restore pattern as ProcCmdDeleteTrace: the
+         * Command struct survives the rename and must be restored
+         * while we still have a valid pointer to it.  ApplyShim is
+         * heap-allocated in TbcxInterpState (unlike ProcShim/OOShim
+         * which are stack-allocated in LoadTbcxStream), so the
+         * UAF severity here is lower — the worst case is the
+         * renamed command continuing to dispatch through CmdApplyShim
+         * with *stale but live* state.  Restoring the handlers here
+         * also stops the shim from intercepting calls to the renamed
+         * command, which matches the user's intent when they rename
+         * [apply]. */
+        if (as->applyCmdPtr) {
+            as->applyCmdPtr->objProc2       = as->savedApplyProc;
+            as->applyCmdPtr->objClientData2 = as->savedApplyCD;
+            if (as->savedApplyNre) {
+                as->applyCmdPtr->nreProc2 = as->savedApplyNre;
+            }
+        }
+    }
     if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
         as->applyCmdPtr    = NULL;
         as->traceInstalled = 0; /* trace auto-removed on delete */
@@ -4085,7 +4515,7 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
         Tcl_Free(bodySrc);
         goto cleanup_objs;
     }
-    Tcl_IncrRefCount(bodyBC); /* F4 fix: own immediately — don't leave at refcount 0 */
+    Tcl_IncrRefCount(bodyBC); 
 
     /* ---- Stage 4.5: attach source text ----
      * Tbcx_ReadBlock produces a tbcxTyBytecode-typed Tcl_Obj whose
@@ -4404,6 +4834,13 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
 
     Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, ip, curNs, &dummyNL, 1, 0);
     if (!topBC) {
+        /* Release H.sourcePath — it was IncrRefCount'd by Tbcx_ReadHeader
+         * on the success path; without this guard it leaks on every
+         * failed load after a successful header read.  The dumper's
+         * `cleanup_no_topbc:` label shows the correct pattern. */
+        if (H.sourcePath) {
+            Tcl_DecrRefCount(H.sourcePath);
+        }
         st->loadDepth--;
         return TCL_ERROR;
     }

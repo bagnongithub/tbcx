@@ -2964,9 +2964,14 @@ static void WriteCompiledBlock(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj) {
     }
 
     /* 1) code — strip startCommand instructions (they exist solely for
-       command-level tracing and add ~15% overhead to code size).  Replace
-       each startCommand with nop bytes.  startCommand has no stack effect
-       and jump targets never land on it, so this is always safe. */
+       command-level tracing and add ~15% overhead to code size).
+       When the Tcl 9.1 `jump1` opcode is available, replace each
+       startCommand with a `jump1 +numBytes` followed by nop padding
+       — the jump skips the whole region in one dispatch cycle instead
+       of executing N consecutive nops.  Fallback to pure `nop` padding
+       when jump1 is unavailable for any reason.  startCommand has no
+       stack effect and jump targets never land on it, so this is
+       always safe. */
     if ((uint64_t)bc->numCodeBytes > TBCX_MAX_CODE) {
         W_Error(w, "tbcx: code too large");
         if (ctx)
@@ -5606,7 +5611,10 @@ int Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     }
     unsigned saveFlags = 0;
     for (Tcl_Size i = 3; i < objc; i++) {
-        const char *flag = Tcl_GetString(objv[i]);
+        const char *flag = Tbcx_GetStringStrict(interp, objv[i]);
+        if (!flag) {
+            return TCL_ERROR;
+        }
         if (strcmp(flag, "-include-source") == 0) {
             saveFlags |= TBCX_SAVE_FL_INCLUDE_SOURCE;
         } else {

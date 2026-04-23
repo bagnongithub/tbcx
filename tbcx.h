@@ -34,14 +34,13 @@
  *                   proc body via its string rep (e.g. ooxml's cloneRule /
  *                   installTocRule using `info body $src` + `proc $new ...
  *                   $body`) silently produced empty/no-op procs.
- *   92 (v1.2)     — each proc record and each method record can carry an
+ *   92 (v1.11)    — each proc record and each method record now carries an
  *                   LPString body-source field immediately before its
  *                   compiled block.  The loader attaches that text as the
  *                   body Tcl_Obj's string rep (via Tcl_InitStringRep)
  *                   without touching the ByteCode internal rep.  By
  *                   default body source is STRIPPED from the artifact
- *                   (matching the 25-year TclPro/tbcload tradition for
- *                   Tcl AOT compile output) and the loader substitutes
+ *                   and the loader substitutes
  *                   a diagnostic sentinel so `info body` returns a
  *                   loud string instead of silently returning empty.
  *                   The optional save-time flag `-include-source`
@@ -50,14 +49,51 @@
  *                   round-trip for artifacts where introspection
  *                   idioms (cloneRule, info class definition, TIP #280
  *                   source attribution, etc.) must work. */
-
 #define TBCX_FORMAT 92u
 
-#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u 
+/* Save-time flags (Tbcx_SaveObjCmd → EmitTbcxStream).  Passed through
+ * TbcxCtx.saveFlags and consulted where per-site behavior changes.
+ * Wire format is unaffected by the flags themselves — they only alter
+ * what the save side chooses to emit. */
+#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u /* write original body srcText as
+                                            LPString for every proc/method;
+                                            the opposite of tclcompiler/
+                                            tbcload's source-strip-always
+                                            default.  Without this flag,
+                                            bodies are emitted as "" on the
+                                            wire and the loader installs
+                                            the diagnostic sentinel. */
+
+/* Diagnostic sentinel installed as body string-rep when the artifact was
+ * written without -include-source (the default).  Two-line shape matches
+ * ActiveState TclPro tclcompiler's canonical pattern (Compiler8.html,
+ * "Example 1: Cloning Procedures"), validated by 25 years of production
+ * use in TclPro/ActiveTcl/TclDevKit:
+ *
+ *     1. A `#` comment line that shows up as the top of any error
+ *        traceback, making the cause visible at a glance without
+ *        requiring readers to parse the error message.
+ *     2. An `error` call so that if downstream code round-trips this
+ *        body — e.g.
+ *            proc new {} [info body original]
+ *            new
+ *        — the resulting proc fails loudly at invocation rather than
+ *        silently running as a no-op.
+ *
+ * Newline separator between the two statements; bodies become two-
+ * statement scripts. `info body`, `info frame`, and error traces all
+ * display this string directly, so the diagnostic is visible in
+ * every consumption path. */
 #define TBCX_STRIPPED_SOURCE_SENTINEL                                                \
     "# tbcx: body source stripped at save time; info body unavailable\n"             \
     "error \"tbcx: introspection-based cloning is not supported for this artifact\""
 
+/* Thread-ownership assertion.  Verifies that the current thread is the
+ * one that created the interpreter, which is the only thread permitted
+ * to use it under Tcl's threading model.  Active only in debug builds
+ * (NDEBUG not defined) unless TBCX_THREAD_CHECKS is also defined.
+ * Fires assert() on violation — use for internal helpers and void-
+ * returning callbacks where TCL_ERROR cannot be propagated. */
 #if defined(TBCX_THREAD_CHECKS) || !defined(NDEBUG)
 #define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                                                                                                  \
     do {                                                                                                                                                                                               \
@@ -68,6 +104,14 @@
 #define TBCX_ASSERT_INTERP_THREAD(ip) ((void)0)
 #endif
 
+/* Thread-ownership check for Tcl command entry points.  Always active
+ * in all builds (debug and release).  Returns TCL_ERROR with a
+ * diagnostic message instead of crashing — use at the four public
+ * Tcl commands (save, load, dump, gc) where the caller can handle
+ * the error through the normal Tcl result channel.
+ *
+ * Cost: one pointer comparison + one Tcl_GetCurrentThread() call per
+ * command invocation — negligible relative to I/O and compilation. */
 #define TBCX_CHECK_INTERP_THREAD(ip)                                                                                                                                                                   \
     do {                                                                                                                                                                                               \
         if (((Interp *)(ip))->threadId != Tcl_GetCurrentThread()) {                                                                                                                                    \
