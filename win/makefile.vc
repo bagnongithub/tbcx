@@ -31,7 +31,31 @@ PRJ_HEADERS = $(ROOT)\tbcx.h
 PRJ_DEFINES = /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE
 PRJ_DEFINES = $(PRJ_DEFINES) /D_CRT_SECURE_NO_WARNINGS
 PRJ_DEFINES = $(PRJ_DEFINES) $(ADDOPTDEFINES) -I$(TMP_DIR) -I$(TCLDIR)\libtommath
-PRJ_LIBS = $(ADDLINKOPTS) $(INSTALLDIR)\lib\tommath.lib
+# tbcx.c / tbcxload.c / tbcxsave.c use C11 atomics (<stdatomic.h>, _Atomic,
+# atomic_load_explicit / atomic_store_explicit with memory_order_*).  Compiling
+# these with MSVC needs TWO switches, both checked by <vcruntime_c11_stdatomic.h>:
+#   /std:c11                 - else it errors "C atomics require C11 or later"
+#                              (guard: __STDC_VERSION__ >= 201112L; MSVC defaults
+#                              to C89).
+#   /experimental:c11atomics - else, once C11 is selected, the same header errors
+#                              "C atomic support is not enabled".  This is the
+#                              documented option that turns on MSVC's C11 atomic
+#                              support in /std:c11 (or /std:c17) mode.
+# The Unix build needs neither, because clang/gcc default to gnu11/gnu17 with
+# atomics enabled; only this Windows nmake makefile must request them explicitly.
+PRJ_DEFINES = $(PRJ_DEFINES) /std:c11 /experimental:c11atomics
+# tbcx reaches libtommath ONLY through Tcl's TomMath stubs table: tbcx.c calls
+# Tcl_TomMath_InitStubs() and every bignum operation goes through the TclBN_mp_*
+# stub macros, resolved at run time via tclstub.lib (already linked below).  No
+# tommath functions are referenced directly, so NO tommath import library is
+# needed at link time.  Linking $(INSTALLDIR)\lib\tommath.lib was both wrong and
+# fragile: Tcl's own makefile.vc installs that file only for a DYNAMIC build
+# (`!if !$(STATIC_BUILD)` guards the copy), so a static Tcl produces
+#   LNK1181: cannot open input file '...\lib\tommath.lib'.
+# Dropping it lets tbcx link against BOTH static and dynamic Tcl, and matches the
+# Unix Makefile.in, which links no tommath library either (it only adds
+# -I.../libtommath for the headers).
+PRJ_LIBS = $(ADDLINKOPTS)
 
 # Define the standard targets
 !include "$(_RULESDIR)\targets.vc"
