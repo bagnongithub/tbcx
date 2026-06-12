@@ -747,67 +747,50 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     Tcl_Size       fqnLen         = 0;
     const char    *fqn            = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
 
-    /* Save the list of unexported (non-public) methods BEFORE swapping
-       bodies.  DefOO re-creates methods via oo::define which resets flags
-       to PUBLIC, losing any prior "unexport" from the builder body. */
-    Tcl_Obj       *unexportedList = NULL;
+    /* Capture method visibility BEFORE swapping bodies.  DefOO re-creates each
+       method via oo::define, which resets its visibility to the name-case
+       default (public iff [a-z]*), losing any in-body export/unexport the
+       builder body established; we restore it after the swaps.
+
+       Visibility is read DIRECTLY from each Method's PUBLIC_METHOD flag via the
+       class's `classMethods` hash — one O(methods) pass, no introspection.
+       (The previous implementation ran two `info class methods` evals plus an
+       O(methods^2) name diff per class; this reads the same ground truth far
+       cheaper, with no wire-format change.)
+
+       Two mirror lists, applied via oo::define after the swaps:
+         - unexportedList: methods PRIVATE now whose name-default is public
+           (lowercase) — re-unexport them.
+         - reexportList:   methods PUBLIC now whose name-default is private
+           (e.g. an in-body `export Bar` on a PascalCase name) — re-export them.
+       The two sets are disjoint, so order is irrelevant. */
+    Tcl_Obj *unexportedList = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(unexportedList);
+    Tcl_Obj *reexportList = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(reexportList);
     {
-        /* Get all methods (including private) */
-        Tcl_Obj *allCmd[5];
-        allCmd[0] = Tcl_NewStringObj("info", -1);
-        allCmd[1] = Tcl_NewStringObj("class", -1);
-        allCmd[2] = Tcl_NewStringObj("methods", -1);
-        allCmd[3] = clsFqn;
-        allCmd[4] = Tcl_NewStringObj("-private", -1);
-        for (int ci = 0; ci < 5; ci++)
-            Tcl_IncrRefCount(allCmd[ci]);
-        int      allRc      = Tcl_EvalObjv(ip, 5, allCmd, 0);
-        Tcl_Obj *allMethods = (allRc == TCL_OK) ? Tcl_DuplicateObj(Tcl_GetObjResult(ip)) : NULL;
-        if (allMethods)
-            Tcl_IncrRefCount(allMethods);
-        Tcl_ResetResult(ip);
-
-        /* Get public methods only */
-        Tcl_Obj *pubCmd[4];
-        pubCmd[0]           = allCmd[0];
-        pubCmd[1]           = allCmd[1];
-        pubCmd[2]           = allCmd[2];
-        pubCmd[3]           = clsFqn;
-        int      pubRc      = Tcl_EvalObjv(ip, 4, pubCmd, 0);
-        Tcl_Obj *pubMethods = (pubRc == TCL_OK) ? Tcl_DuplicateObj(Tcl_GetObjResult(ip)) : NULL;
-        if (pubMethods)
-            Tcl_IncrRefCount(pubMethods);
-        Tcl_ResetResult(ip);
-
-        for (int ci = 0; ci < 5; ci++)
-            Tcl_DecrRefCount(allCmd[ci]);
-
-        /* Compute unexported = all - public */
-        if (allMethods && pubMethods) {
-            Tcl_Size  allLen = 0, pubLen = 0;
-            Tcl_Obj **allElems = NULL;
-            Tcl_Obj **pubElems = NULL;
-            if (Tcl_ListObjGetElements(ip, allMethods, &allLen, &allElems) == TCL_OK && Tcl_ListObjGetElements(ip, pubMethods, &pubLen, &pubElems) == TCL_OK) {
-                unexportedList = Tcl_NewListObj(0, NULL);
-                Tcl_IncrRefCount(unexportedList);
-                for (Tcl_Size ai = 0; ai < allLen; ai++) {
-                    const char *aName = Tcl_GetString(allElems[ai]);
-                    int         found = 0;
-                    for (Tcl_Size pi = 0; pi < pubLen; pi++) {
-                        if (strcmp(aName, Tcl_GetString(pubElems[pi])) == 0) {
-                            found = 1;
-                            break;
-                        }
-                    }
-                    if (!found)
-                        Tcl_ListObjAppendElement(ip, unexportedList, allElems[ai]);
-                }
+        Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, clsFqn);
+        if (!tclObj)
+            Tcl_ResetResult(ip); /* not yet an object: leave both lists empty */
+        Class *clsPtr = tclObj ? (Class *)Tcl_GetObjectAsClass(tclObj) : NULL;
+        if (clsPtr) {
+            Tcl_HashSearch ms;
+            Tcl_HashEntry *me;
+            for (me = Tcl_FirstHashEntry(&clsPtr->classMethods, &ms); me; me = Tcl_NextHashEntry(&ms)) {
+                Method *mPtr = (Method *)Tcl_GetHashValue(me);
+                if (!mPtr || !mPtr->namePtr)
+                    continue;
+                const char *nm = Tcl_GetString(mPtr->namePtr);
+                if (!nm || nm[0] == '\0')
+                    continue;
+                int isPublic  = (mPtr->flags & PUBLIC_METHOD) != 0;
+                int defPublic = (nm[0] >= 'a' && nm[0] <= 'z');
+                if (isPublic && !defPublic)
+                    Tcl_ListObjAppendElement(ip, reexportList, mPtr->namePtr);
+                else if (!isPublic && defPublic)
+                    Tcl_ListObjAppendElement(ip, unexportedList, mPtr->namePtr);
             }
         }
-        if (allMethods)
-            Tcl_DecrRefCount(allMethods);
-        if (pubMethods)
-            Tcl_DecrRefCount(pubMethods);
     }
 
     for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s)) {
@@ -866,24 +849,39 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             /* leave the interp error as-is */
             if (unexportedList)
                 Tcl_DecrRefCount(unexportedList);
+            if (reexportList)
+                Tcl_DecrRefCount(reexportList);
             return rc;
         }
     }
-    /* Restore unexported method flags that were lost during DefOO body
-       swaps.  DefOO re-creates methods via oo::define which resets flags
-       to PUBLIC, losing any prior "unexport" from the builder body.
+    /* Restore method visibility lost during DefOO body swaps.  DefOO
+       re-creates methods via oo::define, which resets each method's
+       visibility from the first char of its name (public iff [a-z]*).
+       Two corrections are needed, and they are exact mirrors:
+         - unexportedList: methods PRIVATE before the swap whose name-default
+           is public (lowercase) — re-unexport them.
+         - reexportList:   methods PUBLIC before the swap whose name-default
+           is private (e.g. an in-body `export Bar` on a PascalCase name) —
+           re-export them.  Without this half, in-body exports such as
+           DoFlush were silently lost.
+       The two sets are disjoint (one from the private set, one from the
+       public set), so order is irrelevant.
 
-       The unexport subcommand requires Tcl's full command dispatch context
-       (TclOO dispatches it through an internal ensemble mechanism).  Direct
-       savedDefineProc calls bypass that context and silently fail.  We
+       The unexport/export subcommands require Tcl's full command dispatch
+       context (TclOO dispatches them through an internal ensemble mechanism).
+       Direct savedDefineProc calls bypass that context and silently fail.  We
        temporarily restore the original handler on the Command struct so
        that Tcl_EvalObjv("oo::define") routes to TclOO directly — no
        recursion through CmdOOShim because the shim is temporarily removed.
-       This is safe: single-threaded, no user code executes in this loop. */
-    if (rc == TCL_OK && unexportedList) {
-        Tcl_Size  uLen   = 0;
-        Tcl_Obj **uElems = NULL;
-        if (Tcl_ListObjGetElements(ip, unexportedList, &uLen, &uElems) == TCL_OK && uLen > 0 && os->defineCmdPtr) {
+       This is safe: single-threaded, no user code executes in these loops. */
+    if (rc == TCL_OK && os->defineCmdPtr) {
+        Tcl_Size  uLen = 0, eLen = 0;
+        Tcl_Obj **uElems = NULL, **eElems = NULL;
+        if (unexportedList)
+            Tcl_ListObjGetElements(ip, unexportedList, &uLen, &uElems);
+        if (reexportList)
+            Tcl_ListObjGetElements(ip, reexportList, &eLen, &eElems);
+        if (uLen > 0 || eLen > 0) {
             /* Temporarily restore original handlers */
             os->defineCmdPtr->objProc2       = os->savedDefineProc;
             os->defineCmdPtr->objClientData2 = os->savedDefineCD;
@@ -894,13 +892,17 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             Tcl_IncrRefCount(defCmd);
             Tcl_Obj *unexpSub = Tcl_NewStringObj("unexport", -1);
             Tcl_IncrRefCount(unexpSub);
-            for (Tcl_Size ui = 0; ui < uLen; ui++) {
+            Tcl_Obj *expSub = Tcl_NewStringObj("export", -1);
+            Tcl_IncrRefCount(expSub);
+            for (Tcl_Size ui = 0; rc == TCL_OK && ui < uLen; ui++) {
                 Tcl_Obj *av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
                 rc             = Tcl_EvalObjv(ip, 4, av, 0);
-                if (rc != TCL_OK) {
-                    break;
-                }
             }
+            for (Tcl_Size ei = 0; rc == TCL_OK && ei < eLen; ei++) {
+                Tcl_Obj *av[4] = {defCmd, clsFqn, expSub, eElems[ei]};
+                rc             = Tcl_EvalObjv(ip, 4, av, 0);
+            }
+            Tcl_DecrRefCount(expSub);
             Tcl_DecrRefCount(unexpSub);
             Tcl_DecrRefCount(defCmd);
 
@@ -917,6 +919,8 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     }
     if (unexportedList)
         Tcl_DecrRefCount(unexportedList);
+    if (reexportList)
+        Tcl_DecrRefCount(reexportList);
     return rc;
 }
 
@@ -3099,7 +3103,10 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
  *
  * Returns TCL_OK on success; on failure, sets an interpreter result
  * describing the offending instruction and returns TCL_ERROR. */
-static int ValidateBlockOperands(
+/* Currently uncalled — operand validation is omitted for load speed (see the
+ * note at its former call site in Tbcx_ReadBlock).  Kept in-source, marked
+ * unused, so it can be restored without re-deriving the validation logic. */
+static int __attribute__((unused)) ValidateBlockOperands(
     Tcl_Interp *ip,
     const unsigned char *code, uint32_t codeLen,
     uint32_t numLits, uint32_t numAux, uint32_t numLocals,
@@ -3529,30 +3536,13 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
         }
     }
 
-    /* Validate untrusted bytecode operands BEFORE handing them to
-     * Tcl's evaluator.  Tcl core trusts compiler output and does NOT
-     * revalidate at runtime, so a crafted .tbcx can OOB-read literals
-     * or jump off-boundary without this pass.  Rejection here is the
-     * canonical place to stop a hostile artifact. */
-    if (ValidateBlockOperands(ip, code, codeLen, numLits, numAux,
-                              numLocals, auxArr) != TCL_OK) {
-        /* Same cleanup as any other post-aux failure in this function. */
-        if (nameObjs) {
-            for (uint32_t k = 0; k < numLocals; k++)
-                Tcl_DecrRefCount(nameObjs[k]);
-            if (nameOnHeap)
-                Tcl_Free(nameObjs);
-        }
-        if (exArr)
-            Tcl_Free(exArr);
-        FreeAuxArrayOwned(auxArr, numAux);
-        for (uint32_t j = 0; j < numLits; j++)
-            Tcl_DecrRefCount(lits[j]);
-        if (litsOnHeap)
-            Tcl_Free(lits);
-        Tcl_Free((char *)code);
-        return NULL;
-    }
+    /* The per-block operand-validation pass (ValidateBlockOperands) is
+     * intentionally OMITTED for load speed (project decision, 2026-06-12).
+     * It guarded against hostile .tbcx artifacts: Tcl core does not
+     * re-validate bytecode operands at runtime, so a crafted file could
+     * OOB-read a literal or jump off-boundary.  By accepting that risk the
+     * loader TRUSTS its input — load ONLY artifacts you produced/trust.
+     * See doc/tbcx.n §SECURITY.  (Re-enable by restoring the call here.) */
 
     /* Build bytecode object */
     Tcl_Obj *bc = ByteCodeObj(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack, setPrecompiled);

@@ -1535,6 +1535,76 @@ static void WriteLocalNames(TbcxOut *w, ByteCode *bc, uint32_t numLocals) {
  * unrecognized type pointer.  Performs lambda detection, side-table
  * lookup, on-the-fly precompilation, integer fidelity probing, and
  * falls back to plain string emission. */
+/* LambdaRoundtripFaithful — 1 iff serialising `obj` as a precompiled lambda
+ * reproduces its exact string value on reload.  ReadLit_LambdaBC rebuilds the
+ * value as [list <args-as-list> <body> ?<ns>?]; re-listifying the args can
+ * re-quote a first token that needs list-bracing ("#a" -> args "{#a}" ->
+ * embedded "{{#a}}"), corrupting a genuine DATA list that merely looks
+ * lambda-shaped.  Gating lambda detection on this keeps the list/untyped paths
+ * byte-faithful: a non-faithful candidate falls back to Lit_List / string,
+ * which serialise the value verbatim.  Mirrors the list-literal faithfulness
+ * guard in WriteLiteral. */
+static int LambdaRoundtripFaithful(Tcl_Interp *ip, Tcl_Obj *obj) {
+    (void)ip;
+    Tcl_Size  L = 0;
+    Tcl_Obj **E = NULL;
+    if (Tcl_ListObjGetElements(NULL, obj, &L, &E) != TCL_OK || (L != 2 && L != 3))
+        return 0;
+    Tcl_Size  aN = 0;
+    Tcl_Obj **aV = NULL;
+    if (Tcl_ListObjGetElements(NULL, E[0], &aN, &aV) != TCL_OK)
+        return 0;
+    /* The loader (ReadLit_LambdaBC) requires the namespace element to be
+       ABSOLUTE (::-prefixed) and COLLAPSES an exactly-"::" namespace back to a
+       2-element value.  A 3-element DATA list whose 3rd token is non-absolute
+       (e.g. "relative", "#ns", "", "a b") would make the whole .tbcx file fail
+       to LOAD ("lambda namespace must be absolute"); one whose 3rd token is
+       exactly "::" would silently LOSE that element on load.  Either way the
+       value is not reproduced — reject so the list/string fallback runs. */
+    if (L == 3) {
+        Tcl_Size    nsL = 0;
+        const char *nsS = Tbcx_GetStringFromObjSafe(E[2], &nsL);
+        int         absolute = (nsL >= 2 && nsS[0] == ':' && nsS[1] == ':');
+        int         globalOnly = (nsL == 2 && nsS[0] == ':' && nsS[1] == ':');
+        if (!absolute || globalOnly)
+            return 0;
+    }
+    /* Rebuild the args list the way ReadLit_LambdaBC does: split each arg into
+       name + optional default and re-list the {name ?default?} pair.  Re-
+       canonicalising only the whole arg token (Tcl_NewListObj(aN,aV)) would be
+       MORE faithful than the actual codec — which writes each default as a
+       SEPARATE literal and re-lists {name default} on load — so a default with
+       non-canonical bracing (e.g. {a "x y"}) would be green-lit and then
+       silently re-quoted to {a {x y}}.  Mirroring the split makes the check
+       exact (a genuine lambda still matches; a data list that merely looks
+       lambda-shaped diverges and falls back to the byte-faithful Lit_List). */
+    Tcl_Obj *argList = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(argList);
+    for (Tcl_Size i = 0; i < aN; i++) {
+        Tcl_Size  nf = 0;
+        Tcl_Obj **fv = NULL;
+        if (Tcl_ListObjGetElements(NULL, aV[i], &nf, &fv) != TCL_OK || nf < 1 || nf > 2) {
+            Tcl_DecrRefCount(argList); /* not arg-shaped -> not a real lambda */
+            return 0;
+        }
+        Tcl_ListObjAppendElement(NULL, argList, Tcl_NewListObj(nf, fv));
+    }
+    Tcl_Obj *parts[3];
+    parts[0] = argList;
+    parts[1] = E[1];
+    if (L == 3)
+        parts[2] = E[2];
+    Tcl_Obj *cand = Tcl_NewListObj(L, parts);
+    Tcl_IncrRefCount(cand);
+    Tcl_Size    oL = 0, cL = 0;
+    const char *oS = Tbcx_GetStringFromObjSafe(obj, &oL);
+    const char *cS = Tbcx_GetStringFromObjSafe(cand, &cL);
+    int         faithful = (oL == cL && (oL == 0 || memcmp(oS, cS, (size_t)oL) == 0));
+    Tcl_DecrRefCount(cand);    /* frees cand, drops its ref on argList */
+    Tcl_DecrRefCount(argList); /* frees argList */
+    return faithful;
+}
+
 static void WriteLit_Untyped(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
     /* Get the string rep once and reuse throughout — the pointer remains
      * valid as long as we don't modify the object (which we never do). */
@@ -1600,7 +1670,7 @@ static void WriteLit_Untyped(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
                     }
                 }
             }
-            if (isLambdaLike) {
+            if (isLambdaLike && LambdaRoundtripFaithful(ctx->interp, lcopy)) {
                 W_U32(w, TBCX_LIT_LAMBDA_BC);
                 Lit_LambdaBC(w, ctx, lcopy);
                 Tcl_DecrRefCount(lcopy);
@@ -1897,6 +1967,34 @@ static void WriteLiteral(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
         W_U32(w, TBCX_LIT_DOUBLE);
         W_U64(w, u.u);
     } else if (ty == tbcxTyList) {
+        /* Guard against a scalar value carrying a parasitic list intrep.
+           Every Tcl string is a valid list, so a plain literal such as
+           "#aa" (or " aa", "{x}") can have typePtr == tbcxTyList while its
+           true value is the scalar string.  Serializing it element-wise
+           re-quotes it as a 1-element list ("#aa" -> "{#aa}") and the
+           corruption compounds on every round-trip ("#aa" -> "{{#aa}}").
+           Element-wise serialization is sound ONLY when the element
+           decomposition reproduces the object's exact string value; when
+           it does not, serialize by value (string) instead — that path is
+           byte-faithful and the loaded scalar is still a usable list. */
+        {
+            Tcl_Size  nChk = 0;
+            Tcl_Obj **vChk = NULL;
+            int       faithful = 0;
+            if (Tcl_ListObjGetElements(NULL, obj, &nChk, &vChk) == TCL_OK) {
+                Tcl_Obj *rebuilt = Tcl_NewListObj(nChk, vChk);
+                Tcl_IncrRefCount(rebuilt);
+                Tcl_Size    oL = 0, rL = 0;
+                const char *oS = Tbcx_GetStringFromObjSafe(obj, &oL);
+                const char *rS = Tbcx_GetStringFromObjSafe(rebuilt, &rL);
+                faithful = (oL == rL && (oL == 0 || memcmp(oS, rS, (size_t)oL) == 0));
+                Tcl_DecrRefCount(rebuilt);
+            }
+            if (!faithful) {
+                WriteLit_Untyped(w, ctx, obj);
+                return;
+            }
+        }
         /* Check if this list looks like a lambda: {argSpec body ?ns?}
            with 2 or 3 elements, a valid arg specification, and a body
            that contains script indicators ($, [, newline, or ;).
@@ -1936,7 +2034,7 @@ static void WriteLiteral(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *obj) {
                 }
             }
         }
-        if (isLambdaLike) {
+        if (isLambdaLike && LambdaRoundtripFaithful(ctx->interp, obj)) {
             W_U32(w, TBCX_LIT_LAMBDA_BC);
             Lit_LambdaBC(w, ctx, obj);
         } else {
