@@ -1,0 +1,423 @@
+# -*-Tcl-*-
+# 32-method-scope.test — TclOO method-scope + body-source fidelity (CR 2026-06-12)
+#
+# v92 carries a per-method `scope` byte (TBCX_MSCOPE_*) so a method's TclOO
+# visibility — public / unexported / TIP 500 true-private — survives a tbcx
+# save/load, established by its definition options (-export/-private/-unexport),
+# lexical `private`/`self` context, and same-body export/unexport/self-export/
+# self-unexport commands.  Each case is checked BOTH ways:
+#   * runtime + introspection behavior matches plain `source`
+#   * default mode strips the body (no comment-only marker leaks into the
+#     artifact); -include-source carries it through the body-source LPString.
+#
+# Source markers are COMMENT-ONLY (never a returned constant) so a stripped
+# artifact provably lacks them while a literal the method returns may not.
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# --- helpers ---------------------------------------------------------------
+
+# srcRun: evaluate the snippet directly (the source-equivalent oracle).
+proc srcRun {script} {
+    set i [interp create]
+    try {
+        return [$i eval $script]
+    } finally {
+        interp delete $i
+    }
+}
+
+# tbcxRun: save+load the snippet through tbcx, return the load result.
+#   mode: "" (default, stripped) or "-include-source"
+proc tbcxRun {label script {mode ""}} {
+    set in  [makeFile $script $label-in.tcl]
+    set out [makeFile "" $label-out.tbcx]
+    if {$mode eq ""} {
+        tbcx::save $in $out
+    } else {
+        tbcx::save $in $out $mode
+    }
+    set i [interp create]
+    try {
+        $i eval {package require tbcx}
+        return [$i eval [list tbcx::load $out]]
+    } finally {
+        interp delete $i
+    }
+}
+
+# rawHasMarker: does the saved artifact's bytes contain the marker text?
+proc rawHasMarker {label script mode marker} {
+    set in  [makeFile $script $label-rin.tcl]
+    set out [makeFile "" $label-rout.tbcx]
+    if {$mode eq ""} { tbcx::save $in $out } else { tbcx::save $in $out $mode }
+    set fh [open $out rb]
+    set data [read $fh]
+    close $fh
+    return [expr {[string first $marker $data] >= 0}]
+}
+
+# scopeMatrix: assert behavior matches source in default AND include-source
+# modes, plus the marker-leak contract in each mode.
+proc scopeMatrix {label script marker} {
+    set want [srcRun $script]
+    test $label.default {behavior matches source (stripped)} -body {
+        tbcxRun $label.d $script
+    } -result $want
+    test $label.include {behavior matches source (-include-source)} -body {
+        tbcxRun $label.i $script -include-source
+    } -result $want
+    test $label.noleak {default mode strips the comment-only body marker} -body {
+        rawHasMarker $label.nl $script "" $marker
+    } -result 0
+    test $label.leak {-include-source carries the comment-only body marker} -body {
+        rawHasMarker $label.lk $script -include-source $marker
+    } -result 1
+}
+
+# ===========================================================================
+# A. Block true-private instance method — not visible to subclass `my`
+# ===========================================================================
+scopeMatrix scope.A {
+    oo::class create ::Base {
+        private {
+            method secret {} {
+                # TBCX_SOURCE_MARKER_A_BLOCK_PRIVATE
+                return "BASE-secret"
+            }
+        }
+        method pub {} { return [my secret] }
+    }
+    oo::class create ::Sub { superclass ::Base; method probe {} { return [my secret] } }
+    list [[::Base new] pub] [catch {[::Sub new] probe}] \
+         [expr {"secret" in [info class methods ::Base -all -private]}]
+} TBCX_SOURCE_MARKER_A_BLOCK_PRIVATE
+# source oracle: {BASE-secret 1 0}  (pub works; subclass blocked; hidden from -private)
+
+# ===========================================================================
+# B. Inline true-private instance method
+# ===========================================================================
+scopeMatrix scope.B {
+    oo::class create ::Base {
+        private method secret {} {
+            # TBCX_SOURCE_MARKER_B_INLINE_PRIVATE
+            return "BASE-secret"
+        }
+        method pub {} { return [my secret] }
+    }
+    oo::class create ::Sub { superclass ::Base; method probe {} { return [my secret] } }
+    list [[::Base new] pub] [catch {[::Sub new] probe}]
+} TBCX_SOURCE_MARKER_B_INLINE_PRIVATE
+
+# ===========================================================================
+# C. Option true-private instance method
+# ===========================================================================
+scopeMatrix scope.C {
+    oo::class create ::Base {
+        method secret -private {} {
+            # TBCX_SOURCE_MARKER_C_OPTION_PRIVATE
+            return "BASE-secret"
+        }
+        method pub {} { return [my secret] }
+    }
+    oo::class create ::Sub { superclass ::Base; method probe {} { return [my secret] } }
+    list [[::Base new] pub] [catch {[::Sub new] probe}]
+} TBCX_SOURCE_MARKER_C_OPTION_PRIVATE
+
+# ===========================================================================
+# D. PascalCase exported instance method (option -export)
+# ===========================================================================
+scopeMatrix scope.D {
+    oo::class create ::C {
+        method Mk -export {} {
+            # TBCX_SOURCE_MARKER_D_OPTION_EXPORT
+            return exported
+        }
+    }
+    list [[::C new] Mk] [expr {"Mk" in [info class methods ::C]}]
+} TBCX_SOURCE_MARKER_D_OPTION_EXPORT
+# source oracle: {exported 1}
+
+# ===========================================================================
+# E. lowercase unexported instance method (option -unexport)
+# ===========================================================================
+scopeMatrix scope.E {
+    oo::class create ::C {
+        method lower -unexport {} {
+            # TBCX_SOURCE_MARKER_E_OPTION_UNEXPORT
+            return hidden
+        }
+        method callLower {} { return [my lower] }
+    }
+    set o [::C new]
+    list [catch {$o lower}] [$o callLower] \
+         [expr {"lower" in [info class methods ::C -all -private]}]
+} TBCX_SOURCE_MARKER_E_OPTION_UNEXPORT
+# source oracle: {1 hidden 1}
+
+# ===========================================================================
+# F. Separate self export
+# ===========================================================================
+scopeMatrix scope.F {
+    oo::class create ::F {
+        self method Mk {} {
+            # TBCX_SOURCE_MARKER_F_SELF_EXPORT
+            return c
+        }
+        self export Mk
+    }
+    ::F Mk
+} TBCX_SOURCE_MARKER_F_SELF_EXPORT
+# source oracle: c
+
+# ===========================================================================
+# G. Block self export
+# ===========================================================================
+scopeMatrix scope.G {
+    oo::class create ::G {
+        self {
+            method Mk {} {
+                # TBCX_SOURCE_MARKER_G_SELF_BLOCK
+                return c
+            }
+            export Mk
+        }
+    }
+    ::G Mk
+} TBCX_SOURCE_MARKER_G_SELF_BLOCK
+
+# ===========================================================================
+# H. Self method exported by option
+# ===========================================================================
+scopeMatrix scope.H {
+    oo::class create ::H {
+        self method Mk -export {} {
+            # TBCX_SOURCE_MARKER_H_SELF_OPTION_EXPORT
+            return c
+        }
+    }
+    ::H Mk
+} TBCX_SOURCE_MARKER_H_SELF_OPTION_EXPORT
+
+# ===========================================================================
+# I. True-private self method through private block
+# ===========================================================================
+scopeMatrix scope.I {
+    oo::class create ::I {
+        private {
+            self method Hidden {} {
+                # TBCX_SOURCE_MARKER_I_SELF_PRIVATE_BLOCK
+                return hidden
+            }
+        }
+        self method callHidden {} { return [my Hidden] }
+    }
+    list [::I callHidden] [catch {::I Hidden}]
+} TBCX_SOURCE_MARKER_I_SELF_PRIVATE_BLOCK
+# source oracle: {hidden 1}
+
+# ===========================================================================
+# J. True-private self method through option
+# ===========================================================================
+scopeMatrix scope.J {
+    oo::class create ::J {
+        self method Hidden -private {} {
+            # TBCX_SOURCE_MARKER_J_SELF_PRIVATE_OPTION
+            return hidden
+        }
+        self method callHidden {} { return [my Hidden] }
+    }
+    list [::J callHidden] [catch {::J Hidden}]
+} TBCX_SOURCE_MARKER_J_SELF_PRIVATE_OPTION
+
+# ===========================================================================
+# K. Ordinary PascalCase self method remains non-public (counter-test)
+# ===========================================================================
+scopeMatrix scope.K {
+    oo::class create ::K {
+        self method Mk {} {
+            # TBCX_SOURCE_MARKER_K_SELF_DEFAULT_PRIVATE
+            return c
+        }
+        self method callMk {} { return [my Mk] }
+    }
+    list [catch {::K Mk}] [::K callMk]
+} TBCX_SOURCE_MARKER_K_SELF_DEFAULT_PRIVATE
+# source oracle: {1 c}
+
+# ===========================================================================
+# Extra counter-tests: ordinary lowercase/uppercase defaults are unchanged.
+# ===========================================================================
+test scope.default.public {lowercase method stays exported} -body {
+    tbcxRun scope.dp {
+        oo::class create ::DP { method lo {} { return ok } }
+        list [[::DP new] lo] [expr {"lo" in [info class methods ::DP]}]
+    }
+} -result {ok 1}
+
+test scope.default.private {PascalCase method stays unexported (not true-private)} -body {
+    tbcxRun scope.dq {
+        oo::class create ::DQ { method Up {} { return up }; method callUp {} { return [my Up] } }
+        oo::class create ::DQs { superclass ::DQ; method probe {} { return [my Up] } }
+        # unexported (not true-private): visible to subclass `my`, hidden externally
+        list [catch {[::DQ new] Up}] [[::DQ new] callUp] [[::DQs new] probe] \
+             [expr {"Up" in [info class methods ::DQ -all -private]}]
+    }
+} -result {1 up up 1}
+
+# in-body export of a PascalCase method (same body) — folds to public.
+test scope.inbody.export {in-body export round-trips} -body {
+    tbcxRun scope.ie {
+        oo::class create ::IE { method Bar {} { return ok }; export Bar }
+        list [[::IE new] Bar] [expr {"Bar" in [info class methods ::IE]}]
+    }
+} -result {ok 1}
+
+# separate oo::define export of a PascalCase method.
+test scope.separate.export {separate oo::define export round-trips} -body {
+    tbcxRun scope.se {
+        oo::class create ::SE { method Bar {} { return ok } }
+        oo::define ::SE { export Bar }
+        list [[::SE new] Bar] [expr {"Bar" in [info class methods ::SE]}]
+    }
+} -result {ok 1}
+
+# ===========================================================================
+# Standalone (non-builder-block) oo::define forms — option scope + no leak.
+# ===========================================================================
+scopeMatrix scope.standalone.export {
+    oo::class create ::SA {}
+    oo::define ::SA method Mk -export {} {
+        # TBCX_SOURCE_MARKER_SA_EXPORT
+        return e
+    }
+    list [[::SA new] Mk] [expr {"Mk" in [info class methods ::SA]}]
+} TBCX_SOURCE_MARKER_SA_EXPORT
+
+scopeMatrix scope.standalone.private {
+    oo::class create ::SB {}
+    oo::define ::SB method secret -private {} {
+        # TBCX_SOURCE_MARKER_SB_PRIVATE
+        return s
+    }
+    oo::define ::SB method pub {} { return [my secret] }
+    oo::class create ::SBs { superclass ::SB; method probe {} { return [my secret] } }
+    list [[::SB new] pub] [catch {[::SBs new] probe}]
+} TBCX_SOURCE_MARKER_SB_PRIVATE
+
+scopeMatrix scope.standalone.inline.private {
+    oo::class create ::SC {}
+    oo::define ::SC private method secret {} {
+        # TBCX_SOURCE_MARKER_SC_INLINE_PRIVATE
+        return s
+    }
+    oo::define ::SC method pub {} { return [my secret] }
+    oo::class create ::SCs { superclass ::SC; method probe {} { return [my secret] } }
+    list [[::SC new] pub] [catch {[::SCs new] probe}]
+} TBCX_SOURCE_MARKER_SC_INLINE_PRIVATE
+
+scopeMatrix scope.standalone.selfmethod {
+    oo::class create ::SE2 {}
+    oo::define ::SE2 self method Hidden -private {} {
+        # TBCX_SOURCE_MARKER_SE2_SELF_PRIVATE
+        return h
+    }
+    oo::define ::SE2 self method callH {} { return [my Hidden] }
+    list [::SE2 callH] [catch {::SE2 Hidden}]
+} TBCX_SOURCE_MARKER_SE2_SELF_PRIVATE
+
+scopeMatrix scope.standalone.selfexport {
+    oo::class create ::SF {}
+    oo::define ::SF self method Mk {} {
+        # TBCX_SOURCE_MARKER_SF_SELF_EXPORT
+        return c
+    }
+    oo::define ::SF self export Mk
+    ::SF Mk
+} TBCX_SOURCE_MARKER_SF_SELF_EXPORT
+
+# standalone bare-block forms: oo::define CLS private { ... } / self { ... }
+scopeMatrix scope.standalone.privblock {
+    oo::class create ::BBp {}
+    oo::define ::BBp private { method secret {} {
+        # TBCX_SOURCE_MARKER_BBP
+        return s
+    } }
+    oo::define ::BBp method pub {} { return [my secret] }
+    oo::class create ::BBps { superclass ::BBp; method probe {} { return [my secret] } }
+    list [[::BBp new] pub] [catch {[::BBps new] probe}]
+} TBCX_SOURCE_MARKER_BBP
+
+scopeMatrix scope.standalone.selfblock {
+    oo::class create ::BBs {}
+    oo::define ::BBs self { method Mk {} {
+        # TBCX_SOURCE_MARKER_BBS
+        return c
+    }; export Mk }
+    ::BBs Mk
+} TBCX_SOURCE_MARKER_BBS
+
+# standalone body-only constructor (oo::define CLS constructor BODY)
+scopeMatrix scope.standalone.ctor {
+    oo::class create ::BBc {}
+    oo::define ::BBc constructor {} {
+        # TBCX_SOURCE_MARKER_BBC
+        my variable z; set z 9
+    }
+    oo::define ::BBc method z {} { my variable z; return $z }
+    [::BBc new] z
+} TBCX_SOURCE_MARKER_BBC
+
+# multi-command class: self method A in create body, self method b via oo::define
+test scope.multi.command {self methods across create+define both install} -body {
+    tbcxRun scope.mc {
+        oo::class create ::MC { self method a {} { return A } }
+        oo::define ::MC { self method b {} { return B } }
+        oo::define ::MC self export a
+        oo::define ::MC self export b
+        list [::MC a] [::MC b]
+    }
+} -result {A B}
+
+# ===========================================================================
+# Per-object methods (oo::objdefine) — option scope round-trips too.
+# ===========================================================================
+scopeMatrix scope.objdefine.export {
+    oo::class create ::OD {}
+    ::OD create od1
+    oo::objdefine od1 method Mk -export {} {
+        # TBCX_SOURCE_MARKER_OD_EXPORT
+        return e
+    }
+    od1 Mk
+} TBCX_SOURCE_MARKER_OD_EXPORT
+
+test scope.objdefine.allscopes {per-object -export/-unexport/-private round-trip} -body {
+    tbcxRun scope.oda {
+        oo::class create ::ODX {}
+        ::ODX create odx
+        oo::objdefine odx method Mk -export {} { return e }
+        oo::objdefine odx method low -unexport {} { return l }
+        oo::objdefine odx method useLow {} { return [my low] }
+        oo::objdefine odx method Sec -private {} { return s }
+        oo::objdefine odx method useSec {} { return [my Sec] }
+        list [odx Mk] [catch {odx low}] [odx useLow] [catch {odx Sec}] [odx useSec]
+    }
+} -result {e 1 l 1 s}
+
+# constructor/destructor + next still work (scope byte is DEFAULT for them).
+test scope.ctor.dtor {ctor/dtor + next unaffected} -body {
+    tbcxRun scope.cd {
+        oo::class create ::CDbase { constructor {} { my variable n; set n base } }
+        oo::class create ::CDsub {
+            superclass ::CDbase
+            constructor {} { next; my variable n; append n +sub }
+            method n {} { my variable n; return $n }
+        }
+        [::CDsub new] n
+    }
+} -result {base+sub}
+
+cleanupTests

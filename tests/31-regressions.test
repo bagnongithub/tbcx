@@ -1,0 +1,222 @@
+# -*-Tcl-*-
+# 31-regressions.test — fixes for two correctness bugs found 2026-06-12
+#
+#   A. List-literal first-element quoting: a scalar value carrying a
+#      parasitic list internal rep (every Tcl string is a valid list) was
+#      serialized element-wise, re-quoting it ("#aa" -> "{#aa}" -> "{{#aa}}").
+#      Triggered by any constant-folded [list …] whose first element needs
+#      list-quoting (leading '#', leading space, embedded braces).
+#
+#   B. TclOO in-body `export` visibility loss: a method exported via the
+#      `export` command INSIDE an `oo::class create {…}` / `oo::define {…}`
+#      body lost its public visibility on load (PrecompClass only restored
+#      the unexport direction). PascalCase callbacks (e.g. DoFlush) became
+#      private and external dispatch threw `unknown method`.
+
+package require tbcx
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# ---------------------------------------------------------------------------
+# A. List-literal first-element quoting
+# ---------------------------------------------------------------------------
+
+test regress.list.0 {first element leading '#' (colour) round-trips} -body {
+    set in  [makeFile {return [lindex [list "#fde9e9" "#641e1e" "#c0392b"] 0]} regress.list.0-in.tcl]
+    set out [makeFile "" regress.list.0-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {#fde9e9}
+
+test regress.list.1 {whole list value preserved (leading '#' first elem)} -body {
+    # Tcl canonically braces a leading-'#' first element (comment-safety); the
+    # tbcx round-trip must reproduce that exact string rep, as `source` does.
+    set in  [makeFile {return [list "#fde9e9" "#641e1e" "#c0392b"]} regress.list.1-in.tcl]
+    set out [makeFile "" regress.list.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{#fde9e9} #641e1e #c0392b}
+
+test regress.list.2 {first element leading space round-trips} -body {
+    set in  [makeFile {return [lindex [list " aa" "bb"] 0]} regress.list.2-in.tcl]
+    set out [makeFile "" regress.list.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result { aa}
+
+test regress.list.3 {first element with embedded braces round-trips} -body {
+    set in  [makeFile {return [lindex [list "{x}" "bb"] 0]} regress.list.3-in.tcl]
+    set out [makeFile "" regress.list.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{x}}
+
+test regress.list.4 {genuine nested list of doubles still element-wise faithful} -body {
+    set in  [makeFile {return [list [list 1.5 2.5] [list 3.5 4.5]]} regress.list.4-in.tcl]
+    set out [makeFile "" regress.list.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{1.5 2.5} {3.5 4.5}}
+
+test regress.list.5 {list whose '#' is not first is unaffected} -body {
+    set in  [makeFile {return [list "bb" "#aa"]} regress.list.5-in.tcl]
+    set out [makeFile "" regress.list.5-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {bb #aa}
+
+# Lambda-misdetection variant of R2: a genuine 2-element DATA list whose first
+# element needs list-quoting AND whose second element looks script-like was
+# mis-serialized as a lambda, re-quoting the first element ("#a" -> "{{#a}}").
+test regress.list.6 {lambda-shaped data list, leading '#' first elem, lindex} -body {
+    set in  [makeFile {return [lindex [list "#a" "set x 1; puts hi"] 0]} regress.list.6-in.tcl]
+    set out [makeFile "" regress.list.6-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {#a}
+
+test regress.list.7 {lambda-shaped data list value preserved} -body {
+    set in  [makeFile {return [list "#a" "set x 1; puts hi"]} regress.list.7-in.tcl]
+    set out [makeFile "" regress.list.7-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{#a} {set x 1; puts hi}}
+
+test regress.list.8 {lambda-shaped data list, leading-space first elem} -body {
+    set in  [makeFile {return [lindex [list " a" "incr n; set y 2"] 0]} regress.list.8-in.tcl]
+    set out [makeFile "" regress.list.8-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result { a}
+
+test regress.list.9 {genuine lambda still precompiles and executes} -body {
+    set in  [makeFile {return [apply {{a b} {expr {$a + $b}}} 3 4]} regress.list.9-in.tcl]
+    set out [makeFile "" regress.list.9-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 7
+
+# 3-element lambda-shaped DATA list whose 3rd token is a NON-ABSOLUTE namespace.
+# Mis-serialized as LAMBDA_BC it makes the *whole file* fail to load
+# ("lambda namespace must be absolute") — the round-trip faithfulness guard must
+# reject any 3rd token that ReadLit_LambdaBC would not accept verbatim.
+test regress.list.10 {3-elem data list, non-absolute 3rd token, loads} -body {
+    set in  [makeFile {return [list {x} {do; it} "relative"]} regress.list.10-in.tcl]
+    set out [makeFile "" regress.list.10-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {x {do; it} relative}
+
+test regress.list.11 {3-elem data list, leading-'#' 3rd token, loads} -body {
+    set in  [makeFile {return [list {x} {do; it} "#ns"]} regress.list.11-in.tcl]
+    set out [makeFile "" regress.list.11-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {x {do; it} #ns}
+
+test regress.list.12 {3-elem data list, empty 3rd token, loads} -body {
+    set in  [makeFile {return [list {x} {do; it} ""]} regress.list.12-in.tcl]
+    set out [makeFile "" regress.list.12-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {x {do; it} {}}
+
+# 3rd token exactly "::" — the loader collapses a global-namespace lambda to a
+# 2-element value, silently dropping the 3rd element.  Must round-trip verbatim.
+test regress.list.13 {3-elem data list, "::" 3rd token preserved} -body {
+    set in  [makeFile {return [list {x} {do; it} "::"]} regress.list.13-in.tcl]
+    set out [makeFile "" regress.list.13-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {x {do; it} ::}
+
+# Counter-test: a genuine 3-element lambda with an ABSOLUTE namespace must STILL
+# serialize as LAMBDA_BC and execute (no over-correction).
+test regress.list.14 {genuine 3-elem lambda, absolute ns, executes} -body {
+    set in  [makeFile {
+        namespace eval ::regns { variable v 100 }
+        return [apply {{x} {expr {$x + $::regns::v}} ::regns} 5]
+    } regress.list.14-in.tcl]
+    set out [makeFile "" regress.list.14-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 105
+
+# Lambda-shaped DATA list whose arg has a DEFAULT with non-canonical bracing.
+# The codec writes defaults as separate literals and re-canonicalises {name
+# default} on load, so a quote-braced default ("x y") was silently re-quoted
+# ({x y}).  The faithfulness check must mirror the name+default split.
+test regress.list.15 {lambda-shaped data list, quote-braced arg default preserved} -body {
+    set in  [makeFile {return [list {{a "x y"}} {set z 1; puts $a}]} regress.list.15-in.tcl]
+    set out [makeFile "" regress.list.15-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {{{a "x y"}} {set z 1; puts $a}}
+
+# Counter-test: a genuine lambda WITH a default still serializes/executes.
+test regress.list.16 {genuine lambda with arg default executes} -body {
+    set in  [makeFile {return [apply {{a {b 5}} {expr {$a + $b}}} 10]} regress.list.16-in.tcl]
+    set out [makeFile "" regress.list.16-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 15
+
+# ---------------------------------------------------------------------------
+# B. TclOO in-body `export` visibility
+# ---------------------------------------------------------------------------
+
+test regress.export.0 {in-body export of PascalCase method survives (external dispatch)} -body {
+    set in  [makeFile {
+        oo::class create ::Reg0 { method Bar {} {return ok}; export Bar }
+        set o [::Reg0 new]
+        return [$o Bar]
+    } regress.export.0-in.tcl]
+    set out [makeFile "" regress.export.0-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result ok
+
+test regress.export.1 {in-body export shows in exported method list} -body {
+    set in  [makeFile {
+        oo::class create ::Reg1 { method Bar {} {return ok}; export Bar }
+        return [expr {"Bar" in [info class methods ::Reg1 -all]}]
+    } regress.export.1-in.tcl]
+    set out [makeFile "" regress.export.1-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1
+
+test regress.export.2 {oo::define braced-body export survives} -body {
+    set in  [makeFile {
+        oo::class create ::Reg2 { method Bar {} {return ok} }
+        oo::define ::Reg2 { export Bar }
+        return [expr {"Bar" in [info class methods ::Reg2 -all]}]
+    } regress.export.2-in.tcl]
+    set out [makeFile "" regress.export.2-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 1
+
+test regress.export.3 {in-body unexport of lowercase method still privatises} -body {
+    set in  [makeFile {
+        oo::class create ::Reg3 { method lo {} {return ok}; unexport lo }
+        return [list [expr {"lo" in [info class methods ::Reg3 -all]}] \
+                     [expr {"lo" in [info class methods ::Reg3 -all -private]}]]
+    } regress.export.3-in.tcl]
+    set out [makeFile "" regress.export.3-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {0 1}
+
+test regress.export.4 {lowercase methods stay public (no over-correction)} -body {
+    set in  [makeFile {
+        oo::class create ::Reg4 { method lo {} {return ok}; method Cb {} {return cb}; export Cb }
+        set o [::Reg4 new]
+        return [list [$o lo] [$o Cb]]
+    } regress.export.4-in.tcl]
+    set out [makeFile "" regress.export.4-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result {ok cb}
+
+cleanupTests
