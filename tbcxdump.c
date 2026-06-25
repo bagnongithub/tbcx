@@ -779,6 +779,13 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
             return TCL_ERROR;
         }
 
+        /* scope byte (v92 amendment) — read immediately after kind. */
+        uint8_t scope = 0;
+        if (!Tbcx_R_U8(r, &scope)) {
+            Tcl_DecrRefCount(clsFqn);
+            return TCL_ERROR;
+        }
+
         char    *mname = NULL;
         uint32_t mnL   = 0;
         if (!Tbcx_R_LPString(r, &mname, &mnL)) {
@@ -811,6 +818,11 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendPrintfToObj(out, " %s", kname);
         Tcl_AppendObjToObj(out, nameObj);
         Tcl_AppendToObj(out, "\n", 1);
+        const char *scopeName = (scope == TBCX_MSCOPE_PUBLIC)         ? "public"
+                                : (scope == TBCX_MSCOPE_UNEXPORTED)   ? "unexported"
+                                : (scope == TBCX_MSCOPE_TRUE_PRIVATE) ? "true-private"
+                                                                      : "default";
+        Tcl_AppendPrintfToObj(out, "    scope: %s\n", scopeName);
         Tcl_AppendToObj(out, "    args: ", -1);
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);

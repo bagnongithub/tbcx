@@ -31,6 +31,21 @@
 #include "tbcx.h"
 
 /* ==========================================================================
+ * Portability
+ * ========================================================================== */
+
+/* "Function may be deliberately uncalled" annotation.  GCC/Clang understand
+ * __attribute__((unused)); MSVC's cl cannot parse it at all (it triggers a
+ * cascade of syntax errors).  MSVC has no whole-function equivalent, but at
+ * warning level /W3 it does not flag an unreferenced static function
+ * (C4505 is a level-4 warning), so an empty expansion is safe there. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define TBCX_MAYBE_UNUSED __attribute__((unused))
+#else
+#  define TBCX_MAYBE_UNUSED
+#endif
+
+/* ==========================================================================
  * File-local globals
  * ========================================================================== */
 
@@ -165,7 +180,9 @@ static int         CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *c
 static int         CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
 static int         CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
 static void        CompiledLocals(Proc *procPtr, Tcl_Size neededCount);
-static int         DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt);
+static int         DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt, int scope);
+static int         TbcxApplyExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *name, int makePublic);
+static int         PairScope(Tcl_Interp *ip, Tcl_Obj *pair);
 static void        DelOOShim(Tcl_Interp *ip, OOShim *os);
 static void        DelProcShim(Tcl_Interp *ip, ProcShim *ps);
 static ApplyShim  *EnsureApplyShim(Tcl_Interp *ip);
@@ -176,7 +193,7 @@ static void        OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char
 static void        OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static void        OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *const objv[], Tcl_Obj *clsFqn, Tcl_DString *keyDs, uint8_t *kindOut, Tcl_Size *bodyIdxOut, Tcl_Obj **runtimeArgsOut,
                                          Tcl_Obj **nameOOut, Tcl_Obj **tmpEmptyArgsOut, int *hasKeyOut);
-static void        OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut);
+static void        OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut, int *scopeOut);
 static int         PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn);
 static void        ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static int         ProcShim_DirectInstall(ProcShim *ps, Tcl_Interp *ip, Tcl_Obj *fqn, Tcl_Obj *nameObj, Proc *preProc, Tcl_Obj *savedArgs);
@@ -506,25 +523,163 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj 
     return 1;
 }
 
-static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt) {
+/* PairScope — extract the TBCX_MSCOPE_* scope from a {args, procbody, scope}
+ * methodsByKey triple.  Returns TBCX_MSCOPE_DEFAULT when the third element is
+ * absent (defensive) or unreadable. */
+static int PairScope(Tcl_Interp *ip, Tcl_Obj *pair) {
+    if (!pair)
+        return TBCX_MSCOPE_DEFAULT;
+    Tcl_Size  n     = 0;
+    Tcl_Obj **elems = NULL;
+    if (Tcl_ListObjGetElements(ip, pair, &n, &elems) != TCL_OK || n < 3)
+        return TBCX_MSCOPE_DEFAULT;
+    Tcl_WideInt v = 0;
+    if (Tcl_GetWideIntFromObj(NULL, elems[2], &v) != TCL_OK)
+        return TBCX_MSCOPE_DEFAULT;
+    if (v < 0 || v > TBCX_MSCOPE_TRUE_PRIVATE)
+        return TBCX_MSCOPE_DEFAULT;
+    return (int)v;
+}
+
+/* TbcxApplyExportVisibility — set a freshly-installed method's export state
+ * (public vs unexported) through TclOO's own `oo::define export|unexport`.
+ * Those subcommands require Tcl's full ensemble-dispatch context, so a direct
+ * savedDefineProc call silently no-ops; we temporarily restore the original
+ * oo::define handler on the Command struct (removing the shim so there is no
+ * re-entrancy through CmdOOShim), evaluate, then re-install the shim.  Safe
+ * because the loader is single-threaded and no user code runs in between. */
+static int TbcxApplyExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *name, int makePublic) {
+    if (!os->defineCmdPtr || !name)
+        return TCL_OK; /* nothing we can safely do */
+    os->defineCmdPtr->objProc2       = os->savedDefineProc;
+    os->defineCmdPtr->objClientData2 = os->savedDefineCD;
+    if (os->savedDefineNre)
+        os->defineCmdPtr->nreProc2 = os->savedDefineNre;
+
+    Tcl_Obj *defCmd = Tcl_NewStringObj("oo::define", -1);
+    Tcl_IncrRefCount(defCmd);
+    Tcl_Obj *sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
+    Tcl_IncrRefCount(sub);
+    Tcl_Obj *av[4] = {defCmd, clsFqn, sub, name};
+    int      rc    = Tcl_EvalObjv(ip, 4, av, 0);
+    Tcl_DecrRefCount(sub);
+    Tcl_DecrRefCount(defCmd);
+
+    os->defineCmdPtr->objProc2       = CmdOOShim;
+    os->defineCmdPtr->objClientData2 = os;
+    if (os->savedDefineNre)
+        os->defineCmdPtr->nreProc2 = CmdOOShim;
+    if (rc == TCL_OK)
+        Tcl_ResetResult(ip);
+    return rc;
+}
+
+/* TbcxApplyObjExportVisibility — like TbcxApplyExportVisibility but for a
+ * per-object method, routing through `oo::objdefine OBJ export|unexport NAME`
+ * with the objdefine shim temporarily removed. */
+static int TbcxApplyObjExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, int makePublic) {
+    if (!os->hasObjDefine || !os->objdefCmdPtr || !name)
+        return TCL_OK;
+    os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+    os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
+    if (os->savedObjdefNre)
+        os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
+
+    Tcl_Obj *defCmd = Tcl_NewStringObj("oo::objdefine", -1);
+    Tcl_IncrRefCount(defCmd);
+    Tcl_Obj *sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
+    Tcl_IncrRefCount(sub);
+    Tcl_Obj *av[4] = {defCmd, objFqn, sub, name};
+    int      rc    = Tcl_EvalObjv(ip, 4, av, 0);
+    Tcl_DecrRefCount(sub);
+    Tcl_DecrRefCount(defCmd);
+
+    os->objdefCmdPtr->objProc2       = CmdOOShimObjDef;
+    os->objdefCmdPtr->objClientData2 = os;
+    if (os->savedObjdefNre)
+        os->objdefCmdPtr->nreProc2 = CmdOOShimObjDef;
+    if (rc == TCL_OK)
+        Tcl_ResetResult(ip);
+    return rc;
+}
+
+/* TbcxInstallObjPrivateMethod — (re)create a per-object true-private method
+ * with the precompiled body via the flat `oo::objdefine OBJ private method`
+ * form so the TIP 500 true-private scope is established by TclOO itself. */
+static int TbcxInstallObjPrivateMethod(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody, uint8_t kind) {
+    Tcl_Obj *cmd = Tcl_NewStringObj("oo::objdefine", -1);
+    Tcl_IncrRefCount(cmd);
+    Tcl_Obj *priv = Tcl_NewStringObj("private", -1);
+    Tcl_IncrRefCount(priv);
+    Tcl_Obj *sub = Tcl_NewStringObj((kind == TBCX_METH_CLASS) ? "classmethod" : "method", -1);
+    Tcl_IncrRefCount(sub);
+    Tcl_IncrRefCount(name);
+    Tcl_IncrRefCount(args);
+    Tcl_IncrRefCount(preBody);
+    Tcl_Obj *av[7] = {cmd, objFqn, priv, sub, name, args, preBody};
+    int      rc    = os->savedObjdefProc(os->savedObjdefCD, ip, 7, av);
+    Tcl_DecrRefCount(preBody);
+    Tcl_DecrRefCount(args);
+    Tcl_DecrRefCount(name);
+    Tcl_DecrRefCount(sub);
+    Tcl_DecrRefCount(priv);
+    Tcl_DecrRefCount(cmd);
+    return rc;
+}
+
+static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt, int scope) {
     int      rc    = TCL_OK;
     /* argv0 is only used for error messages in the original handler */
     Tcl_Obj *argv0 = Tcl_NewStringObj("oo::define", -1);
     Tcl_IncrRefCount(argv0);
 
-    /* Fast path for methods (instance/class): always direct */
+    /* Fast path for methods (instance/class).  The method visibility (scope)
+       is established AT CREATION where the form allows it, so no separate
+       export/unexport pass is needed and TclOO's own definition machinery
+       handles the dispatch/epoch bookkeeping:
+         - TRUE_PRIVATE: `oo::define X private method|classmethod NAME ARGS BODY`
+           (the flat private form; works for both method and classmethod).
+         - PUBLIC/UNEXPORTED on `method`: option form
+           `method NAME -export|-unexport ARGS BODY`.
+         - PUBLIC/UNEXPORTED on `classmethod` (which does NOT accept options):
+           create name-default, then apply export/unexport via TclOO.
+         - DEFAULT: name-case visibility (the historical behavior). */
     if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
-        Tcl_Obj *sub = Tcl_NewStringObj((kind == TBCX_METH_CLASS) ? "classmethod" : "method", -1);
-        Tcl_IncrRefCount(sub);
+        const char *kwStr = (kind == TBCX_METH_CLASS) ? "classmethod" : "method";
         Tcl_IncrRefCount(nameOpt);
         Tcl_IncrRefCount(argsOpt);
         Tcl_IncrRefCount(bodyOpt);
-        Tcl_Obj *av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
-        rc             = os->savedDefineProc(os->savedDefineCD, ip, 6, av);
+        if (scope == TBCX_MSCOPE_TRUE_PRIVATE) {
+            Tcl_Obj *priv = Tcl_NewStringObj("private", -1);
+            Tcl_IncrRefCount(priv);
+            Tcl_Obj *sub = Tcl_NewStringObj(kwStr, -1);
+            Tcl_IncrRefCount(sub);
+            Tcl_Obj *av[7] = {argv0, clsFqn, priv, sub, nameOpt, argsOpt, bodyOpt};
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+            Tcl_DecrRefCount(sub);
+            Tcl_DecrRefCount(priv);
+        } else if (kind == TBCX_METH_INST && (scope == TBCX_MSCOPE_PUBLIC || scope == TBCX_MSCOPE_UNEXPORTED)) {
+            Tcl_Obj *sub = Tcl_NewStringObj("method", -1);
+            Tcl_IncrRefCount(sub);
+            Tcl_Obj *opt = Tcl_NewStringObj((scope == TBCX_MSCOPE_PUBLIC) ? "-export" : "-unexport", -1);
+            Tcl_IncrRefCount(opt);
+            Tcl_Obj *av[7] = {argv0, clsFqn, sub, nameOpt, opt, argsOpt, bodyOpt};
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+            Tcl_DecrRefCount(opt);
+            Tcl_DecrRefCount(sub);
+        } else {
+            Tcl_Obj *sub = Tcl_NewStringObj(kwStr, -1);
+            Tcl_IncrRefCount(sub);
+            Tcl_Obj *av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 6, av);
+            Tcl_DecrRefCount(sub);
+            /* classmethod cannot carry an option; apply export/unexport now. */
+            if (rc == TCL_OK && kind == TBCX_METH_CLASS && (scope == TBCX_MSCOPE_PUBLIC || scope == TBCX_MSCOPE_UNEXPORTED))
+                rc = TbcxApplyExportVisibility(ip, os, clsFqn, nameOpt, scope == TBCX_MSCOPE_PUBLIC);
+        }
         Tcl_DecrRefCount(bodyOpt);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(nameOpt);
-        Tcl_DecrRefCount(sub);
         Tcl_DecrRefCount(argv0);
         return rc;
     }
@@ -546,7 +701,11 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         if (savedBody)
             Tcl_IncrRefCount(savedBody);
 
-        /* Step 1: Create self method with ";" placeholder */
+        /* Step 1: Create self method with ";" placeholder.  The visibility
+           scope is established HERE via the option form (self method accepts
+           -export/-private/-unexport), so the subsequent body swap — which
+           only touches the Proc bodyPtr, not the Method flags — preserves it
+           and no separate, epoch-bumping export/unexport pass is needed. */
         Tcl_Obj *selfSub = Tcl_NewStringObj("self", -1);
         Tcl_IncrRefCount(selfSub);
         Tcl_Obj *methSub = Tcl_NewStringObj("method", -1);
@@ -555,8 +714,22 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         Tcl_IncrRefCount(argsOpt);
         Tcl_Obj *placeholder = Tcl_NewStringObj(";", 1);
         Tcl_IncrRefCount(placeholder);
-        Tcl_Obj *av[7] = {argv0, clsFqn, selfSub, methSub, nameOpt, argsOpt, placeholder};
-        rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+        Tcl_Obj *scopeOpt = NULL;
+        if (scope == TBCX_MSCOPE_PUBLIC)
+            scopeOpt = Tcl_NewStringObj("-export", -1);
+        else if (scope == TBCX_MSCOPE_UNEXPORTED)
+            scopeOpt = Tcl_NewStringObj("-unexport", -1);
+        else if (scope == TBCX_MSCOPE_TRUE_PRIVATE)
+            scopeOpt = Tcl_NewStringObj("-private", -1);
+        if (scopeOpt) {
+            Tcl_IncrRefCount(scopeOpt);
+            Tcl_Obj *av[8] = {argv0, clsFqn, selfSub, methSub, nameOpt, scopeOpt, argsOpt, placeholder};
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 8, av);
+            Tcl_DecrRefCount(scopeOpt);
+        } else {
+            Tcl_Obj *av[7] = {argv0, clsFqn, selfSub, methSub, nameOpt, argsOpt, placeholder};
+            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+        }
         Tcl_DecrRefCount(placeholder);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(nameOpt);
@@ -783,6 +956,12 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
                 const char *nm = Tcl_GetString(mPtr->namePtr);
                 if (!nm || nm[0] == '\0')
                     continue;
+                /* TIP 500 true-private methods are re-installed in private
+                   context by DefOO (driven by the scope byte); they must NOT
+                   be coerced to plain unexported here, which would downgrade
+                   them to subclass-visible methods. */
+                if (mPtr->flags & TRUE_PRIVATE_METHOD)
+                    continue;
                 int isPublic  = (mPtr->flags & PUBLIC_METHOD) != 0;
                 int defPublic = (nm[0] >= 'a' && nm[0] <= 'z');
                 if (isPublic && !defPublic)
@@ -824,10 +1003,11 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
            to the cached method chain). */
         if (kind == TBCX_METH_SELF)
             continue;
-        Tcl_Obj *pair = (Tcl_Obj *)Tcl_GetHashValue(e); /* {args, procbody} */
+        Tcl_Obj *pair = (Tcl_Obj *)Tcl_GetHashValue(e); /* {args, procbody, scope} */
         if (!pair)
             continue;
         Tcl_Obj *savedArgs = NULL, *procBody = NULL;
+        int      methScope = TBCX_MSCOPE_DEFAULT;
         {
             Tcl_Size  pairLen   = 0;
             Tcl_Obj **pairElems = NULL;
@@ -835,6 +1015,7 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
                 continue;
             savedArgs = pairElems[0];
             procBody  = pairElems[1];
+            methScope = PairScope(ip, pair);
         }
 
         Tcl_Obj *nameO = NULL;
@@ -842,7 +1023,7 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             nameO = Tcl_NewStringObj(nameStr, -1);
             Tcl_IncrRefCount(nameO);
         }
-        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO, (kind == TBCX_METH_DTOR ? savedArgs /* may be "" */ : savedArgs), procBody);
+        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO, (kind == TBCX_METH_DTOR ? savedArgs /* may be "" */ : savedArgs), procBody, methScope);
         if (nameO)
             Tcl_DecrRefCount(nameO);
         if (rc != TCL_OK) {
@@ -989,11 +1170,13 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
     }
 }
 
-/* OOShim_LookupPair — look up the precompiled {args, procbody} pair for
- * the given method key.  Returns the pair elements via out-params. */
-static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut) {
+/* OOShim_LookupPair — look up the precompiled {args, procbody, scope} triple
+ * for the given method key.  Returns the elements via out-params. */
+static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut, int *scopeOut) {
     *savedArgsOut = NULL;
     *preBodyOut   = NULL;
+    if (scopeOut)
+        *scopeOut = TBCX_MSCOPE_DEFAULT;
     if (hasKey && bodyIdx >= 0 && runtimeArgs != NULL) {
         Tcl_HashEntry *he = Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(keyDs));
         if (he) {
@@ -1004,6 +1187,8 @@ static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, in
                 if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) == TCL_OK && pairLen >= 2) {
                     *savedArgsOut = pairElems[0];
                     *preBodyOut   = pairElems[1];
+                    if (scopeOut)
+                        *scopeOut = PairScope(ip, pair);
                 }
             }
         }
@@ -1079,16 +1264,17 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
     Tcl_Obj    *tmpEmptyArgs = NULL;           /* temp "" for destructor short form */
     Tcl_Size    bodyIdx      = -1;             /* index of body word in argv */
     uint8_t     kind         = TBCX_METH_NONE; /* TBCX_METH_* */
+    int         methScope    = TBCX_MSCOPE_DEFAULT;
 
     /* Identify the OO subcommand and look up a precompiled pair. */
     OOShim_IdentifyMethod(subc, objc, objv, clsFqn, &keyDs, &kind, &bodyIdx, &runtimeArgs, &nameO, &tmpEmptyArgs, &hasKey);
-    OOShim_LookupPair(ip, os, &keyDs, hasKey, bodyIdx, runtimeArgs, &savedArgs, &preBody);
+    OOShim_LookupPair(ip, os, &keyDs, hasKey, bodyIdx, runtimeArgs, &savedArgs, &preBody, &methScope);
 
     /* If we have a precompiled body and the signature matches byte-wise,
        substitute the body argument and call the original. */
     if (preBody && savedArgs && !isBuilderForm) {
         if (kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) {
-            rc = DefOO(ip, os, clsFqn, kind, NULL, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody);
+            rc = DefOO(ip, os, clsFqn, kind, NULL, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody, TBCX_MSCOPE_DEFAULT);
             goto cleanup;
         }
         Tcl_Size _dummyLen = 0;
@@ -1105,7 +1291,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
         const char *b = Tbcx_GetStringFromObjSafe(savedArgs, &bLen);
 
         if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0) {
-            rc = DefOO(ip, os, clsFqn, kind, (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) ? nameO : NULL, (kind == TBCX_METH_DTOR ? savedArgs : savedArgs), preBody);
+            rc = DefOO(ip, os, clsFqn, kind, (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) ? nameO : NULL, (kind == TBCX_METH_DTOR ? savedArgs : savedArgs), preBody, methScope);
             goto cleanup;
         }
         /* Fast path for stubbed empty bodies: install precompiled body directly. */
@@ -1117,13 +1303,13 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                     Tcl_Obj *argsForCtor = savedArgs ? savedArgs : Tcl_NewObj();
                     if (!savedArgs)
                         Tcl_IncrRefCount(argsForCtor);
-                    rc = DefOO(ip, os, clsFqn, TBCX_METH_CTOR, NULL, argsForCtor, preBody);
+                    rc = DefOO(ip, os, clsFqn, TBCX_METH_CTOR, NULL, argsForCtor, preBody, TBCX_MSCOPE_DEFAULT);
                     if (!savedArgs)
                         Tcl_DecrRefCount(argsForCtor);
                 } else if (kind == TBCX_METH_DTOR) {
-                    rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody);
+                    rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody, TBCX_MSCOPE_DEFAULT);
                 } else {
-                    rc = DefOO(ip, os, clsFqn, kind, nameO, savedArgs, preBody);
+                    rc = DefOO(ip, os, clsFqn, kind, nameO, savedArgs, preBody, methScope);
                 }
                 /* cleanup and return */
                 goto cleanup;
@@ -1147,7 +1333,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             }
             if (listRc == TCL_OK && nEl == 0) {
                 Tcl_Obj *body = objv[objc - 1];
-                rc            = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, body);
+                rc            = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, body, TBCX_MSCOPE_DEFAULT);
             } else {
                 /* Forward to original; normalize the class arg to FQN */
                 argv2[1] = clsFqn;
@@ -1196,12 +1382,14 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
         if (he2) {
             Tcl_Obj *pair2      = (Tcl_Obj *)Tcl_GetHashValue(he2);
             Tcl_Obj *savedArgs2 = NULL, *preBody2 = NULL;
+            int      scope2     = TBCX_MSCOPE_DEFAULT;
             if (pair2) {
                 Tcl_Size  p2Len   = 0;
                 Tcl_Obj **p2Elems = NULL;
                 if (Tcl_ListObjGetElements(ip, pair2, &p2Len, &p2Elems) == TCL_OK && p2Len >= 2) {
                     savedArgs2 = p2Elems[0];
                     preBody2   = p2Elems[1];
+                    scope2     = PairScope(ip, pair2);
                 }
             }
             if (savedArgs2 && preBody2) {
@@ -1212,12 +1400,12 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 int rc2 = TCL_OK;
                 if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) {
                     if (nameO) {
-                        rc2 = DefOO(ip, os, clsForCall, kind, nameO, savedArgs2, preBody2);
+                        rc2 = DefOO(ip, os, clsForCall, kind, nameO, savedArgs2, preBody2, scope2);
                     }
                 } else if (kind == TBCX_METH_CTOR) {
-                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_CTOR, NULL, savedArgs2, preBody2);
+                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_CTOR, NULL, savedArgs2, preBody2, TBCX_MSCOPE_DEFAULT);
                 } else if (kind == TBCX_METH_DTOR) {
-                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_DTOR, NULL, NULL, preBody2);
+                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_DTOR, NULL, NULL, preBody2, TBCX_MSCOPE_DEFAULT);
                 }
                 if (rc2 != TCL_OK)
                     rc = rc2;
@@ -1338,15 +1526,16 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
             if (he) {
                 Tcl_Obj *pair      = (Tcl_Obj *)Tcl_GetHashValue(he);
                 Tcl_Obj *savedArgs = NULL, *preBody = NULL;
+                int      objScope  = TBCX_MSCOPE_DEFAULT;
                 if (pair) {
                     Tcl_Size  pLen   = 0;
                     Tcl_Obj **pElems = NULL;
                     if (Tcl_ListObjGetElements(ip, pair, &pLen, &pElems) == TCL_OK && pLen >= 2) {
                         savedArgs = pElems[0];
                         preBody   = pElems[1];
+                        objScope  = PairScope(ip, pair);
                     }
                 }
-                (void)savedArgs; /* only preBody used in objdefine path */
                 if (preBody) {
                     /* CRITICAL: Do NOT substitute procbody for SELF methods.
                        When oo::define CLS self method ... is processed,
@@ -1362,10 +1551,24 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
                     if (kind == TBCX_METH_SELF) {
                         Tcl_DStringFree(&keyDs);
                         goto objdefine_forward; /* skip second DStringFree */
+                    } else if ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && objScope == TBCX_MSCOPE_TRUE_PRIVATE) {
+                        /* True-private per-object method: install via the flat
+                           private form so TclOO establishes the scope. */
+                        rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameO, savedArgs ? savedArgs : objv[objc - 2], preBody, kind);
+                        Tcl_DStringFree(&keyDs);
+                        if (objFqn != obj)
+                            Tcl_DecrRefCount(objFqn);
+                        if (argv2 != argvStack)
+                            Tcl_Free(argv2);
+                        return rc;
                     } else {
                         /* Substitute the body argument and forward */
                         argv2[bodyIdx] = preBody;
                         rc             = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
+                        /* Apply explicit export/unexport scope (per-object
+                           methods default to name-case visibility otherwise). */
+                        if (rc == TCL_OK && (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && (objScope == TBCX_MSCOPE_PUBLIC || objScope == TBCX_MSCOPE_UNEXPORTED) && nameO)
+                            rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameO, objScope == TBCX_MSCOPE_PUBLIC);
                         Tcl_DStringFree(&keyDs);
                         if (objFqn != obj)
                             Tcl_DecrRefCount(objFqn);
@@ -2056,6 +2259,17 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
+    /* scope byte (v92 amendment) — read immediately after kind. */
+    uint8_t scope = 0;
+    if (!Tbcx_R_U8(r, &scope)) {
+        Tcl_DecrRefCount(clsFqn);
+        return TCL_ERROR;
+    }
+    if (scope > TBCX_MSCOPE_TRUE_PRIVATE) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method scope byte", -1));
+        Tcl_DecrRefCount(clsFqn);
+        return TCL_ERROR;
+    }
     /* name (empty for ctor/dtor) */
     char    *mname = NULL;
     uint32_t mnL   = 0;
@@ -2217,10 +2431,15 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_HashEntry *he    = Tcl_CreateHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs), &isNew);
     Tcl_DStringFree(&keyDs);
     /* Build and validate pair BEFORE touching the old value so the hash
-       entry remains valid if list construction fails. */
+       entry remains valid if list construction fails.  The triple is
+       {args, procbody, scope}; scope is a TBCX_MSCOPE_* integer applied to
+       the installed method's visibility (see DefOO). */
+    Tcl_Obj *scopeObj = Tcl_NewWideIntObj((Tcl_WideInt)scope);
+    Tcl_IncrRefCount(scopeObj);
     Tcl_Obj *pair = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(pair);
-    if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK) {
+    if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, scopeObj) != TCL_OK) {
+        Tcl_DecrRefCount(scopeObj);
         Tcl_DecrRefCount(pair);
         /* Same procPtr ownership discipline as the MethodKeyBuf failure
          * path above: drop procBodyObj (2->1), then cleanup procPtr
@@ -2238,6 +2457,7 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     Tcl_SetHashValue(he, pair);
     if (oldPair)
         Tcl_DecrRefCount(oldPair);
+    Tcl_DecrRefCount(scopeObj);
     Tcl_DecrRefCount(procBodyObj);
     Tcl_DecrRefCount(bodyBC); /* local reference */
     Tcl_DecrRefCount(nameObj);
@@ -3106,7 +3326,7 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
 /* Currently uncalled — operand validation is omitted for load speed (see the
  * note at its former call site in Tbcx_ReadBlock).  Kept in-source, marked
  * unused, so it can be restored without re-deriving the validation logic. */
-static int __attribute__((unused)) ValidateBlockOperands(
+static int TBCX_MAYBE_UNUSED ValidateBlockOperands(
     Tcl_Interp *ip,
     const unsigned char *code, uint32_t codeLen,
     uint32_t numLits, uint32_t numAux, uint32_t numLocals,

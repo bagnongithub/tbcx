@@ -87,6 +87,13 @@ typedef struct {
     int      kind; /* 0=proc; 1=inst-meth; 2=class-meth; 3=ctor; 4=dtor (methods stored in “methods” section) */
     Tcl_Obj *cls;
     int      flags; /* bitmask: 1 = captured from oo::class builder */
+    int      scope; /* TBCX_MSCOPE_* — TclOO visibility the method must have
+                       after load (declaration option + lexical private +
+                       same-body export/unexport).  Unused for procs. */
+    int      emitted; /* set once EmitFlatSelfStubs has written this self
+                         method's flat stub, so a class touched by several
+                         commands does not double-emit (and re-bump the
+                         epoch after a later self method's body swap). */
 } DefRec;
 
 typedef struct {
@@ -101,6 +108,12 @@ typedef struct {
 
 #define DEF_F_FROM_BUILDER 0x01
 #define DEF_F_SELF_METHOD 0x02 /* self method (class-level, emitted differently in stubs) */
+
+/* Lexical-context bits threaded through CaptureClassBody recursion so a
+ * method captured inside a `private { ... }` block becomes true-private and
+ * one inside a `self { ... }` block becomes a self method. */
+#define CAP_CTX_PRIVATE 0x01
+#define CAP_CTX_SELF 0x02
 #define DEF_KIND_PROC 0
 #define DEF_KIND_INST 1
 #define DEF_KIND_CLASS 2
@@ -119,7 +132,7 @@ typedef struct {
  * ========================================================================== */
 
 static Tcl_Obj                *CanonTrivia(Tcl_Obj *in);
-static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth);
+static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags);
 static Tcl_Obj                *CaptureAndRewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsSet *classes, int depth);
 static inline const char      *CmdCore(const char *s);
 static int                     CmpJTEntryUtf8_qsort(const void *pa, const void *pb);
@@ -3537,10 +3550,89 @@ static Tcl_Obj *FqnUnder(Tcl_Interp *ip, Tcl_Obj *curNs, Tcl_Obj *name) {
     return fqn; /* returned refcount = 1 */
 }
 
-static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth) {
+/* Scan method-definition option words (-export/-private/-unexport) and
+ * return the resulting TBCX_MSCOPE_*.  `firstOpt` points at the first option
+ * word; `nOpts` is how many words precede the trailing args/body.  Last
+ * recognized option wins (matching TclOO's left-to-right application).
+ * Returns TBCX_MSCOPE_DEFAULT when no recognized scope option is present. */
+/* Is the word after a `self` token literally "method"? (used to distinguish
+ * the body-bearing `self method ...` from bodiless `self export/mixin/...`). */
+static int SelfSubIsMethod(const Tcl_Token *wSelf) {
+    const Tcl_Token *wSub = NextWord(wSelf);
+    if (!wSub)
+        return 0;
+    Tcl_Obj *o = WordLiteralObj(wSub);
+    if (!o)
+        return 0;
+    int r = (strcmp(Tbcx_GetStringSafe(o), "method") == 0);
+    Tcl_DecrRefCount(o);
+    return r;
+}
+
+static int MethodScopeFromOptionWords(const Tcl_Token *firstOpt, Tcl_Size nOpts) {
+    int              scope = TBCX_MSCOPE_DEFAULT;
+    const Tcl_Token *t     = firstOpt;
+    for (Tcl_Size i = 0; i < nOpts; i++) {
+        Tcl_Obj *w = WordLiteralObj(t);
+        if (w) {
+            const char *s = Tbcx_GetStringSafe(w);
+            if (strcmp(s, "-export") == 0)
+                scope = TBCX_MSCOPE_PUBLIC;
+            else if (strcmp(s, "-unexport") == 0)
+                scope = TBCX_MSCOPE_UNEXPORTED;
+            else if (strcmp(s, "-private") == 0)
+                scope = TBCX_MSCOPE_TRUE_PRIVATE;
+            Tcl_DecrRefCount(w);
+        }
+        t = NextWord(t);
+    }
+    return scope;
+}
+
+/* Fold a same-body export/unexport (or self-export/self-unexport) command
+ * into the scope of the most-recently captured matching method.  `wantSelf`
+ * selects self vs ordinary methods.  `names`/`nNames` are the method names
+ * the command targets.  Updates the LAST matching DefRec (the method's own
+ * definition), so a definition option is overridden by a later export. */
+static void FoldExportScope(DefVec *defs, Tcl_Obj *clsFqn, const Tcl_Token *firstName, Tcl_Size nNames, int wantSelf, int newScope) {
+    Tcl_Size    fqnLen = 0;
+    const char *fqn    = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
+    const Tcl_Token *t = firstName;
+    for (Tcl_Size i = 0; i < nNames; i++) {
+        Tcl_Obj *nm = WordLiteralObj(t);
+        if (nm) {
+            Tcl_Size    nLen = 0;
+            const char *ns   = Tbcx_GetStringFromObjSafe(nm, &nLen);
+            for (Tcl_Size d = defs->n - 1; d >= 0; d--) {
+                DefRec *r = &defs->v[d];
+                if (r->kind != DEF_KIND_INST && r->kind != DEF_KIND_CLASS)
+                    continue;
+                int isSelf = (r->flags & DEF_F_SELF_METHOD) ? 1 : 0;
+                if (isSelf != (wantSelf ? 1 : 0))
+                    continue;
+                Tcl_Size    cLen = 0;
+                const char *cs   = Tbcx_GetStringFromObjSafe(r->cls, &cLen);
+                if (!(cLen == fqnLen && memcmp(cs, fqn, (size_t)fqnLen) == 0))
+                    continue;
+                Tcl_Size    mLen = 0;
+                const char *ms   = Tbcx_GetStringFromObjSafe(r->name, &mLen);
+                if (mLen == nLen && memcmp(ms, ns, (size_t)nLen) == 0) {
+                    r->scope = newScope;
+                    break;
+                }
+            }
+            Tcl_DecrRefCount(nm);
+        }
+        t = NextWord(t);
+    }
+}
+
+static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags) {
     /* Guard against unbounded recursion via nested private blocks */
     if (depth > TBCX_MAX_BLOCK_DEPTH)
         return;
+    int         lexPrivate = (ctxFlags & CAP_CTX_PRIVATE) ? 1 : 0;
+    int         lexSelf    = (ctxFlags & CAP_CTX_SELF) ? 1 : 0;
     Tcl_Parse   p;
     const char *cur    = script;
     Tcl_Size    remain = (len >= 0 ? len : (Tcl_Size)strlen(script));
@@ -3559,8 +3651,8 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                 if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
                     /* Name is always the word after "method"/"classmethod".
                        Args and body are always the last two words.
-                       Any option flags (-export/-private/-unexport) sit
-                       between name and args and are ignored here. */
+                       Option flags (-export/-private/-unexport) sit between
+                       name and args; resolve them into the method scope. */
                     const Tcl_Token *wN = NextWord(w0);
                     const Tcl_Token *t  = w0;
                     for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
@@ -3570,18 +3662,29 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                     Tcl_Obj         *mname = WordLiteralObj(wN);
                     Tcl_Obj         *args  = WordLiteralObj(wA);
                     Tcl_Obj         *body  = WordLiteralObj(wB);
+                    /* options are the words between name and args:
+                       numWords - (keyword + name + args + body) = numWords-4 */
+                    int optScope = MethodScopeFromOptionWords(NextWord(wN), p.numWords - 4);
                     if (mname && args && body) {
                         DefRec r;
                         memset(&r, 0, sizeof(r));
-                        r.kind = (strcmp(kw, "classmethod") == 0) ? DEF_KIND_CLASS : DEF_KIND_INST;
-                        r.cls  = clsFqn;
+                        /* A method/classmethod inside `self { ... }` is a self
+                           method.  classmethod is never a self method. */
+                        int asSelf = (lexSelf && strcmp(kw, "classmethod") != 0) ? 1 : 0;
+                        r.kind     = (strcmp(kw, "classmethod") == 0) ? DEF_KIND_CLASS : DEF_KIND_INST;
+                        if (asSelf)
+                            r.kind = DEF_KIND_CLASS; /* wire-kind set to SELF via flag below */
+                        r.cls = clsFqn;
                         Tcl_IncrRefCount(r.cls);
                         r.name = mname; /* transferred from WordLiteralObj (refcount 1) */
                         r.args = args;  /* transferred from WordLiteralObj (refcount 1) */
                         r.body = body;  /* transferred from WordLiteralObj (refcount 1) */
                         r.ns   = curNs;
                         Tcl_IncrRefCount(r.ns);
-                        r.flags = flags;
+                        r.flags = flags | (asSelf ? DEF_F_SELF_METHOD : 0);
+                        /* Explicit option wins; else lexical `private` makes
+                           it true-private; else name-default. */
+                        r.scope = (optScope != TBCX_MSCOPE_DEFAULT) ? optScope : (lexPrivate ? TBCX_MSCOPE_TRUE_PRIVATE : TBCX_MSCOPE_DEFAULT);
                         DV_Push(defs, r);
                         CS_Add(classes, clsFqn);
                     } else {
@@ -3690,19 +3793,52 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                     }
                 }
                 /* "private { script }" -- recurse into the block to capture
-                   methods/ctors/dtors defined in private context. */
-                else if (strcmp(kw, "private") == 0 && p.numWords >= 2) {
+                   methods/ctors/dtors defined in private (true-private)
+                   context.  "private method/classmethod ..." (inline form,
+                   numWords>=3) is captured directly here so its body is
+                   stubbed rather than leaked verbatim. */
+                else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
                     const Tcl_Token *wBlock = NextWord(w0);
                     Tcl_Obj         *block  = WordLiteralObj(wBlock);
                     if (block) {
                         Tcl_Size    bkLen = 0;
                         const char *bkStr = Tbcx_GetStringFromObjSafe(block, &bkLen);
-                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1);
+                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE);
+                        Tcl_DecrRefCount(block);
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                    /* Inline "private method NAME ?opts? ARGS BODY" (or
+                       classmethod/self method) — recurse over the tail so the
+                       same option/lexical/self handling applies, with the
+                       true-private lexical context set. */
+                    const char *raw    = p.commandStart;
+                    Tcl_Size    rawLen = p.commandSize;
+                    /* Skip the leading "private" word + following whitespace to
+                       get the inner command text. */
+                    const char *inner  = raw;
+                    Tcl_Size    skip   = 0;
+                    while (skip < rawLen && inner[skip] != ' ' && inner[skip] != '\t')
+                        skip++;
+                    while (skip < rawLen && (inner[skip] == ' ' || inner[skip] == '\t'))
+                        skip++;
+                    if (skip < rawLen)
+                        CaptureClassBody(ip, inner + skip, rawLen - skip, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE);
+                }
+                /* "self { script }" block -- recurse with self context so the
+                   inner method/export commands are captured as self methods,
+                   never leaked verbatim. */
+                else if (strcmp(kw, "self") == 0 && p.numWords == 2) {
+                    const Tcl_Token *wBlock = NextWord(w0);
+                    Tcl_Obj         *block  = WordLiteralObj(wBlock);
+                    if (block) {
+                        Tcl_Size    bkLen = 0;
+                        const char *bkStr = Tbcx_GetStringFromObjSafe(block, &bkLen);
+                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_SELF);
                         Tcl_DecrRefCount(block);
                     }
                 }
-                /* Improvement #2: "self method NAME ARGS BODY" -- capture
-                   the body so it can be stubbed, preventing source leakage. */
+                /* "self method NAME ?opts? ARGS BODY" -- capture the body so it
+                   can be stubbed, preventing source leakage, with scope. */
                 else if (strcmp(kw, "self") == 0 && p.numWords >= 5) {
                     const Tcl_Token *wSub   = NextWord(w0);
                     Tcl_Obj         *subCmd = WordLiteralObj(wSub);
@@ -3719,6 +3855,9 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                             Tcl_Obj         *mname = WordLiteralObj(wN);
                             Tcl_Obj         *args  = WordLiteralObj(wA);
                             Tcl_Obj         *body  = WordLiteralObj(wB);
+                            /* options between name and args:
+                               numWords - (self + method + name + args + body) */
+                            int optScope = MethodScopeFromOptionWords(NextWord(wN), p.numWords - 5);
                             if (mname && args && body) {
                                 DefRec r;
                                 memset(&r, 0, sizeof(r));
@@ -3731,6 +3870,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                                 r.ns   = curNs;
                                 Tcl_IncrRefCount(r.ns);
                                 r.flags = flags | DEF_F_SELF_METHOD;
+                                r.scope = (optScope != TBCX_MSCOPE_DEFAULT) ? optScope : (lexPrivate ? TBCX_MSCOPE_TRUE_PRIVATE : TBCX_MSCOPE_DEFAULT);
                                 DV_Push(defs, r);
                                 CS_Add(classes, clsFqn);
                             } else {
@@ -3741,9 +3881,42 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                                 if (body)
                                     Tcl_DecrRefCount(body);
                             }
+                        } else if ((strcmp(subStr, "export") == 0 || strcmp(subStr, "unexport") == 0) && p.numWords >= 3) {
+                            /* self export/unexport NAME... — fold into the
+                               captured self method's scope (the self path has
+                               no verbatim-execution fallback). */
+                            int sc = (strcmp(subStr, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
+                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc);
                         }
                         Tcl_DecrRefCount(subCmd);
                     }
+                }
+                /* "self export/unexport NAME" with exactly 3 words is handled
+                   by the >=5 branch's else-if only when numWords>=5; cover the
+                   3/4-word case here. */
+                else if (strcmp(kw, "self") == 0 && (p.numWords == 3 || p.numWords == 4)) {
+                    const Tcl_Token *wSub   = NextWord(w0);
+                    Tcl_Obj         *subCmd = WordLiteralObj(wSub);
+                    if (subCmd) {
+                        const char *subStr = Tbcx_GetStringSafe(subCmd);
+                        if (strcmp(subStr, "export") == 0 || strcmp(subStr, "unexport") == 0) {
+                            int sc = (strcmp(subStr, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
+                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc);
+                        }
+                        Tcl_DecrRefCount(subCmd);
+                    }
+                }
+                /* In a self-context block, bare "export/unexport NAME" targets
+                   self methods. */
+                else if (lexSelf && (strcmp(kw, "export") == 0 || strcmp(kw, "unexport") == 0) && p.numWords >= 2) {
+                    int sc = (strcmp(kw, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
+                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 1, sc);
+                }
+                /* Ordinary (non-self) "export/unexport NAME..." — fold into the
+                   captured instance/class method scope. */
+                else if ((strcmp(kw, "export") == 0 || strcmp(kw, "unexport") == 0) && p.numWords >= 2) {
+                    int sc = (strcmp(kw, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
+                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 0, sc);
                 }
                 Tcl_DecrRefCount(cmd);
             }
@@ -3752,6 +3925,154 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
         remain = (script + len) - cur;
         Tcl_FreeParse(&p);
     }
+}
+
+/* EmitFlatSelfStubs — emit `oo::define CLS self method NAME ARGS ;` for every
+ * captured self method of clsFqn.  Self methods MUST be installed via these
+ * flat top-level stubs (the load side's create-then-swap requires the self
+ * method to appear as a standalone oo::define call, not nested in a builder
+ * block), so the same emission is used by both the pure (StubLinesForClass)
+ * and non-pure (StubbedBuilderBody) class-rewrite paths.  The visibility scope
+ * travels in the method-record scope byte and is applied at load time. */
+static void EmitFlatSelfStubs(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tcl_Obj *clsFqn) {
+    (void)ip;
+    Tcl_Size    fqnLen = 0;
+    const char *cls    = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
+    for (Tcl_Size i = 0; i < defs->n; i++) {
+        DefRec *r = &defs->v[i];
+        if (!(r->flags & DEF_F_SELF_METHOD))
+            continue;
+        if ((r->flags & DEF_F_FROM_BUILDER) == 0)
+            continue;
+        if (!(r->kind == DEF_KIND_INST || r->kind == DEF_KIND_CLASS))
+            continue;
+        if (r->emitted)
+            continue; /* already written by an earlier class-rewrite call */
+        Tcl_Size    thisLen = 0;
+        const char *thisCls = Tbcx_GetStringFromObjSafe(r->cls, &thisLen);
+        if (!(thisLen == fqnLen && memcmp(thisCls, cls, (size_t)fqnLen) == 0))
+            continue;
+        r->emitted = 1;
+        Tcl_Size    tmp;
+        Tcl_DString ln;
+        Tcl_DStringInit(&ln);
+        Tcl_DStringAppendElement(&ln, "oo::define");
+        Tcl_DStringAppendElement(&ln, cls);
+        Tcl_DStringAppendElement(&ln, "self");
+        Tcl_DStringAppendElement(&ln, "method");
+        Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
+        Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
+        Tcl_DStringAppendElement(&ln, ";");
+        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+        Tcl_DStringAppend(out, "\n", 1);
+        Tcl_DStringFree(&ln);
+    }
+}
+
+/* EmitSelfDeclaratives — for each `self <subcmd> ...` (or `self { block }`)
+ * command in the class body, emit the DECLARATIVE self commands as
+ * `oo::define CLS self <cmd>` lines.  Self method/export/unexport are NOT
+ * emitted (methods become flat stubs via EmitFlatSelfStubs; export/unexport
+ * are folded into the captured method's scope byte), so the original body's
+ * self-method bodies never reach the rewritten script — closing the source
+ * leak while preserving self mixin/variable/filter/forward/class side effects. */
+static void EmitSelfDeclaratives(Tcl_Interp *ip, Tcl_DString *out, Tcl_Obj *clsFqn, const char *body, Tcl_Size bodyLen) {
+    if (!body || bodyLen <= 0)
+        return;
+    const char *cls = Tbcx_GetStringSafe(clsFqn);
+    Tcl_Parse   p;
+    const char *cur    = body;
+    Tcl_Size    remain = bodyLen;
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 2) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = WordLiteralObj(w0);
+            if (cmd && strcmp(CmdCore(Tbcx_GetStringSafe(cmd)), "self") == 0) {
+                const Tcl_Token *wSub   = NextWord(w0);
+                Tcl_Obj         *subObj = wSub ? WordLiteralObj(wSub) : NULL;
+                const char      *sub    = subObj ? Tbcx_GetStringSafe(subObj) : "";
+                if (p.numWords == 2) {
+                    /* self { block } — re-emit non-method/export declaratives. */
+                    Tcl_Obj *block = WordLiteralObj(wSub);
+                    if (block) {
+                        Tcl_Size    blkLen = 0;
+                        const char *blk    = Tbcx_GetStringFromObjSafe(block, &blkLen);
+                        Tcl_Parse   bp;
+                        const char *bc = blk;
+                        Tcl_Size    br = blkLen;
+                        while (br > 0) {
+                            if (Tcl_ParseCommand(ip, bc, br, 0, &bp) != TCL_OK) {
+                                Tcl_FreeParse(&bp);
+                                break;
+                            }
+                            if (bp.numWords >= 1) {
+                                const Tcl_Token *bw0 = bp.tokenPtr;
+                                if (bw0->type == TCL_TOKEN_COMMAND)
+                                    bw0++;
+                                Tcl_Obj    *bcmd = WordLiteralObj(bw0);
+                                const char *bk   = bcmd ? CmdCore(Tbcx_GetStringSafe(bcmd)) : "";
+                                if (bcmd && strcmp(bk, "method") != 0 && strcmp(bk, "export") != 0 && strcmp(bk, "unexport") != 0) {
+                                    const char *rs   = bp.commandStart;
+                                    Tcl_Size    rl   = bp.commandSize;
+                                    while (rl > 0 && (rs[rl - 1] == '\n' || rs[rl - 1] == '\r' || rs[rl - 1] == ' ' || rs[rl - 1] == '\t' || rs[rl - 1] == ';'))
+                                        rl--;
+                                    if (rl > 0) {
+                                        Tcl_DString ln;
+                                        Tcl_DStringInit(&ln);
+                                        Tcl_DStringAppendElement(&ln, "oo::define");
+                                        Tcl_DStringAppendElement(&ln, cls);
+                                        Tcl_DStringAppendElement(&ln, "self");
+                                        Tcl_DStringAppend(&ln, " ", 1);
+                                        Tcl_DStringAppend(&ln, rs, rl);
+                                        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                                        Tcl_DStringAppend(out, "\n", 1);
+                                        Tcl_DStringFree(&ln);
+                                    }
+                                }
+                                if (bcmd)
+                                    Tcl_DecrRefCount(bcmd);
+                            }
+                            bc = bp.commandStart + bp.commandSize;
+                            br = (blk + blkLen) - bc;
+                            Tcl_FreeParse(&bp);
+                        }
+                        Tcl_DecrRefCount(block);
+                    }
+                } else if (strcmp(sub, "method") != 0 && strcmp(sub, "export") != 0 && strcmp(sub, "unexport") != 0) {
+                    /* self <declarative> ... — emit `oo::define CLS self ...`. */
+                    const char *rawStart = p.commandStart;
+                    Tcl_Size    rawLen   = p.commandSize;
+                    while (rawLen > 0 && (rawStart[rawLen - 1] == '\n' || rawStart[rawLen - 1] == '\r' || rawStart[rawLen - 1] == ' ' || rawStart[rawLen - 1] == '\t' || rawStart[rawLen - 1] == ';'))
+                        rawLen--;
+                    if (rawLen > 0) {
+                        Tcl_DString ln;
+                        Tcl_DStringInit(&ln);
+                        Tcl_DStringAppendElement(&ln, "oo::define");
+                        Tcl_DStringAppendElement(&ln, cls);
+                        Tcl_DStringAppend(&ln, " ", 1);
+                        Tcl_DStringAppend(&ln, rawStart, rawLen);
+                        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                        Tcl_DStringAppend(out, "\n", 1);
+                        Tcl_DStringFree(&ln);
+                    }
+                }
+                if (subObj)
+                    Tcl_DecrRefCount(subObj);
+            }
+            if (cmd)
+                Tcl_DecrRefCount(cmd);
+        }
+        cur    = p.commandStart + p.commandSize;
+        remain = (body + bodyLen) - cur;
+        Tcl_FreeParse(&p);
+    }
+    Tcl_ResetResult(ip);
 }
 
 static void StubLinesForClass(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tcl_Obj *clsFqn, const char *body, Tcl_Size bodyLen) {
@@ -3779,24 +4100,15 @@ static void StubLinesForClass(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tc
                     w0++;
                 Tcl_Obj *cmd = WordLiteralObj(w0);
                 if (cmd) {
-                    const char *kw             = CmdCore(Tbcx_GetStringSafe(cmd));
+                    const char *kw = CmdCore(Tbcx_GetStringSafe(cmd));
                     /* Only emit declarative, order-independent keywords.
-                       Improvement #2: skip "self method ..." -- these are
-                       captured in DefVec and emitted with stubbed bodies
-                       in pass 2.  Other self commands (self mixin, etc.)
-                       are still emitted verbatim. */
-                    int         isCapturedSelf = 0;
-                    if (strcmp(kw, "self") == 0 && p.numWords >= 5) {
-                        const Tcl_Token *wSub   = NextWord(w0);
-                        Tcl_Obj         *subObj = WordLiteralObj(wSub);
-                        if (subObj) {
-                            if (strcmp(Tbcx_GetStringSafe(subObj), "method") == 0)
-                                isCapturedSelf = 1;
-                            Tcl_DecrRefCount(subObj);
-                        }
-                    }
-                    if (!isCapturedSelf && (strcmp(kw, "variable") == 0 || strcmp(kw, "superclass") == 0 || strcmp(kw, "mixin") == 0 || strcmp(kw, "filter") == 0 || strcmp(kw, "forward") == 0 ||
-                                            strcmp(kw, "self") == 0)) {
+                       ALL "self ..." commands are handled separately by
+                       EmitSelfDeclaratives / EmitFlatSelfStubs (self methods
+                       become flat stubs, self export/unexport fold into the
+                       scope byte, self declaratives are re-emitted), so they
+                       are never copied verbatim here — that would leak a self
+                       method body and double-define the method. */
+                    if (strcmp(kw, "variable") == 0 || strcmp(kw, "superclass") == 0 || strcmp(kw, "mixin") == 0 || strcmp(kw, "filter") == 0 || strcmp(kw, "forward") == 0) {
                         /* Extract the raw command text from the source and
                            wrap it in oo::define cls <raw command>. */
                         Tcl_Size    cmdLen   = p.commandSize;
@@ -3830,78 +4142,51 @@ static void StubLinesForClass(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tc
         Tcl_ResetResult(ip);
     }
 
-    /* Pass 2: Emit method/ctor/dtor stubs from DefVec.
-       IMPORTANT: Self method stubs must be emitted LAST among all stubs for
-       a class.  The load-side Proc body swap for self methods is invalidated
-       by subsequent oo::define calls (which bump TclOO's class epoch).
-       By emitting self method stubs after ctor/dtor/instance method stubs,
-       the swap happens last and no further epoch bumps follow before the
-       self method is called in the top-level bytecode.
-       Pass 2a: non-SELF stubs.  Pass 2b: SELF stubs. */
-    for (int selfPass = 0; selfPass <= 1; selfPass++) {
-        for (Tcl_Size i = 0; i < defs->n; i++) {
-            DefRec *r = &defs->v[i];
-            if (r->kind == DEF_KIND_PROC)
-                continue;
-            if ((r->flags & DEF_F_FROM_BUILDER) == 0)
-                continue;
-            int isSelf = (r->flags & DEF_F_SELF_METHOD) ? 1 : 0;
-            if (selfPass == 0 && isSelf)
-                continue; /* defer SELF to pass 2b */
-            if (selfPass == 1 && !isSelf)
-                continue; /* already emitted in pass 2a */
-            Tcl_Size    thisLen = 0;
-            const char *thisCls = Tbcx_GetStringFromObjSafe(r->cls, &thisLen);
-            if (!(thisLen == fqnLen && memcmp(thisCls, cls, (size_t)fqnLen) == 0))
-                continue;
+    /* Pass 2: Emit non-self method/ctor/dtor stubs from DefVec. */
+    for (Tcl_Size i = 0; i < defs->n; i++) {
+        DefRec *r = &defs->v[i];
+        if (r->kind == DEF_KIND_PROC)
+            continue;
+        if ((r->flags & DEF_F_FROM_BUILDER) == 0)
+            continue;
+        if (r->flags & DEF_F_SELF_METHOD)
+            continue; /* self methods emitted by EmitFlatSelfStubs below */
+        Tcl_Size    thisLen = 0;
+        const char *thisCls = Tbcx_GetStringFromObjSafe(r->cls, &thisLen);
+        if (!(thisLen == fqnLen && memcmp(thisCls, cls, (size_t)fqnLen) == 0))
+            continue;
 
-            Tcl_DString ln;
-            Tcl_DStringInit(&ln);
-            Tcl_Size tmp;
-            Tcl_DStringAppendElement(&ln, "oo::define");
-            Tcl_DStringAppendElement(&ln, cls);
+        Tcl_DString ln;
+        Tcl_DStringInit(&ln);
+        Tcl_Size tmp;
+        Tcl_DStringAppendElement(&ln, "oo::define");
+        Tcl_DStringAppendElement(&ln, cls);
 
-            if (r->kind == DEF_KIND_INST || r->kind == DEF_KIND_CLASS) {
-                if (r->flags & DEF_F_SELF_METHOD) {
-                    /* Self methods: emit as multi-word oo::define stub with
-                       "self" subcommand:
-                           oo::define CLS self method NAME ARGS ";"
-                       This goes through the define shim (not objdefine), where
-                       procbody substitution works correctly — the same path
-                       used by regular methods like "label".  Using oo::objdefine
-                       instead would fail: the procbody Tcl_Obj doesn't survive
-                       TclOO method chain rebuilds triggered by subclass
-                       "superclass" declarations.
-                       Multi-word form (7 words) is not precompilable by the
-                       instruction scanner, avoiding Bug 5 (self resolving to
-                       global ::self command).
-                       CRITICAL: placeholder body MUST be non-empty (";").
-                       TclOO deletes methods with empty body "". */
-                    /* Keep the "oo::define CLS" prefix already in ln */
-                    Tcl_DStringAppendElement(&ln, "self");
-                    Tcl_DStringAppendElement(&ln, "method");
-                    Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
-                    Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-                    Tcl_DStringAppendElement(&ln, ";");
-                } else {
-                    Tcl_DStringAppendElement(&ln, (r->kind == DEF_KIND_CLASS) ? "classmethod" : "method");
-                    Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
-                    Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-                    Tcl_DStringAppendElement(&ln, "");
-                }
-            } else if (r->kind == DEF_KIND_CTOR) {
-                Tcl_DStringAppendElement(&ln, "constructor");
-                Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-                Tcl_DStringAppendElement(&ln, "");
-            } else if (r->kind == DEF_KIND_DTOR) {
-                Tcl_DStringAppendElement(&ln, "destructor");
-                Tcl_DStringAppendElement(&ln, ";");
-            }
-            Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
-            Tcl_DStringAppend(out, "\n", 1);
-            Tcl_DStringFree(&ln);
+        if (r->kind == DEF_KIND_INST || r->kind == DEF_KIND_CLASS) {
+            Tcl_DStringAppendElement(&ln, (r->kind == DEF_KIND_CLASS) ? "classmethod" : "method");
+            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
+            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
+            Tcl_DStringAppendElement(&ln, "");
+        } else if (r->kind == DEF_KIND_CTOR) {
+            Tcl_DStringAppendElement(&ln, "constructor");
+            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
+            Tcl_DStringAppendElement(&ln, "");
+        } else if (r->kind == DEF_KIND_DTOR) {
+            Tcl_DStringAppendElement(&ln, "destructor");
+            Tcl_DStringAppendElement(&ln, ";");
         }
-    } /* end selfPass loop */
+        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+        Tcl_DStringAppend(out, "\n", 1);
+        Tcl_DStringFree(&ln);
+    }
+
+    /* Self declaratives (mixin/variable/filter/forward/class inside
+       `self ...` or `self { ... }`) then flat self-method stubs.  Self method
+       stubs are emitted LAST: the load-side Proc body swap for self methods is
+       invalidated by subsequent oo::define epoch bumps, so nothing must follow
+       them before the self methods run in the top-level bytecode. */
+    EmitSelfDeclaratives(ip, out, clsFqn, body, bodyLen);
+    EmitFlatSelfStubs(ip, out, defs, clsFqn);
 }
 
 static int IsPureOodefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Size len) {
@@ -4066,30 +4351,63 @@ static Tcl_Obj *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj) {
                     Tcl_DecrRefCount(cmd);
                     goto next_cmd;
                 } else if (strcmp(kw, "private") == 0 && p.numWords >= 2) {
+                    Tcl_Obj *stubbed = NULL;
                     if (p.numWords == 2) {
-                        /* Block form: private { script } — recurse into
-                           the block and emit private { <stubbed> }. */
+                        /* Block form: private { script } — recurse into the
+                           block and emit private { <stubbed> }. */
                         const Tcl_Token *wBlock = NextWord(w0);
                         Tcl_Obj         *block  = WordLiteralObj(wBlock);
                         if (block) {
-                            Tcl_Obj    *stubbed = StubbedBuilderBody(ip, block);
-                            Tcl_DString ln;
-                            Tcl_DStringInit(&ln);
-                            Tcl_DStringAppendElement(&ln, "private");
-                            Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(stubbed));
-                            Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
-                            Tcl_DStringAppend(&out, "\n", 1);
-                            Tcl_DStringFree(&ln);
-                            Tcl_DecrRefCount(stubbed);
+                            stubbed = StubbedBuilderBody(ip, block);
                             Tcl_DecrRefCount(block);
                         }
                     } else {
-                        /* Inline form: private method/ctor/dtor ...
-                           Copy verbatim (it will be captured by the
-                           dynamic probe and handled like any other
-                           method definition). */
-                        Tcl_DStringAppend(&out, p.commandStart, p.commandSize);
+                        /* Inline form: private method/classmethod ... — stub
+                           the body by recursing over the tail (everything after
+                           the leading "private" word) so the method body never
+                           leaks verbatim.  `private self method ...` is stripped
+                           to a flat self stub by the recursion. */
+                        const char *raw  = p.commandStart;
+                        Tcl_Size    rl   = p.commandSize;
+                        Tcl_Size    skip = 0;
+                        while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
+                            skip++;
+                        while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
+                            skip++;
+                        if (skip < rl) {
+                            Tcl_Obj *tail = Tcl_NewStringObj(raw + skip, rl - skip);
+                            Tcl_IncrRefCount(tail);
+                            stubbed = StubbedBuilderBody(ip, tail);
+                            Tcl_DecrRefCount(tail);
+                        }
                     }
+                    if (stubbed) {
+                        Tcl_Size    sl  = 0;
+                        const char *ss  = Tbcx_GetStringFromObjSafe(stubbed, &sl);
+                        /* Emit the private wrapper only when it has real
+                           content; an all-self block stubs to empty. */
+                        Tcl_Size    nb  = sl;
+                        while (nb > 0 && (ss[nb - 1] == ' ' || ss[nb - 1] == '\t' || ss[nb - 1] == '\n' || ss[nb - 1] == '\r' || ss[nb - 1] == ';'))
+                            nb--;
+                        if (nb > 0) {
+                            Tcl_DString ln;
+                            Tcl_DStringInit(&ln);
+                            Tcl_DStringAppendElement(&ln, "private");
+                            Tcl_DStringAppendElement(&ln, ss);
+                            Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                            Tcl_DStringAppend(&out, "\n", 1);
+                            Tcl_DStringFree(&ln);
+                        }
+                        Tcl_DecrRefCount(stubbed);
+                    }
+                    Tcl_DecrRefCount(cmd);
+                    goto next_cmd;
+                } else if (strcmp(kw, "self") == 0) {
+                    /* All self forms (self method / self { block } / self
+                       export/unexport / self declaratives) are handled by
+                       EmitFlatSelfStubs + EmitSelfDeclaratives at the caller,
+                       so strip them here to avoid leaking self method bodies
+                       and double-defining. */
                     Tcl_DecrRefCount(cmd);
                     goto next_cmd;
                 }
@@ -4205,6 +4523,49 @@ typedef struct {
     int          depth;
 } RewriteCtx;
 
+/* EmitStandaloneDefineTail — handle a standalone (non-builder-block)
+ * `oo::define CLS <tail>` whose <tail> defines or modifies methods (the
+ * private/self forms, in inline `private method …`, block `private { … }`,
+ * `self method …`, or block `self { … }` shape).  The tail is processed as a
+ * one-command builder body — equivalent to `oo::define CLS { <tail> }` — so
+ * method bodies are stubbed (no source leak) and the scope byte is set, while
+ * self methods are emitted as flat stubs and self declaratives re-emitted. */
+static void EmitStandaloneDefineTail(RewriteCtx *ctx, Tcl_Obj *clsFqn, Tcl_Obj *cls, const char *tail, Tcl_Size tailLen) {
+    CaptureClassBody(ctx->ip, tail, tailLen, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
+    CS_Add(ctx->classes, clsFqn);
+    if (IsPureOodefineBuilderBody(ctx->ip, tail, tailLen)) {
+        StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, tail, tailLen);
+    } else {
+        Tcl_Obj *tailObj = Tcl_NewStringObj(tail, tailLen);
+        Tcl_IncrRefCount(tailObj);
+        Tcl_Obj    *stubbed = StubbedBuilderBody(ctx->ip, tailObj);
+        Tcl_DString cmdLn;
+        Tcl_DStringInit(&cmdLn);
+        Tcl_DStringAppendElement(&cmdLn, "oo::define");
+        Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(cls));
+        Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(stubbed));
+        Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+        Tcl_DStringAppend(ctx->out, "\n", 1);
+        Tcl_DStringFree(&cmdLn);
+        Tcl_DecrRefCount(stubbed);
+        EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, tail, tailLen);
+        EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
+        Tcl_DecrRefCount(tailObj);
+    }
+}
+
+/* Slice the raw tail text of a command starting at the token `wFrom` through
+ * the end of the parsed command, trimming trailing whitespace/`;`. */
+static const char *CmdTailFromToken(Tcl_Parse *p, const Tcl_Token *wFrom, Tcl_Size *lenOut) {
+    const char *cmdEnd  = p->commandStart + p->commandSize;
+    const char *tail    = wFrom->start;
+    Tcl_Size    tailLen = (Tcl_Size)(cmdEnd - tail);
+    while (tailLen > 0 && (tail[tailLen - 1] == '\n' || tail[tailLen - 1] == '\r' || tail[tailLen - 1] == ' ' || tail[tailLen - 1] == '\t' || tail[tailLen - 1] == ';'))
+        tailLen--;
+    *lenOut = tailLen;
+    return tail;
+}
+
 /* Handle all oo::define, oo::class, oo::objdefine, and metaclass commands.
  * Returns 1 if the command was handled, 0 otherwise.
  * The DString ctx->out is appended with the rewritten command text. */
@@ -4224,11 +4585,18 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             const char *kw     = clsFqn ? Tbcx_GetStringSafe(kwd) : "";
 
             if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p->numWords >= 6) {
+                /* Words: oo::define CLS method NAME ?-option? ARGS BODY.
+                   The name is ALWAYS the word right after the keyword; args/body
+                   are the last two; any option (-export/-private/-unexport) sits
+                   between name and args and is resolved into the scope byte. */
+                const Tcl_Token *wN   = NextWord(wK);
                 const Tcl_Token *tokP = w0;
-                for (Tcl_Size w = 0; w + 3 < p->numWords; w++)
+                for (Tcl_Size w = 0; w + 2 < p->numWords; w++)
                     tokP = NextWord(tokP);
-                const Tcl_Token *wN = tokP, *wA = NextWord(wN), *wB = NextWord(wA);
+                const Tcl_Token *wA = tokP, *wB = NextWord(wA);
                 Tcl_Obj         *mname = WordLiteralObj(wN), *args = WordLiteralObj(wA), *body = WordLiteralObj(wB);
+                /* options between name and args: numWords - (oo::define+cls+kw+name+args+body) */
+                int              optScope = MethodScopeFromOptionWords(NextWord(wN), p->numWords - 6);
                 if (args) {
                     Tcl_Size _d;
                     if (Tcl_ListObjLength(ctx->ip, args, &_d) != TCL_OK) {
@@ -4241,17 +4609,19 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     /* Capture */
                     DefRec r;
                     memset(&r, 0, sizeof(r));
-                    r.kind = (strcmp(kw, "classmethod") == 0 ? DEF_KIND_CLASS : DEF_KIND_INST);
-                    r.cls  = clsFqn;
+                    r.kind  = (strcmp(kw, "classmethod") == 0 ? DEF_KIND_CLASS : DEF_KIND_INST);
+                    r.cls   = clsFqn;
                     Tcl_IncrRefCount(r.cls); /* borrowed: local DecrRefCount at scope end */
-                    r.name = mname;          /* transferred from WordLiteralObj (refcount 1) */
-                    r.args = args;           /* transferred from WordLiteralObj (refcount 1) */
-                    r.body = body;           /* transferred from WordLiteralObj (refcount 1) */
-                    r.ns   = ctx->curNs;
+                    r.name  = mname;         /* transferred from WordLiteralObj (refcount 1) */
+                    r.args  = args;          /* transferred from WordLiteralObj (refcount 1) */
+                    r.body  = body;          /* transferred from WordLiteralObj (refcount 1) */
+                    r.ns    = ctx->curNs;
+                    r.scope = optScope;
                     Tcl_IncrRefCount(r.ns);
                     DV_Push(ctx->defs, r);
                     CS_Add(ctx->classes, clsFqn);
-                    /* Rewrite: stub the body */
+                    /* Rewrite: stub the body (option dropped — scope travels in
+                       the scope byte and is re-applied at load by DefOO). */
                     Tcl_DString line;
                     Tcl_DStringInit(&line);
                     Tcl_DStringAppendElement(&line, "oo::define");
@@ -4328,6 +4698,26 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                         Tcl_DecrRefCount(body);
                 }
             }
+            /* Standalone body-bearing forms:
+                 oo::define CLS self method NAME ?opt? ARGS BODY
+                 oo::define CLS private method|classmethod|self method ... BODY
+                 oo::define CLS private { ... }
+               are equivalent to the one-command builder body
+               `oo::define CLS { <tail> }`; route the tail through the same
+               capture+stub machinery so the body is stubbed (no source leak)
+               and the scope byte is set.  Bodiless self/private forms
+               (self export/unexport, self mixin, …) are left to the verbatim
+               fallback below — they carry no body to leak.  */
+            else if (clsFqn && ((strcmp(kw, "self") == 0 && SelfSubIsMethod(wK)) || strcmp(kw, "private") == 0)) {
+                /* Standalone inline `oo::define CLS self method …` /
+                   `oo::define CLS private method|classmethod … BODY` (numWords>=5
+                   reach here; the bare-block numWords==4 forms are routed by the
+                   dedicated branch below). */
+                Tcl_Size    tailLen = 0;
+                const char *tail    = CmdTailFromToken(p, wK, &tailLen);
+                EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
+                *handled = 1;
+            }
             if (clsFqn)
                 Tcl_DecrRefCount(clsFqn);
             Tcl_DecrRefCount(cls);
@@ -4338,6 +4728,32 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             if (kwd)
                 Tcl_DecrRefCount(kwd);
         }
+    }
+
+    /* ---- oo::define cls private|self { block } / constructor|destructor body
+            (bare-block / body-only standalone forms, numWords == 4) ---- */
+    else if (!*handled && p->numWords == 4 && strcmp(c0, "oo::define") == 0) {
+        const Tcl_Token *wCls = NextWord(w0);
+        Tcl_Obj         *cls  = WordLiteralObj(wCls);
+        const Tcl_Token *wK   = wCls ? NextWord(wCls) : NULL;
+        Tcl_Obj         *kwd  = wK ? WordLiteralObj(wK) : NULL;
+        if (cls && kwd) {
+            const char *kw2 = Tbcx_GetStringSafe(kwd);
+            if (strcmp(kw2, "private") == 0 || strcmp(kw2, "self") == 0 || strcmp(kw2, "constructor") == 0 || strcmp(kw2, "destructor") == 0) {
+                Tcl_Obj *clsFqn = FqnUnder(ctx->ip, ctx->curNs, cls);
+                if (clsFqn) {
+                    Tcl_Size    tailLen = 0;
+                    const char *tail    = CmdTailFromToken(p, wK, &tailLen);
+                    EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
+                    Tcl_DecrRefCount(clsFqn);
+                    *handled = 1;
+                }
+            }
+        }
+        if (cls)
+            Tcl_DecrRefCount(cls);
+        if (kwd)
+            Tcl_DecrRefCount(kwd);
     }
 
     /* ---- oo::define cls { builder body } ---- */
@@ -4352,7 +4768,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 Tcl_Size    bl = 0;
                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
                 /* Capture from builder body */
-                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0);
+                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
                 CS_Add(ctx->classes, clsFqn);
                 /* Rewrite: check purity then stub */
                 if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
@@ -4368,6 +4784,10 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     Tcl_DStringAppend(ctx->out, "\n", 1);
                     Tcl_DStringFree(&cmdLn);
                     Tcl_DecrRefCount(stubbed);
+                    /* Self forms were stripped from the stubbed body; emit them
+                       as flat declarative lines + flat self-method stubs. */
+                    EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
+                    EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
                 }
                 Tcl_DecrRefCount(clsFqn);
                 *handled = 1;
@@ -4401,7 +4821,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                         if (bod) {
                             Tcl_Size    bl = 0;
                             const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
-                            CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0);
+                            CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
                             if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
                                 Tcl_DStringAppendElement(&cmdLn, "");
                                 Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
@@ -4413,6 +4833,8 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                                 Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                                 Tcl_DStringAppend(ctx->out, "\n", 1);
                                 Tcl_DecrRefCount(stubbed);
+                                EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
+                                EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
                             }
                             Tcl_DecrRefCount(bod);
                         } else {
@@ -4516,7 +4938,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                             if (bod) {
                                 Tcl_Size    bl = 0;
                                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
-                                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0);
+                                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
                                 if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
                                     Tcl_DStringAppendElement(&cmdLn, "");
                                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
@@ -4528,6 +4950,8 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                                     Tcl_DStringAppend(ctx->out, "\n", 1);
                                     Tcl_DecrRefCount(stubbed);
+                                    EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
+                                    EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
                                 }
                                 Tcl_DecrRefCount(bod);
                             } else {
@@ -4566,7 +4990,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 Tcl_Size    bl = 0;
                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
                 /* Capture from builder body */
-                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, objFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0);
+                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, objFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
                 CS_Add(ctx->classes, objFqn);
                 /* Rewrite: check purity then stub */
                 if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
@@ -4675,11 +5099,17 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             const char *kw     = objFqn ? Tbcx_GetStringSafe(kwd) : "";
 
             if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p->numWords >= 6) {
+                /* Words: oo::objdefine OBJ method NAME ?-option? ARGS BODY.
+                   Name is the word right after the keyword; args/body are the
+                   last two; options resolve into the scope byte (applied at
+                   load by the objdefine shim). */
+                const Tcl_Token *wN   = NextWord(wK);
                 const Tcl_Token *tokP = w0;
-                for (Tcl_Size w = 0; w + 3 < p->numWords; w++)
+                for (Tcl_Size w = 0; w + 2 < p->numWords; w++)
                     tokP = NextWord(tokP);
-                const Tcl_Token *wN = tokP, *wA = NextWord(wN), *wB = NextWord(wA);
+                const Tcl_Token *wA = tokP, *wB = NextWord(wA);
                 Tcl_Obj         *mname = WordLiteralObj(wN), *args = WordLiteralObj(wA), *body = WordLiteralObj(wB);
+                int              optScope = MethodScopeFromOptionWords(NextWord(wN), p->numWords - 6);
                 if (args) {
                     Tcl_Size _d;
                     if (Tcl_ListObjLength(ctx->ip, args, &_d) != TCL_OK) {
@@ -4691,17 +5121,19 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 if (mname && args && body) {
                     DefRec r;
                     memset(&r, 0, sizeof(r));
-                    r.kind = (strcmp(kw, "classmethod") == 0 ? DEF_KIND_CLASS : DEF_KIND_INST);
-                    r.cls  = objFqn;
+                    r.kind  = (strcmp(kw, "classmethod") == 0 ? DEF_KIND_CLASS : DEF_KIND_INST);
+                    r.cls   = objFqn;
                     Tcl_IncrRefCount(r.cls); /* borrowed: local DecrRefCount at scope end */
-                    r.name = mname;          /* transferred from WordLiteralObj (refcount 1) */
-                    r.args = args;           /* transferred from WordLiteralObj (refcount 1) */
-                    r.body = body;           /* transferred from WordLiteralObj (refcount 1) */
-                    r.ns   = ctx->curNs;
+                    r.name  = mname;         /* transferred from WordLiteralObj (refcount 1) */
+                    r.args  = args;          /* transferred from WordLiteralObj (refcount 1) */
+                    r.body  = body;          /* transferred from WordLiteralObj (refcount 1) */
+                    r.ns    = ctx->curNs;
+                    r.scope = optScope;
                     Tcl_IncrRefCount(r.ns);
                     DV_Push(ctx->defs, r);
                     CS_Add(ctx->classes, objFqn);
-                    /* Rewrite: stub the body */
+                    /* Rewrite: stub the body (option dropped — scope byte
+                       carries it; the objdefine shim re-applies it). */
                     Tcl_DString line;
                     Tcl_DStringInit(&line);
                     Tcl_DStringAppendElement(&line, "oo::objdefine");
@@ -5517,6 +5949,14 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tc
                 if (defs.v[i].flags & DEF_F_SELF_METHOD)
                     wireKind = 4; /* TBCX_METH_SELF */
                 W_U8(w, wireKind);
+            }
+            /* scope byte (v92 amendment): TclOO visibility the loaded method
+               must have — see TBCX_MSCOPE_*.  Ctor/dtor carry DEFAULT. */
+            {
+                uint8_t wireScope = (uint8_t)defs.v[i].scope;
+                if (defs.v[i].kind == DEF_KIND_CTOR || defs.v[i].kind == DEF_KIND_DTOR)
+                    wireScope = TBCX_MSCOPE_DEFAULT;
+                W_U8(w, wireScope);
             }
             /* name (empty for ctor/dtor) */
             if (defs.v[i].kind == DEF_KIND_CTOR || defs.v[i].kind == DEF_KIND_DTOR) {
