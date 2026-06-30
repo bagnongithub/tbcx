@@ -277,11 +277,11 @@ test proc.18 {proc using apply/lambda} -body {
     tbcx::load $out
 } -result {1 4 9 16}
 
-# v92 regression tests: body source preservation, default-strip, info script
+# Body source preservation, default-strip, and info script behaviour.
 # --------------------------------------------------------------------------
 
 # proc.v92.1: with -include-source, info body returns original source
-test proc.v92.1 {v92: -include-source preserves info body round-trip} -body {
+test proc.v92.1 {-include-source preserves info body round-trip} -body {
     set in  [makeFile {
         proc hello {name} {return "Hello, $name!"}
     } v92-1-in.tcl]
@@ -299,7 +299,7 @@ test proc.v92.1 {v92: -include-source preserves info body round-trip} -body {
 
 # proc.v92.2: default (no flag) strips source; loader installs sentinel;
 # proc still executes correctly via the bytecode path
-test proc.v92.2 {v92: default save strips source, proc still runs via sentinel} -body {
+test proc.v92.2 {default save strips source, proc still runs via sentinel} -body {
     set in  [makeFile {
         proc hello {name} {return "Hi $name"}
     } v92-2-in.tcl]
@@ -319,7 +319,7 @@ test proc.v92.2 {v92: default save strips source, proc still runs via sentinel} 
 
 # proc.v92.3: cloning a default-save body into a new proc fails loudly at
 # invocation (the sentinel's `error` line raises)
-test proc.v92.3 {v92: default sentinel fails loudly when cloned} -body {
+test proc.v92.3 {default sentinel fails loudly when cloned} -body {
     set in  [makeFile {
         proc hello {name} {return "Hi $name"}
     } v92-3-in.tcl]
@@ -341,7 +341,7 @@ test proc.v92.3 {v92: default sentinel fails loudly when cloned} -body {
 # proc.v92.4: info script returns the authored source path during tbcx::load
 # (not the .tbcx path, not the outer argv0) — matches source semantics.
 # Independent of source-preservation flag.
-test proc.v92.4 {v92: info script returns authored source path} -body {
+test proc.v92.4 {info script returns authored source path} -body {
     set in  [makeFile {
         set ::captured_info_script [info script]
     } v92-4-in.tcl]
@@ -360,7 +360,7 @@ test proc.v92.4 {v92: info script returns authored source path} -body {
 
 # proc.v92.5: with -include-source, info class definition round-trips
 # the original method body
-test proc.v92.5 {v92: -include-source preserves info class definition round-trip} -body {
+test proc.v92.5 {-include-source preserves info class definition round-trip} -body {
     set in  [makeFile {
         oo::class create Greeter {
             method hi {who} {return "Hi $who"}

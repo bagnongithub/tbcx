@@ -1,7 +1,7 @@
 # -*-Tcl-*-
-# 32-method-scope.test — TclOO method-scope + body-source fidelity (CR 2026-06-12)
+# 32-method-scope.test — TclOO method-scope + body-source fidelity
 #
-# v92 carries a per-method `scope` byte (TBCX_MSCOPE_*) so a method's TclOO
+# Each method record carries a `scope` byte (TBCX_MSCOPE_*) so a method's TclOO
 # visibility — public / unexported / TIP 500 true-private — survives a tbcx
 # save/load, established by its definition options (-export/-private/-unexport),
 # lexical `private`/`self` context, and same-body export/unexport/self-export/
@@ -419,5 +419,671 @@ test scope.ctor.dtor {ctor/dtor + next unaffected} -body {
         [::CDsub new] n
     }
 } -result {base+sub}
+
+# ===========================================================================
+# Braced oo::objdefine builder blocks — per-object method scope round-trip.
+#
+# A non-pure braced object builder (scope option, private{}, inline private,
+# export/unexport) is saved as a stubbed builder body and replayed by
+# PrecompObject, which patches the OBJECT's own method table — never through
+# class-definition (oo::define) machinery, even when the object is a class.
+# Each scopeMatrix case also pins the default-strip / -include-source body
+# source contract.  For unexported vs true-private the probe
+#   "name in [info object methods OBJ -all -private]"
+# distinguishes them: 1 = unexported (still listed), 0 = true-private (hidden).
+# ===========================================================================
+
+# 1. plain block (pure path) — pins the existing plain-method round-trip.
+scopeMatrix scope.objdefine.block.plain {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method a {} {
+            # TBCX_MARK_ODBLK_PLAIN
+            return A
+        }
+        method b {} { return B }
+    }
+    list [::od a] [::od b]
+} TBCX_MARK_ODBLK_PLAIN
+
+# 2. method -export — public call succeeds, source-marker contract honoured.
+scopeMatrix scope.objdefine.block.optexport {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method Pub -export {} {
+            # TBCX_MARK_ODBLK_OPTEXPORT
+            return p
+        }
+    }
+    list [::od Pub] [expr {"Pub" in [info object methods ::od]}]
+} TBCX_MARK_ODBLK_OPTEXPORT
+
+# 3. method -unexport — external call fails, internal [my] works, stays unexported.
+scopeMatrix scope.objdefine.block.optunexport {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method low -unexport {} {
+            # TBCX_MARK_ODBLK_OPTUNEXPORT
+            return h
+        }
+        method useLow {} { return [my low] }
+    }
+    list [catch {::od low}] [::od useLow] [expr {"low" in [info object methods ::od -all -private]}]
+} TBCX_MARK_ODBLK_OPTUNEXPORT
+
+# 4. method -private — TRUE-private (hidden from -all -private), not just unexported.
+scopeMatrix scope.objdefine.block.optprivate {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method sec -private {} {
+            # TBCX_MARK_ODBLK_OPTPRIVATE
+            return s
+        }
+        method useSec {} { return [my sec] }
+    }
+    list [catch {::od sec}] [::od useSec] [expr {"sec" in [info object methods ::od -all -private]}]
+} TBCX_MARK_ODBLK_OPTPRIVATE
+
+# 5. private { ... } block — TRUE-private, no default-mode source leak.
+scopeMatrix scope.objdefine.block.privateblock {
+    oo::object create ::od
+    oo::objdefine ::od {
+        private {
+            method sec {} {
+                # TBCX_MARK_ODBLK_PRIVBLOCK
+                return s
+            }
+        }
+        method useSec {} { return [my sec] }
+    }
+    list [catch {::od sec}] [::od useSec] [expr {"sec" in [info object methods ::od -all -private]}]
+} TBCX_MARK_ODBLK_PRIVBLOCK
+
+# 6. inline private method — same TRUE-private contract as the block form.
+scopeMatrix scope.objdefine.block.inlineprivate {
+    oo::object create ::od
+    oo::objdefine ::od {
+        private method sec {} {
+            # TBCX_MARK_ODBLK_INLINEPRIV
+            return s
+        }
+        method useSec {} { return [my sec] }
+    }
+    list [catch {::od sec}] [::od useSec] [expr {"sec" in [info object methods ::od -all -private]}]
+} TBCX_MARK_ODBLK_INLINEPRIV
+
+# 7. export statement after a PascalCase (default-private) method survives body swap.
+scopeMatrix scope.objdefine.block.exportstmt {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method Mk {} {
+            # TBCX_MARK_ODBLK_EXPORTSTMT
+            return e
+        }
+        export Mk
+    }
+    list [::od Mk] [expr {"Mk" in [info object methods ::od]}]
+} TBCX_MARK_ODBLK_EXPORTSTMT
+
+# 8. unexport statement on a lowercase (default-public) method survives body swap.
+scopeMatrix scope.objdefine.block.unexportstmt {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method low {} {
+            # TBCX_MARK_ODBLK_UNEXPORTSTMT
+            return l
+        }
+        method useLow {} { return [my low] }
+        unexport low
+    }
+    list [catch {::od low}] [::od useLow]
+} TBCX_MARK_ODBLK_UNEXPORTSTMT
+
+# 9. mixed: variable + plain + option-bearing + private{} + export/unexport.
+scopeMatrix scope.objdefine.block.mixed {
+    oo::object create ::od
+    oo::objdefine ::od {
+        variable v
+        method a {} { return A }
+        method B -export {} {
+            # TBCX_MARK_ODBLK_MIXED
+            return b
+        }
+        method c -unexport {} { return C }
+        private { method sec {} { return S } }
+        method useAll {} { return [list [my a] [my sec]] }
+        export a
+        unexport c
+    }
+    list [::od a] [::od B] [catch {::od c}] [::od useAll]
+} TBCX_MARK_ODBLK_MIXED
+
+# 10. mixed scope options + export/unexport in one objdefine builder.
+scopeMatrix scope.objdefine.block.regress {
+    oo::object create ::od
+    oo::objdefine ::od {
+        method Pub  {} { return P }
+        method hide -unexport {} {
+            # TBCX_MARK_ODBLK_REGRESS
+            return H
+        }
+        private { method sec {} { return S } }
+        method useSec {} { return [my sec] }
+        export Pub
+    }
+    list [::od Pub] [catch {::od hide}] [::od useSec]
+} TBCX_MARK_ODBLK_REGRESS
+# source oracle: {P 1 S}
+
+# 11. flat per-object option statement — the method name is objv[3], with any
+# scope option sitting between the name and the args.
+scopeMatrix scope.objdefine.flat.option.parse {
+    oo::object create ::od
+    oo::objdefine ::od method hide -unexport {} {
+        # TBCX_MARK_ODFLAT_OPTPARSE
+        return h
+    }
+    oo::objdefine ::od method useHide {} { return [my hide] }
+    list [catch {::od hide}] [::od useHide] [expr {"hide" in [info object methods ::od -all -private]}]
+} TBCX_MARK_ODFLAT_OPTPARSE
+
+# 12. class-object target — PrecompObject patches the class object's OWN table.
+scopeMatrix scope.objdefine.block.classobject {
+    oo::class create ::C {}
+    oo::objdefine ::C {
+        method ObjM {} {
+            # TBCX_MARK_ODBLK_CLASSOBJ
+            return object-method
+        }
+        export ObjM
+    }
+    ::C ObjM
+} TBCX_MARK_ODBLK_CLASSOBJ
+
+# 13. class-instance method m and class-object method m on the same FQN coexist:
+# each method record carries an origin byte, so they key distinctly at load.
+test scope.objdefine.block.classobject.coexist {class-instance and class-object same-name methods coexist} -body {
+    tbcxRun coexist {
+        oo::class create ::CC { method m {} { return instance } }
+        oo::objdefine ::CC { method m {} { return object } }
+        list [[::CC new] m] [::CC m]
+    }
+} -result {instance object}
+
+# 14. unsupported body-bearing per-object form (oo::objdefine has no `constructor`):
+# the forwarded stubbed builder raises TclOO's own error at load, exactly as plain
+# `source` raises it at runtime — no silent stub-body success.
+test scope.objdefine.block.invalid-kind {unsupported per-object body form fails loudly} -body {
+    set script {
+        oo::object create ::od
+        oo::objdefine ::od { method real {} { return r }; constructor {} {} }
+        ::od real
+    }
+    set want [catch {srcRun $script} sr]
+    set got  [catch {tbcxRun ik $script} tr]
+    list [expr {$want == $got}] $got [string match {*constructor*} $tr]
+} -result {1 1 1}
+
+# 14b. A `self method` inside an oo::objdefine builder is an unrepresentable
+# per-object form (oo::objdefine has no `self method`; sourcing it errors).  The
+# non-pure stub path strips `self` words, so tbcx must reject it loudly at save
+# rather than silently drop the method and load it as a no-op.
+test scope.objdefine.block.self-rejected {self method in objdefine builder rejected at save} -body {
+    set in [makeFile {
+        oo::object create ::o
+        oo::objdefine ::o { method real {} { return r }; self method z {} { return s } }
+    } selfobj-in.tcl]
+    set out [makeFile "" selfobj-out.tbcx]
+    set rc [catch {tbcx::save $in $out} err]
+    list $rc [string match {*self method*oo::objdefine*not representable*} $err]
+} -result {1 1}
+
+# 15b. A runtime-variable objdefine target is left verbatim by the saver (its
+# real bodies run as-is).  When the same artifact ALSO captures a literal-target
+# per-object method (so the OO shim is installed), the verbatim builder must NOT
+# be mis-reported as a missing precompiled body — it has no records to patch.
+scopeMatrix scope.objdefine.block.verbatim-var-target {
+    oo::object create ::cap
+    oo::objdefine ::cap { method m -export {} {
+        # TBCX_MARK_ODBLK_VERBATIM
+        return CAP } }
+    oo::object create ::o
+    set obj ::o
+    oo::objdefine $obj { method foo {} { return F } }
+    list [::cap m] [::o foo]
+} TBCX_MARK_ODBLK_VERBATIM
+
+# 15c. A per-object method with a NON-LITERAL body ([computeBody]) cannot be
+# precompiled.  The braced builder must round-trip it by running it verbatim
+# (like the flat statement / variable-target forms), never silently stub it to a
+# no-op.  Covers both a non-pure block (scope option present) and a pure block.
+test scope.objdefine.block.nonliteral-nonpure {non-literal body in non-pure objdefine block runs verbatim} -body {
+    tbcxRun nlnp {
+        proc gb {} { return {return F} }
+        oo::object create ::o
+        oo::objdefine ::o {
+            method foo -private {} [gb]
+            method use {} { return [my foo] }
+            method bar -export {} { return B }
+        }
+        list [::o use] [::o bar] [catch {::o foo}]
+    }
+} -result {F B 1}
+
+test scope.objdefine.block.nonliteral-pure {non-literal body in pure-looking objdefine block runs verbatim} -body {
+    tbcxRun nlp {
+        proc gb {} { return {return P} }
+        oo::object create ::o
+        oo::objdefine ::o { method foo {} [gb] }
+        ::o foo
+    }
+} -result P
+
+# 15c'. A non-literal method NAME (method $m …) is likewise uncapturable; the
+# braced builder is left verbatim so the method is installed under its real name.
+test scope.objdefine.block.nonliteral-name {non-literal method name in objdefine block runs verbatim} -body {
+    tbcxRun nln {
+        oo::object create ::o
+        oo::objdefine ::o {
+            variable mn
+            set mn foo
+            method $mn -export {} { return N }
+        }
+        ::o foo
+    }
+} -result N
+
+# 15d. Cross-builder: a verbatim (non-literal-body) per-object method must keep
+# its own body even when an earlier captured builder defined the same method name
+# on the same object — the verbatim body is never overwritten by the other
+# builder's precompiled record (last definition wins, matching source).
+test scope.objdefine.block.crossbuilder {verbatim method body not clobbered by another builder's record} -body {
+    tbcxRun xbld {
+        proc gb {} { return {return verb} }
+        oo::object create ::o
+        oo::objdefine ::o { method foo -export {} { return cap } }
+        oo::objdefine ::o { method foo {} [gb] }
+        ::o foo
+    }
+} -result verb
+
+# 15e. Whole-builder verbatim: a builder forced verbatim by one non-literal
+# method may contain a sibling with an empty literal body ({}).  That empty-body
+# sibling must NOT be patched from another builder's same-name record, and an
+# empty-body sibling with no record must NOT trigger a false "missing body" load
+# error.  Both are decided per-builder, not per-method.
+test scope.objdefine.block.verbatim-empty-sibling {empty-body sibling in a verbatim builder is left verbatim} -body {
+    tbcxRun vesib {
+        proc gb {} { return {return verb} }
+        oo::object create ::o
+        oo::objdefine ::o { method shared {} { return cap } }
+        oo::objdefine ::o { method trigger {} [gb]; method shared {} {}; method noop {} {} }
+        list [::o shared] [::o trigger] [::o noop]
+    }
+} -result {{} verb {}}
+
+# 15f. A verbatim builder (runtime-variable target) that redefines a method to a
+# GENUINELY EMPTY body must keep that empty body — it must NOT be re-patched from
+# the earlier captured definition's record.  The stub sentinel distinguishes a
+# tbcx-stubbed body from a real (or empty) verbatim body, so an empty verbatim
+# body is never mistaken for a stub.  Covers braced and flat verbatim targets.
+test scope.objdefine.block.verbatim-empty-redef {empty-body verbatim redefinition is not re-patched (braced)} -body {
+    tbcxRun veredef {
+        oo::object create ::foo
+        oo::objdefine ::foo { method m {} { return 1 } }
+        set o ::foo
+        oo::objdefine $o { method m {} {} }
+        ::foo m
+    }
+} -result {}
+
+test scope.objdefine.flat.verbatim-empty-redef {empty-body verbatim redefinition is not re-patched (flat)} -body {
+    tbcxRun veredefF {
+        oo::object create ::foo
+        oo::objdefine ::foo method m {} { return 1 }
+        set o ::foo
+        oo::objdefine $o method m {} {}
+        ::foo m
+    }
+} -result {}
+
+# 15g. Class builders (oo::define / oo::class create) with a non-literal method
+# name, arg-spec, or body are left VERBATIM — the body runs at load instead of a
+# silent no-op — mirroring the per-object handling.  All-literal class builders
+# are unaffected (still precompiled and, in default mode, source-stripped).
+test scope.classbuilder.nonliteral-body {non-literal class method body runs verbatim} -body {
+    tbcxRun cbnlb {
+        proc gb {} { return {return CB} }
+        oo::class create ::C { method m {} [gb] }
+        [::C new] m
+    }
+} -result CB
+
+test scope.classbuilder.nonliteral-name {non-literal class method name runs verbatim} -body {
+    tbcxRun cbnln {
+        oo::class create ::C { variable n; method [string cat foo] {} { return N } }
+        [::C new] foo
+    }
+} -result N
+
+test scope.classdefine.nonliteral-body {non-literal method body in oo::define builder runs verbatim} -body {
+    tbcxRun cdnlb {
+        proc gb {} { return {return D} }
+        oo::class create ::C {}
+        oo::define ::C { method m {} [gb] }
+        [::C new] m
+    }
+} -result D
+
+# 15. Source policy for the three private per-object forms: default strips the
+# in-body marker, -include-source preserves it, both execute source-equivalently.
+foreach {pol_label pol_marker pol_script} {
+    optprivate TBCX_MARK_POL_OPT {
+        oo::object create ::od
+        oo::objdefine ::od {
+            method sec -private {} {
+                # TBCX_MARK_POL_OPT
+                return s
+            }
+            method useSec {} { return [my sec] }
+        }
+        ::od useSec
+    }
+    privblock TBCX_MARK_POL_BLK {
+        oo::object create ::od
+        oo::objdefine ::od {
+            private {
+                method sec {} {
+                    # TBCX_MARK_POL_BLK
+                    return s
+                }
+            }
+            method useSec {} { return [my sec] }
+        }
+        ::od useSec
+    }
+    inlinepriv TBCX_MARK_POL_INL {
+        oo::object create ::od
+        oo::objdefine ::od {
+            private method sec {} {
+                # TBCX_MARK_POL_INL
+                return s
+            }
+            method useSec {} { return [my sec] }
+        }
+        ::od useSec
+    }
+} {
+    test scope.objdefine.block.source-policy.$pol_label \
+        {default strips marker, -include-source keeps it, both exec equivalent} -body {
+        list \
+            [rawHasMarker sp.$pol_label.d $pol_script "" $pol_marker] \
+            [rawHasMarker sp.$pol_label.i $pol_script -include-source $pol_marker] \
+            [tbcxRun sp.$pol_label.xd $pol_script] \
+            [tbcxRun sp.$pol_label.xi $pol_script -include-source] \
+            [srcRun $pol_script]
+    } -result {0 1 s s s}
+}
+
+# ===========================================================================
+# 16. Interleaved same-key redefinition (P3).  A method record is matched
+# positionally — methodsByKey is a per-key FIFO consumed in definition order —
+# so an observation taken BETWEEN two definitions of the same method sees the
+# body in effect at that point, not the final body.  Affects class-instance,
+# per-object, flat, braced, and constructor redefinitions.
+# ===========================================================================
+test scope.redef.class.interleaved {interleaved class-method redefinition sees correct intermediate} -body {
+    tbcxRun rci {
+        oo::class create ::C
+        oo::define ::C { method m {} { return 1 } }
+        ::C create o
+        set a [o m]
+        oo::define ::C { method m {} { return 2 } }
+        set b [o m]
+        return "$a $b"
+    }
+} -result {1 2}
+
+test scope.redef.object.interleaved {interleaved per-object method redefinition} -body {
+    tbcxRun roi {
+        oo::object create ::o
+        oo::objdefine ::o { method m {} { return 1 } }
+        set a [::o m]
+        oo::objdefine ::o { method m {} { return 2 } }
+        set b [::o m]
+        return "$a $b"
+    }
+} -result {1 2}
+
+test scope.redef.flat.interleaved {interleaved flat class-method redefinition} -body {
+    tbcxRun rfi {
+        oo::class create ::C
+        oo::define ::C method m {} { return 1 }
+        ::C create o
+        set a [o m]
+        oo::define ::C method m {} { return 2 }
+        set b [o m]
+        return "$a $b"
+    }
+} -result {1 2}
+
+test scope.redef.within.builder {within-builder redefinition: last wins (no-regression pin)} -body {
+    tbcxRun rwb {
+        oo::class create ::C { method m {} { return first }; method m {} { return second } }
+        [::C new] m
+    }
+} -result second
+
+test scope.redef.mixed {braced builder then flat redefinition of same method} -body {
+    tbcxRun rmx {
+        oo::class create ::C { method m {} { return braced } }
+        ::C create o
+        set a [o m]
+        oo::define ::C method m {} { return flat }
+        set b [o m]
+        return "$a $b"
+    }
+} -result {braced flat}
+
+test scope.redef.ctor.interleaved {interleaved constructor redefinition (a class object built between two definitions uses the first)} -body {
+    tbcxRun rcti {
+        oo::class create ::C
+        oo::define ::C { constructor {} { set ::ctorv 1 } }
+        ::C create ::o1
+        set a $::ctorv
+        oo::define ::C { constructor {} { set ::ctorv 2 } }
+        ::C create ::o2
+        set b $::ctorv
+        return "$a $b"
+    }
+} -result {1 2}
+
+# Class-instance m and class-object m on the same FQN, EACH redefined, all
+# round-trip independently (origin byte keys them apart; FIFO orders each).
+test scope.redef.classobject.coexist {class-instance and class-object same-name methods both redefine independently} -body {
+    tbcxRun rcoc {
+        oo::class create ::C { method m {} { return inst1 } }
+        oo::objdefine ::C { method m {} { return obj1 } }
+        oo::define ::C { method m {} { return inst2 } }
+        oo::objdefine ::C { method m {} { return obj2 } }
+        list [[::C new] m] [::C m]
+    }
+} -result {inst2 obj2}
+
+# ===========================================================================
+# 17. Narrow-edge verbatim (P4): a STANDALONE `oo::define CLS self method …`,
+# `self { … }`, `private { … }`, or `private method …` whose method body / name /
+# args is non-literal cannot be precompiled.  The whole standalone command is
+# left VERBATIM (bodies run at load), matching `source`, instead of being
+# stubbed to a silent no-op.
+# ===========================================================================
+test scope.standalone.self.method.nonliteral {standalone self method with non-literal body runs verbatim} -body {
+    tbcxRun ssmnl {
+        proc gb {} { return {return SM} }
+        oo::class create ::C {}
+        oo::define ::C self method m {} [gb]
+        ::C m
+    }
+} -result SM
+
+test scope.standalone.self.block.nonliteral {standalone self block with non-literal method body runs verbatim} -body {
+    tbcxRun ssbnl {
+        proc gb {} { return {return SB} }
+        oo::class create ::C {}
+        oo::define ::C self { method m {} [gb] }
+        ::C m
+    }
+} -result SB
+
+test scope.standalone.private.block.nonliteral {standalone private block with non-literal method body runs verbatim} -body {
+    tbcxRun spbnl {
+        proc gb {} { return {return PB} }
+        oo::class create ::C { method use {} { return [my m] } }
+        oo::define ::C private { method m {} [gb] }
+        [::C new] use
+    }
+} -result PB
+
+test scope.standalone.private.inline.nonliteral {standalone inline private method with non-literal body runs verbatim} -body {
+    tbcxRun spinl {
+        proc gb {} { return {return IP} }
+        oo::class create ::C { method use {} { return [my m] } }
+        oo::define ::C private method m {} [gb]
+        [::C new] use
+    }
+} -result IP
+
+# ===========================================================================
+# 18. Export/unexport TIMING.  An `export`/`unexport` STATEMENT in a separate
+# `oo::define`/`oo::objdefine` command must take effect at the command's own
+# position, not at the (earlier) method definition — so a method's visibility
+# observed BETWEEN its definition and a later separate export matches source.
+# (Folding a separate-command export into the method's scope byte would apply it
+# too early.)  Same-command in-body export still folds and round-trips.
+# ===========================================================================
+test scope.export.timing.class {separate-builder class export applies at its own position} -body {
+    tbcxRun extc {
+        oo::class create ::C { method M {} { return 1 } }
+        set b [catch {[::C new] M} e]
+        oo::define ::C { export M }
+        set c [[::C new] M]
+        list $b $c
+    }
+} -result {1 1}
+
+test scope.export.timing.class.redef {redefining a method resets visibility; later export re-applies at its position} -body {
+    tbcxRun extcr {
+        oo::class create ::C { method M {} { return 1 } }
+        oo::define ::C { export M }
+        ::C create o; set a [o M]
+        oo::define ::C { method M {} { return 2 } }
+        set b [catch {o M} e]
+        oo::define ::C { export M }
+        set c [o M]
+        list $a $b $c
+    }
+} -result {1 1 2}
+
+test scope.export.timing.object {separate-builder per-object export applies at its own position} -body {
+    tbcxRun exto {
+        oo::object create ::o
+        oo::objdefine ::o { method M {} { return 1 } }
+        set b [catch {::o M} e]
+        oo::objdefine ::o { export M }
+        set c [::o M]
+        list $b $c
+    }
+} -result {1 1}
+
+test scope.export.timing.unexport {separate-builder unexport applies at its own position} -body {
+    tbcxRun extu {
+        oo::class create ::C { method m {} { return 1 } }
+        ::C create o; set a [o m]
+        oo::define ::C { unexport m }
+        set b [catch {o m} e]
+        list $a $b
+    }
+} -result {1 1}
+
+test scope.export.inbody.still.folds {same-command in-body export still round-trips} -body {
+    tbcxRun exib {
+        oo::class create ::C { method Bar {} { return ok }; export Bar }
+        list [[::C new] Bar] [expr {"Bar" in [info class methods ::C]}]
+    }
+} -result {ok 1}
+
+# ===========================================================================
+# 19. Standalone-flat `oo::define C method m … BODY` with a non-literal body /
+# name is left verbatim (the method runs at load, matching source) — the flat
+# statement form of the class-builder verbatim rule.
+# ===========================================================================
+test scope.standalone.flat.method.nonliteral.body {flat oo::define method with non-literal body runs verbatim} -body {
+    tbcxRun sfmb {
+        proc gb {} { return {return FNB} }
+        oo::class create ::C {}
+        oo::define ::C method m {} [gb]
+        [::C new] m
+    }
+} -result FNB
+
+test scope.standalone.flat.method.nonliteral.name {flat oo::define method with non-literal name runs verbatim} -body {
+    tbcxRun sfmn {
+        oo::class create ::C {}
+        set n foo
+        oo::define ::C method $n {} { return FNN }
+        [::C new] foo
+    }
+} -result FNN
+
+# ===========================================================================
+# 20. Same-builder method MUTATION.  A builder that defines a method and then
+# deletes / renames / forwards-over it IN THE SAME builder is left verbatim, so
+# the mutation runs in source order (positional re-install would otherwise
+# resurrect the removed/renamed/overridden method).  Separate-command mutations
+# and forwards to a different name are unaffected (still precompiled).
+# ===========================================================================
+test scope.mutate.deletemethod.samebuilder {define+delete in same class builder} -body {
+    tbcxRun mdc {
+        oo::class create ::C { method m {} { return A }; deletemethod m }
+        lsort [info class methods ::C]
+    }
+} -result {}
+
+test scope.mutate.renamemethod.samebuilder {define+rename in same class builder} -body {
+    tbcxRun mrc {
+        oo::class create ::C { method a {} { return A }; renamemethod a b }
+        list [lsort [info class methods ::C]] [[::C new] b]
+    }
+} -result {b A}
+
+test scope.mutate.deletemethod.object.samebuilder {define+delete in same oo::objdefine builder} -body {
+    tbcxRun mdo {
+        oo::class create ::C {}
+        oo::objdefine ::C { method m {} { return A }; deletemethod m }
+        info object methods ::C
+    }
+} -result {}
+
+test scope.mutate.forward.override.samebuilder {method then forward-over same name in one builder} -body {
+    tbcxRun mfo {
+        oo::class create ::C { method m {} { return real }; forward m ::tcl::mathfunc::max 1 2 }
+        [::C new] m
+    }
+} -result 2
+
+test scope.mutate.deletemethod.separatebuilder {define then delete in a SEPARATE command still round-trips} -body {
+    tbcxRun mds {
+        oo::class create ::C { method m {} { return A } }
+        oo::define ::C { deletemethod m }
+        info class methods ::C
+    }
+} -result {}
+
+test scope.mutate.forward.diffname.precompiled {forward to a different name round-trips and stays precompiled} -body {
+    tbcxRun mfd {
+        oo::class create ::C { method real {a b} { return [expr {$a + $b}] }; forward add my real }
+        list [[::C new] add 3 4] [[::C new] real 1 2]
+    }
+} -result {7 3}
 
 cleanupTests

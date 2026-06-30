@@ -108,6 +108,12 @@ typedef struct {
 
 #define DEF_F_FROM_BUILDER 0x01
 #define DEF_F_SELF_METHOD 0x02 /* self method (class-level, emitted differently in stubs) */
+#define DEF_F_OBJDEFINE 0x04   /* captured from oo::objdefine (object-definition
+                                * origin) rather than oo::define/oo::class.  Drives
+                                * the per-record origin byte written to the methods
+                                * table, so the loader keys class-instance and
+                                * per-object methods distinctly (and they coexist).
+                                * Also gates the self-method-in-objdefine reject. */
 
 /* Lexical-context bits threaded through CaptureClassBody recursion so a
  * method captured inside a `private { ... }` block becomes true-private and
@@ -132,7 +138,7 @@ typedef struct {
  * ========================================================================== */
 
 static Tcl_Obj                *CanonTrivia(Tcl_Obj *in);
-static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags);
+static void                    CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags, Tcl_Size foldStartIdx);
 static Tcl_Obj                *CaptureAndRewriteScript(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, DefVec *defs, ClsSet *classes, int depth);
 static inline const char      *CmdCore(const char *s);
 static int                     CmpJTEntryUtf8_qsort(const void *pa, const void *pb);
@@ -164,6 +170,8 @@ static void                    DV_Push(DefVec *dv, DefRec r);
 static int                     EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tcl_Obj *sourcePath);
 static Tcl_Obj                *FqnUnder(Tcl_Interp *ip, Tcl_Obj *curNs, Tcl_Obj *name);
 static int                     IsPureOodefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Size len);
+static int                     IsPureObjdefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Size len);
+static int                     ObjdefineBuilderHasNonLiteralMethod(Tcl_Interp *ip, const char *script, Tcl_Size len, int depth);
 static void                    Lit_Bignum(TbcxOut *w, Tcl_Obj *o);
 static void                    Lit_Bytecode(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *bcObj);
 static void                    Lit_Dict(TbcxOut *w, TbcxCtx *ctx, Tcl_Obj *o);
@@ -3594,7 +3602,7 @@ static int MethodScopeFromOptionWords(const Tcl_Token *firstOpt, Tcl_Size nOpts)
  * selects self vs ordinary methods.  `names`/`nNames` are the method names
  * the command targets.  Updates the LAST matching DefRec (the method's own
  * definition), so a definition option is overridden by a later export. */
-static void FoldExportScope(DefVec *defs, Tcl_Obj *clsFqn, const Tcl_Token *firstName, Tcl_Size nNames, int wantSelf, int newScope) {
+static void FoldExportScope(DefVec *defs, Tcl_Obj *clsFqn, const Tcl_Token *firstName, Tcl_Size nNames, int wantSelf, int newScope, Tcl_Size foldStartIdx) {
     Tcl_Size    fqnLen = 0;
     const char *fqn    = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
     const Tcl_Token *t = firstName;
@@ -3609,6 +3617,20 @@ static void FoldExportScope(DefVec *defs, Tcl_Obj *clsFqn, const Tcl_Token *firs
                     continue;
                 int isSelf = (r->flags & DEF_F_SELF_METHOD) ? 1 : 0;
                 if (isSelf != (wantSelf ? 1 : 0))
+                    continue;
+                /* A non-self (class-instance/class) `export`/`unexport` STATEMENT
+                   may only fold into a method defined by the SAME builder
+                   (records at index >= foldStartIdx).  An export in a SEPARATE
+                   `oo::define` command is order-dependent: applying it to an
+                   earlier builder's method record would export the method at its
+                   definition time, before the export statement actually runs, so
+                   an observation taken between the two commands would see the
+                   wrong visibility.  Such cross-builder exports instead apply at
+                   the export command's own position — the statement is forwarded
+                   verbatim in the stubbed builder and the post-swap visibility
+                   restore (PrecompClass) preserves it.  Self methods have no such
+                   restore path, so they keep the whole-history fold. */
+                if (!wantSelf && d < foldStartIdx)
                     continue;
                 Tcl_Size    cLen = 0;
                 const char *cs   = Tbcx_GetStringFromObjSafe(r->cls, &cLen);
@@ -3627,7 +3649,11 @@ static void FoldExportScope(DefVec *defs, Tcl_Obj *clsFqn, const Tcl_Token *firs
     }
 }
 
-static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags) {
+static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_Obj *curNs, Tcl_Obj *clsFqn, DefVec *defs, ClsSet *classes, int flags, int depth, int ctxFlags, Tcl_Size foldStartIdx) {
+    /* foldStartIdx is the defs index where THIS builder's records begin (passed
+       by the top-level caller as defs->n, then threaded unchanged through nested
+       private/self recursion), so a class export/unexport statement folds only
+       into methods this same builder defined. */
     /* Guard against unbounded recursion via nested private blocks */
     if (depth > TBCX_MAX_BLOCK_DEPTH)
         return;
@@ -3803,7 +3829,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                     if (block) {
                         Tcl_Size    bkLen = 0;
                         const char *bkStr = Tbcx_GetStringFromObjSafe(block, &bkLen);
-                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE);
+                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE, foldStartIdx);
                         Tcl_DecrRefCount(block);
                     }
                 } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
@@ -3822,7 +3848,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                     while (skip < rawLen && (inner[skip] == ' ' || inner[skip] == '\t'))
                         skip++;
                     if (skip < rawLen)
-                        CaptureClassBody(ip, inner + skip, rawLen - skip, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE);
+                        CaptureClassBody(ip, inner + skip, rawLen - skip, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_PRIVATE, foldStartIdx);
                 }
                 /* "self { script }" block -- recurse with self context so the
                    inner method/export commands are captured as self methods,
@@ -3833,7 +3859,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                     if (block) {
                         Tcl_Size    bkLen = 0;
                         const char *bkStr = Tbcx_GetStringFromObjSafe(block, &bkLen);
-                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_SELF);
+                        CaptureClassBody(ip, bkStr, bkLen, curNs, clsFqn, defs, classes, flags, depth + 1, ctxFlags | CAP_CTX_SELF, foldStartIdx);
                         Tcl_DecrRefCount(block);
                     }
                 }
@@ -3886,7 +3912,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                                captured self method's scope (the self path has
                                no verbatim-execution fallback). */
                             int sc = (strcmp(subStr, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
-                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc);
+                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc, foldStartIdx);
                         }
                         Tcl_DecrRefCount(subCmd);
                     }
@@ -3901,7 +3927,7 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                         const char *subStr = Tbcx_GetStringSafe(subCmd);
                         if (strcmp(subStr, "export") == 0 || strcmp(subStr, "unexport") == 0) {
                             int sc = (strcmp(subStr, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
-                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc);
+                            FoldExportScope(defs, clsFqn, NextWord(wSub), p.numWords - 2, 1, sc, foldStartIdx);
                         }
                         Tcl_DecrRefCount(subCmd);
                     }
@@ -3910,13 +3936,13 @@ static void CaptureClassBody(Tcl_Interp *ip, const char *script, Tcl_Size len, T
                    self methods. */
                 else if (lexSelf && (strcmp(kw, "export") == 0 || strcmp(kw, "unexport") == 0) && p.numWords >= 2) {
                     int sc = (strcmp(kw, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
-                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 1, sc);
+                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 1, sc, foldStartIdx);
                 }
                 /* Ordinary (non-self) "export/unexport NAME..." — fold into the
                    captured instance/class method scope. */
                 else if ((strcmp(kw, "export") == 0 || strcmp(kw, "unexport") == 0) && p.numWords >= 2) {
                     int sc = (strcmp(kw, "export") == 0) ? TBCX_MSCOPE_PUBLIC : TBCX_MSCOPE_UNEXPORTED;
-                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 0, sc);
+                    FoldExportScope(defs, clsFqn, NextWord(w0), p.numWords - 1, 0, sc, foldStartIdx);
                 }
                 Tcl_DecrRefCount(cmd);
             }
@@ -3962,7 +3988,10 @@ static void EmitFlatSelfStubs(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tc
         Tcl_DStringAppendElement(&ln, "method");
         Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
         Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-        Tcl_DStringAppendElement(&ln, ";");
+        /* Stub body: the sentinel, uniform with every other method form, so the
+           loader's "patch iff forwarded body == sentinel" gate recognises it and
+           never mistakes a verbatim self method for a stub. */
+        Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
         Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
         Tcl_DStringAppend(out, "\n", 1);
         Tcl_DStringFree(&ln);
@@ -4142,42 +4171,91 @@ static void StubLinesForClass(Tcl_Interp *ip, Tcl_DString *out, DefVec *defs, Tc
         Tcl_ResetResult(ip);
     }
 
-    /* Pass 2: Emit non-self method/ctor/dtor stubs from DefVec. */
-    for (Tcl_Size i = 0; i < defs->n; i++) {
-        DefRec *r = &defs->v[i];
-        if (r->kind == DEF_KIND_PROC)
-            continue;
-        if ((r->flags & DEF_F_FROM_BUILDER) == 0)
-            continue;
-        if (r->flags & DEF_F_SELF_METHOD)
-            continue; /* self methods emitted by EmitFlatSelfStubs below */
-        Tcl_Size    thisLen = 0;
-        const char *thisCls = Tbcx_GetStringFromObjSafe(r->cls, &thisLen);
-        if (!(thisLen == fqnLen && memcmp(thisCls, cls, (size_t)fqnLen) == 0))
-            continue;
-
-        Tcl_DString ln;
-        Tcl_DStringInit(&ln);
-        Tcl_Size tmp;
-        Tcl_DStringAppendElement(&ln, "oo::define");
-        Tcl_DStringAppendElement(&ln, cls);
-
-        if (r->kind == DEF_KIND_INST || r->kind == DEF_KIND_CLASS) {
-            Tcl_DStringAppendElement(&ln, (r->kind == DEF_KIND_CLASS) ? "classmethod" : "method");
-            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->name, &tmp));
-            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-            Tcl_DStringAppendElement(&ln, "");
-        } else if (r->kind == DEF_KIND_CTOR) {
-            Tcl_DStringAppendElement(&ln, "constructor");
-            Tcl_DStringAppendElement(&ln, Tbcx_GetStringFromObjSafe(r->args, &tmp));
-            Tcl_DStringAppendElement(&ln, "");
-        } else if (r->kind == DEF_KIND_DTOR) {
-            Tcl_DStringAppendElement(&ln, "destructor");
-            Tcl_DStringAppendElement(&ln, ";");
+    /* Pass 2: emit a flat stub line for each non-self method/ctor/dtor defined
+       IN THIS builder body.  Parsing the body (rather than iterating the shared
+       DefVec) keeps emission builder-scoped: a class touched by several
+       commands does not re-stub an earlier command's methods, which would make
+       the load side over-consume their precompiled FIFO records.  Self forms
+       are skipped — EmitFlatSelfStubs emits them; `private` never appears (a
+       pure builder rejects it).  Every stub body is the sentinel, uniform with
+       all method forms, so the loader gates installation on "forwarded body ==
+       sentinel"; the sentinel is non-empty, so a stubbed ctor/dtor is not
+       treated as a deletion.  All names/args here are literals (a non-literal
+       method already forced the whole builder verbatim before this runs).  Each
+       statement's args are advisory — the loader installs from the precompiled
+       record's args, not the stub's. */
+    if (body && bodyLen > 0) {
+        Tcl_Parse   p;
+        const char *cur    = body;
+        Tcl_Size    remain = bodyLen;
+        while (remain > 0) {
+            if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+                Tcl_FreeParse(&p);
+                break;
+            }
+            if (p.numWords >= 1) {
+                const Tcl_Token *w0 = p.tokenPtr;
+                if (w0->type == TCL_TOKEN_COMMAND)
+                    w0++;
+                Tcl_Obj *cmd = WordLiteralObj(w0);
+                if (cmd) {
+                    const char *kw   = CmdCore(Tbcx_GetStringSafe(cmd));
+                    int         emit = 0;
+                    Tcl_DString ln;
+                    Tcl_DStringInit(&ln);
+                    Tcl_DStringAppendElement(&ln, "oo::define");
+                    Tcl_DStringAppendElement(&ln, cls);
+                    if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+                        const Tcl_Token *wN = NextWord(w0);
+                        const Tcl_Token *t  = w0;
+                        for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                            t = NextWord(t);
+                        Tcl_Obj *mname = WordLiteralObj(wN);
+                        Tcl_Obj *args  = WordLiteralObj(t);
+                        if (mname && args) {
+                            Tcl_DStringAppendElement(&ln, kw);
+                            Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(mname));
+                            Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(args));
+                            Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
+                            emit = 1;
+                        }
+                        if (mname)
+                            Tcl_DecrRefCount(mname);
+                        if (args)
+                            Tcl_DecrRefCount(args);
+                    } else if (strcmp(kw, "constructor") == 0 && p.numWords >= 2) {
+                        const Tcl_Token *wArgs = NULL;
+                        if (p.numWords >= 3) {
+                            const Tcl_Token *pre = w0;
+                            for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                                pre = NextWord(pre);
+                            wArgs = pre;
+                        }
+                        Tcl_Obj *args = wArgs ? WordLiteralObj(wArgs) : NULL;
+                        Tcl_DStringAppendElement(&ln, "constructor");
+                        Tcl_DStringAppendElement(&ln, args ? Tbcx_GetStringSafe(args) : "");
+                        Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
+                        emit = 1;
+                        if (args)
+                            Tcl_DecrRefCount(args);
+                    } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
+                        Tcl_DStringAppendElement(&ln, "destructor");
+                        Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
+                        emit = 1;
+                    }
+                    if (emit) {
+                        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
+                        Tcl_DStringAppend(out, "\n", 1);
+                    }
+                    Tcl_DStringFree(&ln);
+                    Tcl_DecrRefCount(cmd);
+                }
+            }
+            cur    = p.commandStart + p.commandSize;
+            remain = (body + bodyLen) - cur;
+            Tcl_FreeParse(&p);
         }
-        Tcl_DStringAppend(out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
-        Tcl_DStringAppend(out, "\n", 1);
-        Tcl_DStringFree(&ln);
+        Tcl_ResetResult(ip);
     }
 
     /* Self declaratives (mixin/variable/filter/forward/class inside
@@ -4258,6 +4336,377 @@ static int IsPureOodefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Siz
     return 1;
 }
 
+/* IsPureObjdefineBuilderBody — purity predicate for an `oo::objdefine OBJ { … }`
+ * braced builder body.  It is deliberately STRICTER than the class predicate
+ * (IsPureOodefineBuilderBody): the only body-bearing form a pure object builder
+ * may contain is a plain per-object method `method NAME ARGS BODY` with no
+ * scope option.  When the predicate returns 1 the saver expands the block into
+ * flat `oo::objdefine OBJ method NAME ARGS ""` statements (each precompiled,
+ * stubbed, and name-case-scoped at load by the flat objdefine shim path).  When
+ * it returns 0 the saver emits a single stubbed builder body that the loader
+ * replays through PrecompObject, which patches the object's own method table
+ * while honouring options, private scope, and export/unexport.
+ *
+ * Non-pure (route through StubbedBuilderBody + PrecompObject):
+ *   - `method NAME -export|-unexport|-private ARGS BODY` (any scope option),
+ *   - `private { … }` and inline `private method …`,
+ *   - `export …` / `unexport …` (order- and existence-dependent),
+ *   - `deletemethod …` / `renamemethod …`.
+ * Treated as non-pure so TclOO raises the source-equivalent error during the
+ * forwarded replay (these are not valid per-object body forms, never installed
+ * as object methods):
+ *   - `classmethod …`, `constructor …`, `destructor …`, `self method …`.
+ * Declarative object commands that carry no method body and are order-
+ * independent (`variable`, `mixin`, `filter`, `forward`, `class`) stay pure and
+ * are copied verbatim by the expansion path. */
+static int IsPureObjdefineBuilderBody(Tcl_Interp *ip, const char *script, Tcl_Size len) {
+    Tcl_Parse   p;
+    const char *cur    = script;
+    Tcl_Size    remain = (len >= 0 ? len : (Tcl_Size)strlen(script));
+
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            /* Be conservative: on parse error, do not treat as pure. */
+            Tcl_FreeParse(&p);
+            return 0;
+        }
+        if (p.numWords == 0) {
+            cur    = p.commandStart + p.commandSize;
+            remain = (script + len) - cur;
+            Tcl_FreeParse(&p);
+            continue;
+        }
+
+        const Tcl_Token *w0 = p.tokenPtr;
+        if (w0->type == TCL_TOKEN_COMMAND)
+            w0++;
+
+        Tcl_Obj *cmd = WordLiteralObj(w0);
+        if (!cmd) {
+            Tcl_FreeParse(&p);
+            return 0;
+        }
+        const char *core = CmdCore(Tbcx_GetStringSafe(cmd));
+
+        int         ok   = 0;
+        if (strcmp(core, "method") == 0) {
+            /* Plain per-object method only: exactly `method NAME ARGS BODY`.
+               A scope option sits between NAME and ARGS, lifting the word count
+               above 4, which forces the non-pure (PrecompObject) path. */
+            ok = (p.numWords == 4);
+        } else if (strcmp(core, "variable") == 0 || strcmp(core, "mixin") == 0 || strcmp(core, "filter") == 0 || strcmp(core, "forward") == 0 || strcmp(core, "class") == 0) {
+            /* Declarative, order-independent, no method body — copy verbatim. */
+            ok = (p.numWords >= 2);
+        } else {
+            /* method-with-option, private, export, unexport, deletemethod,
+               renamemethod, classmethod, constructor, destructor, self, and any
+               unrecognised subcommand all break purity. */
+            ok = 0;
+        }
+        Tcl_DecrRefCount(cmd);
+        if (!ok) {
+            Tcl_FreeParse(&p);
+            return 0;
+        }
+
+        cur    = p.commandStart + p.commandSize;
+        remain = (script + len) - cur;
+        Tcl_FreeParse(&p);
+    }
+    return 1;
+}
+
+/* CollectMutationScan — walk a class/object builder body, recording every
+ * method/classmethod NAME it defines (into methodNames) and every `forward`
+ * NAME (into forwardNames), and raising *sawDelRename on any `deletemethod`/
+ * `renamemethod`.  Recurses `private { … }`, inline `private …`, and `self { … }`
+ * blocks and the `self method`/`self forward`/`self deletemethod` forms. */
+static void CollectMutationScan(Tcl_Interp *ip, const char *script, Tcl_Size len, Tcl_HashTable *methodNames, Tcl_HashTable *forwardNames, int *sawDelRename, int depth) {
+    if (depth > TBCX_MAX_BLOCK_DEPTH)
+        return;
+    Tcl_Parse   p;
+    const char *cur    = script;
+    Tcl_Size    remain = (len >= 0 ? len : (Tcl_Size)strlen(script));
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 1) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = WordLiteralObj(w0);
+            if (cmd) {
+                const char *kw = CmdCore(Tbcx_GetStringSafe(cmd));
+                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+                    Tcl_Obj *nm = WordLiteralObj(NextWord(w0));
+                    if (nm) {
+                        int isNew;
+                        Tcl_CreateHashEntry(methodNames, Tbcx_GetStringSafe(nm), &isNew);
+                        Tcl_DecrRefCount(nm);
+                    }
+                } else if (strcmp(kw, "forward") == 0 && p.numWords >= 3) {
+                    Tcl_Obj *nm = WordLiteralObj(NextWord(w0));
+                    if (nm) {
+                        int isNew;
+                        Tcl_CreateHashEntry(forwardNames, Tbcx_GetStringSafe(nm), &isNew);
+                        Tcl_DecrRefCount(nm);
+                    }
+                } else if (strcmp(kw, "deletemethod") == 0 || strcmp(kw, "renamemethod") == 0) {
+                    if (sawDelRename)
+                        *sawDelRename = 1;
+                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
+                    Tcl_Obj *blk = WordLiteralObj(NextWord(w0));
+                    if (blk) {
+                        Tcl_Size    bl = 0;
+                        const char *bs = Tbcx_GetStringFromObjSafe(blk, &bl);
+                        CollectMutationScan(ip, bs, bl, methodNames, forwardNames, sawDelRename, depth + 1);
+                        Tcl_DecrRefCount(blk);
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                    const char *raw  = p.commandStart;
+                    Tcl_Size    rl   = p.commandSize;
+                    Tcl_Size    skip = 0;
+                    while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
+                        skip++;
+                    while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
+                        skip++;
+                    if (skip < rl)
+                        CollectMutationScan(ip, raw + skip, rl - skip, methodNames, forwardNames, sawDelRename, depth + 1);
+                } else if (strcmp(kw, "self") == 0 && p.numWords == 2) {
+                    Tcl_Obj *blk = WordLiteralObj(NextWord(w0));
+                    if (blk) {
+                        Tcl_Size    bl = 0;
+                        const char *bs = Tbcx_GetStringFromObjSafe(blk, &bl);
+                        CollectMutationScan(ip, bs, bl, methodNames, forwardNames, sawDelRename, depth + 1);
+                        Tcl_DecrRefCount(blk);
+                    }
+                } else if (strcmp(kw, "self") == 0 && p.numWords >= 3) {
+                    const Tcl_Token *wSub = NextWord(w0);
+                    Tcl_Obj         *sub  = WordLiteralObj(wSub);
+                    if (sub) {
+                        const char *ss = CmdCore(Tbcx_GetStringSafe(sub));
+                        if ((strcmp(ss, "method") == 0 || strcmp(ss, "classmethod") == 0) && p.numWords >= 5) {
+                            Tcl_Obj *nm = WordLiteralObj(NextWord(wSub));
+                            if (nm) {
+                                int isNew;
+                                Tcl_CreateHashEntry(methodNames, Tbcx_GetStringSafe(nm), &isNew);
+                                Tcl_DecrRefCount(nm);
+                            }
+                        } else if (strcmp(ss, "forward") == 0 && p.numWords >= 4) {
+                            Tcl_Obj *nm = WordLiteralObj(NextWord(wSub));
+                            if (nm) {
+                                int isNew;
+                                Tcl_CreateHashEntry(forwardNames, Tbcx_GetStringSafe(nm), &isNew);
+                                Tcl_DecrRefCount(nm);
+                            }
+                        } else if (strcmp(ss, "deletemethod") == 0 || strcmp(ss, "renamemethod") == 0) {
+                            if (sawDelRename)
+                                *sawDelRename = 1;
+                        }
+                        Tcl_DecrRefCount(sub);
+                    }
+                }
+                Tcl_DecrRefCount(cmd);
+            }
+        }
+        cur    = p.commandStart + p.commandSize;
+        remain = (script + len) - cur;
+        Tcl_FreeParse(&p);
+    }
+}
+
+/* BuilderMutatesOwnMethod — 1 if a class/object builder body DEFINES a method
+ * and then deletes, renames, or forwards-over it within the SAME builder.  tbcx
+ * replays method bodies positionally and (for pure builders) emits declaratives
+ * around method stubs, then re-installs each precompiled method, so a
+ * same-builder mutation of a just-defined method would be UNDONE at load (the
+ * deleted/renamed/overridden method resurrected with its precompiled body).
+ * When this returns 1 the caller leaves the whole builder verbatim so the
+ * mutation runs in source order, matching `source`.  `deletemethod`/
+ * `renamemethod` are method-mutating and rare, so any occurrence forces
+ * verbatim; a `forward` is common (delegation to a different name), so it forces
+ * verbatim only when its name collides with a method this same builder defines.
+ * Separate-command mutations (a `deletemethod` in its own `oo::define`) are
+ * unaffected by the reinstall and continue to round-trip whether or not this
+ * fires. */
+static int BuilderMutatesOwnMethod(Tcl_Interp *ip, const char *script, Tcl_Size len) {
+    Tcl_HashTable methodNames, forwardNames;
+    Tcl_InitHashTable(&methodNames, TCL_STRING_KEYS);
+    Tcl_InitHashTable(&forwardNames, TCL_STRING_KEYS);
+    int sawDelRename = 0;
+    CollectMutationScan(ip, script, len, &methodNames, &forwardNames, &sawDelRename, 0);
+    int res = sawDelRename;
+    if (!res) {
+        Tcl_HashSearch s;
+        Tcl_HashEntry *e;
+        for (e = Tcl_FirstHashEntry(&forwardNames, &s); e && !res; e = Tcl_NextHashEntry(&s)) {
+            const char *fn = (const char *)Tcl_GetHashKey(&forwardNames, e);
+            if (fn && Tcl_FindHashEntry(&methodNames, fn))
+                res = 1;
+        }
+    }
+    Tcl_DeleteHashTable(&methodNames);
+    Tcl_DeleteHashTable(&forwardNames);
+    return res;
+}
+
+/* ObjdefineBuilderHasNonLiteralMethod — return 1 if a braced class/object
+ * builder must be left VERBATIM.  Two reasons: (a) any per-object/class method
+ * has a NAME, arg-spec, or body that is NOT a static literal (e.g.
+ * `method m {} [computeBody]` or `method m $argv {…}`) — it cannot be
+ * precompiled, and the stub/expand paths would turn it into a no-op at load; or
+ * (b) the builder defines a method and then mutates it in place (deletemethod /
+ * renamemethod / forward-over-its-own-method), which the positional re-install
+ * would otherwise undo (see BuilderMutatesOwnMethod).  When this returns 1 the
+ * caller leaves the whole builder verbatim (bodies run as ordinary code at
+ * load), matching how the flat `oo::objdefine OBJ method …` statement and the
+ * runtime-variable-target builder are already handled.  Recurses through
+ * `private { … }` and inline `private method …`. */
+static int ObjdefineBuilderHasNonLiteralMethod(Tcl_Interp *ip, const char *script, Tcl_Size len, int depth) {
+    if (depth == 0 && BuilderMutatesOwnMethod(ip, script, len))
+        return 1; /* same-builder method mutation — leave verbatim */
+    if (depth > TBCX_MAX_BLOCK_DEPTH)
+        return 1; /* too deep to introspect safely — treat as non-literal (verbatim) */
+    Tcl_Parse   p;
+    const char *cur    = script;
+    Tcl_Size    remain = (len >= 0 ? len : (Tcl_Size)strlen(script));
+    int         found  = 0;
+    while (remain > 0 && !found) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 1) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = WordLiteralObj(w0);
+            if (cmd) {
+                const char *kw = CmdCore(Tbcx_GetStringSafe(cmd));
+                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+                    /* name = word after keyword; args = 2nd-last; body = last.
+                       Capture requires all three to be literals (see
+                       CaptureClassBody); a non-literal name (`method $m …`),
+                       arg-spec, or body means the method cannot be captured, so
+                       the whole builder must be left verbatim. */
+                    Tcl_Obj         *name = WordLiteralObj(NextWord(w0));
+                    if (!name)
+                        found = 1;
+                    else
+                        Tcl_DecrRefCount(name);
+                    const Tcl_Token *t = w0;
+                    for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                        t = NextWord(t);
+                    Tcl_Obj *args = WordLiteralObj(t);
+                    Tcl_Obj *body = WordLiteralObj(NextWord(t));
+                    if (!args || !body)
+                        found = 1;
+                    if (args)
+                        Tcl_DecrRefCount(args);
+                    if (body)
+                        Tcl_DecrRefCount(body);
+                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
+                    Tcl_Obj *block = WordLiteralObj(NextWord(w0));
+                    if (block) {
+                        Tcl_Size    bl2 = 0;
+                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                        if (ObjdefineBuilderHasNonLiteralMethod(ip, bs2, bl2, depth + 1))
+                            found = 1;
+                        Tcl_DecrRefCount(block);
+                    } else {
+                        found = 1; /* non-literal private block — cannot introspect */
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                    /* Inline `private method …` — recurse over the tail. */
+                    const char *raw  = p.commandStart;
+                    Tcl_Size    rl   = p.commandSize;
+                    Tcl_Size    skip = 0;
+                    while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
+                        skip++;
+                    while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
+                        skip++;
+                    if (skip < rl && ObjdefineBuilderHasNonLiteralMethod(ip, raw + skip, rl - skip, depth + 1))
+                        found = 1;
+                } else if (strcmp(kw, "constructor") == 0 && p.numWords >= 2) {
+                    /* constructor ?ARGS? BODY — body is last; args 2nd-last if present. */
+                    const Tcl_Token *t = w0;
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
+                        t = NextWord(t);
+                    Tcl_Obj *body = WordLiteralObj(t);
+                    if (!body)
+                        found = 1;
+                    else
+                        Tcl_DecrRefCount(body);
+                    if (p.numWords >= 3) {
+                        const Tcl_Token *pre = w0;
+                        for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                            pre = NextWord(pre);
+                        Tcl_Obj *args = WordLiteralObj(pre);
+                        if (!args)
+                            found = 1;
+                        else
+                            Tcl_DecrRefCount(args);
+                    }
+                } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
+                    /* destructor BODY — body is the last word. */
+                    const Tcl_Token *t = w0;
+                    for (Tcl_Size w = 0; w + 1 < p.numWords; w++)
+                        t = NextWord(t);
+                    Tcl_Obj *body = WordLiteralObj(t);
+                    if (!body)
+                        found = 1;
+                    else
+                        Tcl_DecrRefCount(body);
+                } else if (strcmp(kw, "self") == 0 && p.numWords == 2) {
+                    /* self { block } — recurse into the self-context block. */
+                    Tcl_Obj *block = WordLiteralObj(NextWord(w0));
+                    if (block) {
+                        Tcl_Size    bl2 = 0;
+                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                        if (ObjdefineBuilderHasNonLiteralMethod(ip, bs2, bl2, depth + 1))
+                            found = 1;
+                        Tcl_DecrRefCount(block);
+                    } else {
+                        found = 1;
+                    }
+                } else if (strcmp(kw, "self") == 0 && p.numWords >= 5) {
+                    /* self method NAME ?opts? ARGS BODY. */
+                    const Tcl_Token *wSub = NextWord(w0);
+                    Tcl_Obj         *sub  = WordLiteralObj(wSub);
+                    if (sub) {
+                        if (strcmp(Tbcx_GetStringSafe(sub), "method") == 0) {
+                            Tcl_Obj *name = WordLiteralObj(NextWord(wSub));
+                            if (!name)
+                                found = 1;
+                            else
+                                Tcl_DecrRefCount(name);
+                            const Tcl_Token *t = w0;
+                            for (Tcl_Size w = 0; w + 2 < p.numWords; w++)
+                                t = NextWord(t);
+                            Tcl_Obj *args = WordLiteralObj(t);
+                            Tcl_Obj *body = WordLiteralObj(NextWord(t));
+                            if (!args || !body)
+                                found = 1;
+                            if (args)
+                                Tcl_DecrRefCount(args);
+                            if (body)
+                                Tcl_DecrRefCount(body);
+                        }
+                        Tcl_DecrRefCount(sub);
+                    }
+                }
+                Tcl_DecrRefCount(cmd);
+            }
+        }
+        cur    = p.commandStart + p.commandSize;
+        remain = (script + len) - cur;
+        Tcl_FreeParse(&p);
+    }
+    return found;
+}
+
 /* Build a builder body where every method/classmethod/constructor/destructor
  * subcommand has its body replaced by the empty string, while copying all
  * other subcommands verbatim. This ensures that load-time evaluation of the
@@ -4300,7 +4749,7 @@ static Tcl_Obj *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj) {
                         }
                         t = NextWord(t);
                     }
-                    Tcl_DStringAppendElement(&ln, ""); /* stubbed body */
+                    Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY); /* stub sentinel */
                     Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
                     Tcl_DStringAppend(&out, "\n", 1);
                     Tcl_DStringFree(&ln);
@@ -4327,7 +4776,8 @@ static Tcl_Obj *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj) {
                         Tcl_DStringInit(&ln);
                         Tcl_DStringAppendElement(&ln, "constructor");
                         Tcl_DStringAppendElement(&ln, Tbcx_GetStringSafe(args));
-                        Tcl_DStringAppendElement(&ln, "");
+                        /* Sentinel stub body (uniform with every method form). */
+                        Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
                         Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
                         Tcl_DStringAppend(&out, "\n", 1);
                         Tcl_DStringFree(&ln);
@@ -4338,12 +4788,12 @@ static Tcl_Obj *StubbedBuilderBody(Tcl_Interp *ip, Tcl_Obj *bodyObj) {
                     goto next_cmd;
                 } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
                     /* Destructor takes exactly one argument (body).
-                       Emit "destructor {;}" — semicolon as minimal stub. */
+                       Emit "destructor {<sentinel>}" — uniform stub body. */
                     {
                         Tcl_DString ln;
                         Tcl_DStringInit(&ln);
                         Tcl_DStringAppendElement(&ln, "destructor");
-                        Tcl_DStringAppendElement(&ln, ";");
+                        Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
                         Tcl_DStringAppend(&out, Tcl_DStringValue(&ln), Tcl_DStringLength(&ln));
                         Tcl_DStringAppend(&out, "\n", 1);
                         Tcl_DStringFree(&ln);
@@ -4529,9 +4979,19 @@ typedef struct {
  * `self method …`, or block `self { … }` shape).  The tail is processed as a
  * one-command builder body — equivalent to `oo::define CLS { <tail> }` — so
  * method bodies are stubbed (no source leak) and the scope byte is set, while
- * self methods are emitted as flat stubs and self declaratives re-emitted. */
-static void EmitStandaloneDefineTail(RewriteCtx *ctx, Tcl_Obj *clsFqn, Tcl_Obj *cls, const char *tail, Tcl_Size tailLen) {
-    CaptureClassBody(ctx->ip, tail, tailLen, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
+ * self methods are emitted as flat stubs and self declaratives re-emitted.
+ *
+ * Returns 1 if the command was handled (captured + stubbed), or 0 to leave it
+ * VERBATIM: a tail with a non-literal method/ctor/dtor/self name/args/body
+ * cannot be precompiled, and stubbing it would silently drop the body — so the
+ * caller emits the original command unchanged (every body runs at load, exactly
+ * as `source` would), mirroring the braced-builder verbatim policy.  The check
+ * runs BEFORE CaptureClassBody so no orphan records are captured for a builder
+ * that ends up verbatim. */
+static int EmitStandaloneDefineTail(RewriteCtx *ctx, Tcl_Obj *clsFqn, Tcl_Obj *cls, const char *tail, Tcl_Size tailLen) {
+    if (ObjdefineBuilderHasNonLiteralMethod(ctx->ip, tail, tailLen, 0))
+        return 0; /* leave the whole standalone command verbatim */
+    CaptureClassBody(ctx->ip, tail, tailLen, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0, ctx->defs->n);
     CS_Add(ctx->classes, clsFqn);
     if (IsPureOodefineBuilderBody(ctx->ip, tail, tailLen)) {
         StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, tail, tailLen);
@@ -4552,6 +5012,7 @@ static void EmitStandaloneDefineTail(RewriteCtx *ctx, Tcl_Obj *clsFqn, Tcl_Obj *
         EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
         Tcl_DecrRefCount(tailObj);
     }
+    return 1;
 }
 
 /* Slice the raw tail text of a command starting at the token `wFrom` through
@@ -4629,7 +5090,11 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(kwd));
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(mname));
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(args));
-                    Tcl_DStringAppendElement(&line, "");
+                    /* Sentinel stub body: the loader installs the precompiled
+                       body only when the forwarded body equals it, so a verbatim
+                       (non-literal-body) flat method is never patched from a
+                       stale same-key record. */
+                    Tcl_DStringAppendElement(&line, TBCX_METH_STUB_BODY);
                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
                     Tcl_DStringAppend(ctx->out, "\n", 1);
                     Tcl_DStringFree(&line);
@@ -4686,7 +5151,8 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(cls));
                     Tcl_DStringAppendElement(&line, kw);
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(args));
-                    Tcl_DStringAppendElement(&line, "");
+                    /* Sentinel stub body (uniform with every method form). */
+                    Tcl_DStringAppendElement(&line, TBCX_METH_STUB_BODY);
                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
                     Tcl_DStringAppend(ctx->out, "\n", 1);
                     Tcl_DStringFree(&line);
@@ -4715,8 +5181,9 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                    dedicated branch below). */
                 Tcl_Size    tailLen = 0;
                 const char *tail    = CmdTailFromToken(p, wK, &tailLen);
-                EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
-                *handled = 1;
+                /* 0 == leave verbatim (non-literal method); caller emits the
+                   original command unchanged. */
+                *handled            = EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
             }
             if (clsFqn)
                 Tcl_DecrRefCount(clsFqn);
@@ -4744,9 +5211,9 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 if (clsFqn) {
                     Tcl_Size    tailLen = 0;
                     const char *tail    = CmdTailFromToken(p, wK, &tailLen);
-                    EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
+                    /* 0 == leave verbatim (non-literal method/ctor/dtor body). */
+                    *handled            = EmitStandaloneDefineTail(ctx, clsFqn, cls, tail, tailLen);
                     Tcl_DecrRefCount(clsFqn);
-                    *handled = 1;
                 }
             }
         }
@@ -4767,8 +5234,17 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             if (clsFqn) {
                 Tcl_Size    bl = 0;
                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
+                if (ObjdefineBuilderHasNonLiteralMethod(ctx->ip, bs, bl, 0)) {
+                    /* A method/ctor/dtor/self with a non-literal name/args/body
+                       cannot be precompiled; stubbing it would silently drop the
+                       body.  Leave the whole class builder VERBATIM (caller emits
+                       the original command) so every body runs at load, exactly
+                       as `source` would — at the cost of not precompiling this
+                       one builder.  Mirrors the oo::objdefine handling. */
+                    Tcl_DecrRefCount(clsFqn);
+                } else {
                 /* Capture from builder body */
-                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
+                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0, ctx->defs->n);
                 CS_Add(ctx->classes, clsFqn);
                 /* Rewrite: check purity then stub */
                 if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
@@ -4791,6 +5267,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 }
                 Tcl_DecrRefCount(clsFqn);
                 *handled = 1;
+                } /* else: capturable builder */
             }
         }
         if (cls)
@@ -4809,7 +5286,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             if (nm) {
                 Tcl_Obj *clsFqn = FqnUnder(ctx->ip, ctx->curNs, nm);
                 if (clsFqn) {
-                    CS_Add(ctx->classes, clsFqn);
+                    int         leaveVerbatim = 0;
                     Tcl_DString cmdLn;
                     Tcl_DStringInit(&cmdLn);
                     Tcl_DStringAppendElement(&cmdLn, c0);
@@ -4821,35 +5298,46 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                         if (bod) {
                             Tcl_Size    bl = 0;
                             const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
-                            CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
-                            if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
-                                Tcl_DStringAppendElement(&cmdLn, "");
-                                Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
-                                Tcl_DStringAppend(ctx->out, "\n", 1);
-                                StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, bs, bl);
+                            if (ObjdefineBuilderHasNonLiteralMethod(ctx->ip, bs, bl, 0)) {
+                                /* Non-literal method/ctor/dtor/self body — leave the
+                                   whole creation command verbatim (caller emits the
+                                   original); nothing captured or stubbed. */
+                                leaveVerbatim = 1;
                             } else {
-                                Tcl_Obj *stubbed = StubbedBuilderBody(ctx->ip, bod);
-                                Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(stubbed));
-                                Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
-                                Tcl_DStringAppend(ctx->out, "\n", 1);
-                                Tcl_DecrRefCount(stubbed);
-                                EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
-                                EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
+                                CS_Add(ctx->classes, clsFqn);
+                                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0, ctx->defs->n);
+                                if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
+                                    Tcl_DStringAppendElement(&cmdLn, "");
+                                    Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                    Tcl_DStringAppend(ctx->out, "\n", 1);
+                                    StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, bs, bl);
+                                } else {
+                                    Tcl_Obj *stubbed = StubbedBuilderBody(ctx->ip, bod);
+                                    Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(stubbed));
+                                    Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                    Tcl_DStringAppend(ctx->out, "\n", 1);
+                                    Tcl_DecrRefCount(stubbed);
+                                    EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
+                                    EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
+                                }
                             }
                             Tcl_DecrRefCount(bod);
                         } else {
+                            CS_Add(ctx->classes, clsFqn);
                             Tcl_DStringAppendElement(&cmdLn, "");
                             Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                             Tcl_DStringAppend(ctx->out, "\n", 1);
                         }
                     } else {
+                        CS_Add(ctx->classes, clsFqn);
                         Tcl_DStringAppendElement(&cmdLn, "");
                         Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                         Tcl_DStringAppend(ctx->out, "\n", 1);
                     }
                     Tcl_DStringFree(&cmdLn);
                     Tcl_DecrRefCount(clsFqn);
-                    *handled = 1;
+                    if (!leaveVerbatim)
+                        *handled = 1;
                 } /* if (clsFqn) */
                 Tcl_DecrRefCount(nm);
             }
@@ -4926,7 +5414,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 if (nm) {
                     Tcl_Obj *clsFqn = FqnUnder(ctx->ip, ctx->curNs, nm);
                     if (clsFqn) {
-                        CS_Add(ctx->classes, clsFqn);
+                        int         leaveVerbatim = 0;
                         Tcl_DString cmdLn;
                         Tcl_DStringInit(&cmdLn);
                         Tcl_DStringAppendElement(&cmdLn, c0);
@@ -4938,23 +5426,29 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                             if (bod) {
                                 Tcl_Size    bl = 0;
                                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
-                                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
-                                if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
-                                    Tcl_DStringAppendElement(&cmdLn, "");
-                                    Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
-                                    Tcl_DStringAppend(ctx->out, "\n", 1);
-                                    StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, bs, bl);
+                                if (ObjdefineBuilderHasNonLiteralMethod(ctx->ip, bs, bl, 0)) {
+                                    leaveVerbatim = 1; /* non-literal body — leave verbatim */
                                 } else {
-                                    Tcl_Obj *stubbed = StubbedBuilderBody(ctx->ip, bod);
-                                    Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(stubbed));
-                                    Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
-                                    Tcl_DStringAppend(ctx->out, "\n", 1);
-                                    Tcl_DecrRefCount(stubbed);
-                                    EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
-                                    EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
+                                    CS_Add(ctx->classes, clsFqn);
+                                    CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, clsFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0, ctx->defs->n);
+                                    if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
+                                        Tcl_DStringAppendElement(&cmdLn, "");
+                                        Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                        Tcl_DStringAppend(ctx->out, "\n", 1);
+                                        StubLinesForClass(ctx->ip, ctx->out, ctx->defs, clsFqn, bs, bl);
+                                    } else {
+                                        Tcl_Obj *stubbed = StubbedBuilderBody(ctx->ip, bod);
+                                        Tcl_DStringAppendElement(&cmdLn, Tbcx_GetStringSafe(stubbed));
+                                        Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
+                                        Tcl_DStringAppend(ctx->out, "\n", 1);
+                                        Tcl_DecrRefCount(stubbed);
+                                        EmitSelfDeclaratives(ctx->ip, ctx->out, clsFqn, bs, bl);
+                                        EmitFlatSelfStubs(ctx->ip, ctx->out, ctx->defs, clsFqn);
+                                    }
                                 }
                                 Tcl_DecrRefCount(bod);
                             } else {
+                                CS_Add(ctx->classes, clsFqn);
                                 Tcl_DStringAppendElement(&cmdLn, "");
                                 Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&cmdLn), Tcl_DStringLength(&cmdLn));
                                 Tcl_DStringAppend(ctx->out, "\n", 1);
@@ -4962,7 +5456,8 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                         }
                         Tcl_DStringFree(&cmdLn);
                         Tcl_DecrRefCount(clsFqn);
-                        *handled = 1;
+                        if (!leaveVerbatim)
+                            *handled = 1;
                     } /* if (clsFqn) */
                     Tcl_DecrRefCount(nm);
                 }
@@ -4989,11 +5484,30 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
             if (objFqn) {
                 Tcl_Size    bl = 0;
                 const char *bs = Tbcx_GetStringFromObjSafe(bod, &bl);
-                /* Capture from builder body */
-                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, objFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER, 0, 0);
+                if (ObjdefineBuilderHasNonLiteralMethod(ctx->ip, bs, bl, 0)) {
+                    /* A per-object method whose body or arg-spec is not a static
+                       literal (e.g. `method m {} [computeBody]`) cannot be
+                       precompiled, and stubbing it would silently drop the body.
+                       Leave the whole builder VERBATIM — matching the flat
+                       `oo::objdefine OBJ method …` statement and the runtime-
+                       variable-target forms — so every body runs as ordinary
+                       code at load (source-equivalent), at the cost of not
+                       precompiling/stripping this one builder.  *handled stays 0
+                       so the caller emits the original command unchanged. */
+                    Tcl_DecrRefCount(objFqn);
+                } else {
+                /* Capture from builder body.  The object-definition origin flag
+                   travels into every captured record so each is keyed with
+                   object origin at load (coexisting with any same-name class
+                   method), and so a `self method` here is rejected at save. */
+                CaptureClassBody(ctx->ip, bs, bl, ctx->curNs, objFqn, ctx->defs, ctx->classes, DEF_F_FROM_BUILDER | DEF_F_OBJDEFINE, 0, 0, ctx->defs->n);
                 CS_Add(ctx->classes, objFqn);
-                /* Rewrite: check purity then stub */
-                if (IsPureOodefineBuilderBody(ctx->ip, bs, bl)) {
+                /* Rewrite: check purity then stub.  The object predicate is
+                   stricter than the class one — only plain `method NAME ARGS
+                   BODY` stays pure; option/private/export/unexport blocks route
+                   through StubbedBuilderBody so the loader replays them via
+                   PrecompObject against the object's own method table. */
+                if (IsPureObjdefineBuilderBody(ctx->ip, bs, bl)) {
                     /* Expand into multi-word oo::objdefine stubs,
                        walking the body to preserve command order and
                        emit non-method commands (variable etc.) verbatim. */
@@ -5018,7 +5532,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                                 Tcl_DStringAppendElement(&ln, "oo::objdefine");
                                 Tcl_DStringAppendElement(&ln, objNmStr);
                                 if ((strcmp(pk, "method") == 0 || strcmp(pk, "classmethod") == 0) && pp.numWords >= 4) {
-                                    /* Emit all words except last (body), then empty stub */
+                                    /* Emit all words except last (body), then the stub sentinel */
                                     const Tcl_Token *wt = pw0;
                                     for (Tcl_Size wi = 0; wi + 1 < pp.numWords; wi++) {
                                         Tcl_Obj *w = WordLiteralObj(wt);
@@ -5028,7 +5542,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                                         }
                                         wt = NextWord(wt);
                                     }
-                                    Tcl_DStringAppendElement(&ln, "");
+                                    Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
                                 } else if (strcmp(pk, "constructor") == 0 && pp.numWords >= 3) {
                                     const Tcl_Token *wt = pw0;
                                     for (Tcl_Size wi = 0; wi + 1 < pp.numWords; wi++) {
@@ -5039,10 +5553,10 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                                         }
                                         wt = NextWord(wt);
                                     }
-                                    Tcl_DStringAppendElement(&ln, "");
+                                    Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
                                 } else if (strcmp(pk, "destructor") == 0) {
                                     Tcl_DStringAppendElement(&ln, "destructor");
-                                    Tcl_DStringAppendElement(&ln, ";");
+                                    Tcl_DStringAppendElement(&ln, TBCX_METH_STUB_BODY);
                                 } else {
                                     /* Non-body command (variable etc.) — emit verbatim */
                                     const Tcl_Token *wt = pw0;
@@ -5080,6 +5594,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                 }
                 Tcl_DecrRefCount(objFqn);
                 *handled = 1;
+                } /* else: capturable builder */
             } /* if (objFqn) */
         }
         if (objNm)
@@ -5129,6 +5644,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     r.body  = body;          /* transferred from WordLiteralObj (refcount 1) */
                     r.ns    = ctx->curNs;
                     r.scope = optScope;
+                    r.flags = DEF_F_OBJDEFINE; /* object-definition origin (drives the wire origin byte) */
                     Tcl_IncrRefCount(r.ns);
                     DV_Push(ctx->defs, r);
                     CS_Add(ctx->classes, objFqn);
@@ -5141,7 +5657,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     Tcl_DStringAppendElement(&line, kw);
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(mname));
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(args));
-                    Tcl_DStringAppendElement(&line, "");
+                    Tcl_DStringAppendElement(&line, TBCX_METH_STUB_BODY);
                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
                     Tcl_DStringAppend(ctx->out, "\n", 1);
                     Tcl_DStringFree(&line);
@@ -5188,6 +5704,7 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     r.args = args;           /* transferred (refcount 1) */
                     r.body = body;           /* transferred from WordLiteralObj (refcount 1) */
                     r.ns   = ctx->curNs;
+                    r.flags = DEF_F_OBJDEFINE; /* object-definition origin (drives the wire origin byte) */
                     Tcl_IncrRefCount(r.ns);
                     DV_Push(ctx->defs, r);
                     CS_Add(ctx->classes, objFqn);
@@ -5198,7 +5715,8 @@ static int RewriteOoCmd(RewriteCtx *ctx, Tcl_Parse *p, const Tcl_Token *w0, cons
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(objNm));
                     Tcl_DStringAppendElement(&line, kw);
                     Tcl_DStringAppendElement(&line, Tbcx_GetStringSafe(args));
-                    Tcl_DStringAppendElement(&line, "");
+                    /* Sentinel stub body (uniform with every method form). */
+                    Tcl_DStringAppendElement(&line, TBCX_METH_STUB_BODY);
                     Tcl_DStringAppend(ctx->out, Tcl_DStringValue(&line), Tcl_DStringLength(&line));
                     Tcl_DStringAppend(ctx->out, "\n", 1);
                     Tcl_DStringFree(&line);
@@ -5772,9 +6290,31 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tc
         }
     }
 
-    /* 1. Compile top-level (after capture + rewrite) */
-    if (TclSetByteCodeFromAny(w->interp, srcCopy, NULL, NULL) != TCL_OK) {
-        goto cleanup;
+    /* 1. Compile top-level (after capture + rewrite) at TRUE global scope.
+       `tbcx::save` may be invoked from inside a proc.  Tcl decides whether a
+       command like `catch … e` / `set v …` may use compiled LOCAL variables via
+       EnvHasLVT(env) = (env->procPtr || iPtr->varFramePtr->localCachePtr) — so a
+       caller frame carrying a LocalCache makes the top-level script compile to
+       that proc's local slots (storeScalar/loadScalar %vN).  A serialized
+       top-level ByteCode carries NO locals (numLocals=0), so those instructions
+       would index a non-existent local-variable array and CRASH at load.  A
+       loaded tbcx top-level always runs at global scope, so compile it with no
+       local-variable table: clear compiledProcPtr AND hide the caller frame's
+       LocalCache for the duration of the compile, then restore both. */
+    {
+        Interp     *iPtr      = (Interp *)w->interp;
+        CallFrame  *saveFrame = iPtr->varFramePtr;
+        LocalCache *saveLC    = saveFrame ? saveFrame->localCachePtr : NULL;
+        Proc       *saveProc  = iPtr->compiledProcPtr;
+        iPtr->compiledProcPtr = NULL;
+        if (saveFrame)
+            saveFrame->localCachePtr = NULL;
+        int tlRc = TclSetByteCodeFromAny(w->interp, srcCopy, NULL, NULL);
+        if (saveFrame)
+            saveFrame->localCachePtr = saveLC;
+        iPtr->compiledProcPtr = saveProc;
+        if (tlRc != TCL_OK)
+            goto cleanup;
     }
     ByteCode *top = NULL;
     top           = TbcxGetByteCode(srcCopy);
@@ -5926,6 +6466,31 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tc
     done_classes:;
     }
 
+    /* 7-pre0. Per-object self/class methods are not representable.  A `self
+       method` (or a method inside a `self { … }` block) written in an
+       oo::objdefine builder is captured carrying BOTH the object-definition
+       origin and the self-method flag.  oo::objdefine has no `self method`
+       form — such a builder errors when sourced — and object-definition replay
+       cannot install it either.  The non-pure stub path strips `self` words, so
+       without this guard the body would silently vanish and load as a no-op.
+       Reject it loudly at save instead. */
+    for (Tcl_Size i = 0; i < defs.n; i++) {
+        if ((defs.v[i].flags & DEF_F_OBJDEFINE) && (defs.v[i].flags & DEF_F_SELF_METHOD)) {
+            Tcl_Size    cl = 0;
+            const char *cs = Tbcx_GetStringFromObjSafe(defs.v[i].cls, &cl);
+            Tcl_Size    nl = 0;
+            const char *ns = defs.v[i].name ? Tbcx_GetStringFromObjSafe(defs.v[i].name, &nl) : "";
+            Tcl_SetObjResult(w->interp, Tcl_ObjPrintf("tbcx: cannot serialize 'self method %s' inside an oo::objdefine builder for %s (per-object self/class methods are not representable)", ns, cs));
+            w->err = TCL_ERROR;
+            goto cleanup; /* rc is TCL_ERROR */
+        }
+    }
+
+    /* No method-key collision guard is needed here: each method record carries
+       an origin byte (class-definition vs object-definition), so a class-instance
+       method and a per-object method that share an FQN/kind/name are keyed
+       distinctly at load and coexist. */
+
     /* 7. Methods section: emit captured OO methods/ctors/dtors */
     uint32_t numMethods = 0;
     for (Tcl_Size i = 0; i < defs.n; i++) {
@@ -5950,14 +6515,19 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tc
                     wireKind = 4; /* TBCX_METH_SELF */
                 W_U8(w, wireKind);
             }
-            /* scope byte (v92 amendment): TclOO visibility the loaded method
-               must have — see TBCX_MSCOPE_*.  Ctor/dtor carry DEFAULT. */
+            /* scope byte: TclOO visibility the loaded method must have —
+               see TBCX_MSCOPE_*.  Ctor/dtor carry DEFAULT. */
             {
                 uint8_t wireScope = (uint8_t)defs.v[i].scope;
                 if (defs.v[i].kind == DEF_KIND_CTOR || defs.v[i].kind == DEF_KIND_DTOR)
                     wireScope = TBCX_MSCOPE_DEFAULT;
                 W_U8(w, wireScope);
             }
+            /* origin byte: 0 = class-definition (oo::define/oo::class),
+               1 = object-definition (oo::objdefine).  The loader keys records
+               by (FQN, kind, name, origin) so a class-instance method and a
+               per-object method that share an FQN/kind/name coexist. */
+            W_U8(w, (uint8_t)((defs.v[i].flags & DEF_F_OBJDEFINE) ? TBCX_MORIGIN_OBJECT : TBCX_MORIGIN_CLASS));
             /* name (empty for ctor/dtor) */
             if (defs.v[i].kind == DEF_KIND_CTOR || defs.v[i].kind == DEF_KIND_DTOR) {
                 W_LPString(w, "", 0);

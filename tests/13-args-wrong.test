@@ -24,9 +24,9 @@ test args.3 {dumpfile: wrong #args} -body {
 
 # Too many args
 test args.4 {save: unknown option} -body {
-    # With v92, tbcx::save accepts an optional -include-source flag
-    # after the two required positional args; any other trailing token
-    # is reported as an unknown option rather than an arg-count error.
+    # tbcx::save accepts an optional -include-source flag after the two
+    # required positional args; any other trailing token is reported as an
+    # unknown option rather than an arg-count error.
     list [catch {tbcx::save a b c} e] $e
 } -result {1 {tbcx::save: unknown option "c"; expected -include-source}}
 

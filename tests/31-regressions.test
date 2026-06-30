@@ -1,17 +1,17 @@
 # -*-Tcl-*-
-# 31-regressions.test — fixes for two correctness bugs found 2026-06-12
+# 31-regressions.test — assorted correctness checks.
 #
-#   A. List-literal first-element quoting: a scalar value carrying a
-#      parasitic list internal rep (every Tcl string is a valid list) was
-#      serialized element-wise, re-quoting it ("#aa" -> "{#aa}" -> "{{#aa}}").
-#      Triggered by any constant-folded [list …] whose first element needs
-#      list-quoting (leading '#', leading space, embedded braces).
+#   A. List-literal first-element quoting: a constant-folded [list …] whose
+#      first element needs list-quoting (leading '#', leading space, embedded
+#      braces) must round-trip without re-quoting (a scalar carrying a parasitic
+#      list internal rep must not be re-serialized element-wise, e.g. "#aa" must
+#      not become "{#aa}").
 #
-#   B. TclOO in-body `export` visibility loss: a method exported via the
-#      `export` command INSIDE an `oo::class create {…}` / `oo::define {…}`
-#      body lost its public visibility on load (PrecompClass only restored
-#      the unexport direction). PascalCase callbacks (e.g. DoFlush) became
-#      private and external dispatch threw `unknown method`.
+#   B. TclOO in-body `export` visibility: a method exported via the `export`
+#      command INSIDE an `oo::class create {…}` / `oo::define {…}` body keeps its
+#      public visibility on load (PrecompClass restores both the export and the
+#      unexport direction), so a PascalCase callback (e.g. DoFlush) stays
+#      externally dispatchable.
 
 package require tbcx
 package require tcltest 2.5
@@ -218,5 +218,54 @@ test regress.export.4 {lowercase methods stay public (no over-correction)} -body
     tbcx::save $in $out
     tbcx::load $out
 } -result {ok cb}
+
+# ---------------------------------------------------------------------------
+# C. Top-level compiled at GLOBAL scope (no borrowed caller-frame locals).
+#    `tbcx::save` is frequently invoked from inside a proc (tcltest bodies and
+#    every save wrapper are procs).  Tcl decides whether `catch … e` / `set v …`
+#    may use compiled LOCALS via EnvHasLVT = (env->procPtr ||
+#    iPtr->varFramePtr->localCachePtr) — so a caller frame carrying a LocalCache
+#    made the saved script's TOP LEVEL compile to that proc's local slots
+#    (storeScalar/loadScalar %vN).  A serialized top-level carries no locals
+#    (numLocals=0), so those instructions indexed a non-existent local array and
+#    SIGSEGV'd at load.  The saver now hides the caller frame's LocalCache (and
+#    compiledProcPtr) for the top-level compile.
+# ---------------------------------------------------------------------------
+# saveInProc: call tbcx::save from a frame that carries a LocalCache (this proc
+# has many compiled local variables, accessed so the cache is materialised) —
+# that is what made the saved top-level borrow proc-local slots.
+proc saveInProc {in out} {
+    set g0 0; set g1 1; set g2 2; set g3 3; set g4 4
+    set g5 5; set g6 6; set g7 7; set g8 8; set g9 9
+    incr g0 $g9; incr g1 $g8; incr g2 $g7
+    tbcx::save $in $out
+}
+# loadFresh: load at GLOBAL scope in a fresh interp (where a corrupt top-level
+# referencing local slot N would index a non-existent local array and crash).
+proc loadFresh {out} {
+    set i [interp create]
+    try {
+        $i eval {package require tbcx}
+        return [$i eval [list tbcx::load $out]]
+    } finally {
+        interp delete $i
+    }
+}
+
+test regress.toplevel.catch.var {top-level catch+var (after OO defs) saved from a proc loads at global scope} -body {
+    set in  [makeFile {oo::class create ::Tlc { method Up {} { return u } }
+set o [::Tlc new]
+list [catch {$o Up} e] $e} regress.tlcv-in.tcl]
+    set out [makeFile "" regress.tlcv-out.tbcx]
+    saveInProc $in $out
+    loadFresh $out
+} -result {1 {unknown method "Up": must be destroy}}
+
+test regress.toplevel.catch.options {top-level catch+result var (plain script) saved from a proc} -body {
+    set in  [makeFile {set x [catch {error boom} e]; list $x $e} regress.tlco-in.tcl]
+    set out [makeFile "" regress.tlco-out.tbcx]
+    saveInProc $in $out
+    loadFresh $out
+} -result {1 boom}
 
 cleanupTests

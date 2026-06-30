@@ -1,18 +1,13 @@
 # -*- tcl -*-
-# 30-rename-uaf.test — regression test for the internal-review rename-UAF
-# bug.  Before the fix, ProcCmdDeleteTrace / OOShimDefineCmdTrace /
-# OOShimObjdefCmdTrace / ApplyCmdDeleteTrace treated TCL_TRACE_RENAME
-# identically to TCL_TRACE_DELETE: null the cached Command* and skip
-# the handler restore in teardown.  After a rename, the Command struct
-# survives with CmdProcShim / CmdOOShim / CmdApplyShim still wired
-# into objProc2 and the client data still pointing at the
-# stack-allocated ProcShim / OOShim (or heap-allocated ApplyShim).
-# Invoking the renamed command post-load then dereferenced freed
-# memory and crashed with "called Tcl_FindHashEntry on deleted table"
-# / illegal instruction.
-#
-# Fix: on TCL_TRACE_RENAME, restore the original handlers in-place
-# while the Command struct is still accessible via the old name.
+# 30-rename-uaf.test — renaming a tbcx-shimmed command must restore the original
+# handlers in-place while the Command struct is still reachable via the old name.
+# A Command struct survives a rename (unlike a delete), so ProcCmdDeleteTrace /
+# OOShimDefineCmdTrace / OOShimObjdefCmdTrace / ApplyCmdDeleteTrace must, on
+# TCL_TRACE_RENAME, restore the Command's objProc2/clientData rather than only
+# nulling the cached Command*.  Otherwise the renamed command stays wired to
+# CmdProcShim / CmdOOShim / CmdApplyShim with client data pointing at the freed
+# ProcShim / OOShim / ApplyShim, and invoking it after load dereferences freed
+# memory.
 
 package require tcltest
 namespace import ::tcltest::*

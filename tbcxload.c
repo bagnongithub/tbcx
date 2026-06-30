@@ -90,7 +90,15 @@ typedef struct {
 } ProcShim;
 
 typedef struct {
-    Tcl_HashTable    methodsByKey;         /* key: STRING "class\x1Fkind\x1Fname", val: Tcl_Obj* PAIR {args, procbody} */
+    Tcl_HashTable    methodsByKey;         /* key: STRING "class\x1Fkind\x1Forigin\x1Fname",
+                                              val: Tcl_Obj* FIFO list of {args, procbody, scope}
+                                              triples in definition (serialization) order.  A
+                                              definition site consumes the front element via
+                                              OOShim_TakeRecord, so interleaved same-key
+                                              redefinitions install the correct body at each site. */
+    Tcl_Obj         *retired;              /* list owning every triple already consumed from a
+                                              methodsByKey FIFO; keeps each precompiled body (and
+                                              its Proc) alive until DelOOShim. */
     Command         *defineCmdPtr;         /* cached oo::define Command (NULL if invalidated by rename/delete) */
     Command         *objdefCmdPtr;         /* cached oo::objdefine Command (NULL if invalidated) */
     int              defineTraceInstalled; /* 1 if command trace is active on oo::define */
@@ -188,13 +196,17 @@ static void        DelProcShim(Tcl_Interp *ip, ProcShim *ps);
 static ApplyShim  *EnsureApplyShim(Tcl_Interp *ip);
 static void        FixCompiledLocalNames(Proc *procPtr, LocalCache *lc);
 static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePath);
-static int         MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name);
+static int         MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj *name);
 static void        OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static void        OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static void        OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *const objv[], Tcl_Obj *clsFqn, Tcl_DString *keyDs, uint8_t *kindOut, Tcl_Size *bodyIdxOut, Tcl_Obj **runtimeArgsOut,
                                          Tcl_Obj **nameOOut, Tcl_Obj **tmpEmptyArgsOut, int *hasKeyOut);
-static void        OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut, int *scopeOut);
-static int         PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn);
+static Tcl_Obj    *OOShim_TakeRecord(OOShim *os, const char *key);
+static int         PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *builderBody);
+static int         PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *builderBody);
+static int         ObjBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *builderBody, Tcl_HashTable *namesOut, int *sawUnsupportedBodyFormOut, int *anyVerbatimOut);
+static void        ClassBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *builderBody, Tcl_HashTable *keysOut);
+static int         DefOOObj(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody);
 static void        ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
 static int         ProcShim_DirectInstall(ProcShim *ps, Tcl_Interp *ip, Tcl_Obj *fqn, Tcl_Obj *nameObj, Proc *preProc, Tcl_Obj *savedArgs);
 static inline void R_Error(TbcxIn *r, const char *msg);
@@ -481,12 +493,12 @@ static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
     bcPtr->localCachePtr = lc;
 }
 
-/* MethodKeyBuf — Build a hash key string "classFqn\x1Fkind\x1Fname" into a
- * caller-provided Tcl_DString.  This avoids allocating a Tcl_Obj + refcount
+/* MethodKeyBuf — Build a hash key string "classFqn\x1Fkind\x1Forigin\x1Fname"
+ * into a caller-provided Tcl_DString.  This avoids allocating a Tcl_Obj + refcount
  * management for what is purely a transient lookup key.  Caller must call
  * Tcl_DStringFree(ds) when done.
  * Returns 1 on success, 0 if a required string object is invalid. */
-static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *name) {
+static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj *name) {
     Tcl_DStringInit(ds);
     Tcl_Size    fqnLen = 0;
     const char *fqn    = Tbcx_GetStringFromObjStrict(NULL, clsFqn, &fqnLen);
@@ -509,6 +521,13 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj 
             kindLen    = 2;
         }
         Tcl_DStringAppend(ds, kindBuf, kindLen);
+    }
+    Tcl_DStringAppend(ds, "\x1F", 1);
+    {
+        /* origin: a single ASCII digit (0 = class-definition, 1 = object). */
+        char ob[2];
+        ob[0] = '0' + (char)(origin % 10);
+        Tcl_DStringAppend(ds, ob, 1);
     }
     Tcl_DStringAppend(ds, "\x1F", 1);
     if (name) {
@@ -539,6 +558,42 @@ static int PairScope(Tcl_Interp *ip, Tcl_Obj *pair) {
     if (v < 0 || v > TBCX_MSCOPE_TRUE_PRIVATE)
         return TBCX_MSCOPE_DEFAULT;
     return (int)v;
+}
+
+/* OOShim_TakeRecord — pop and return the FRONT (oldest) precompiled
+ * {args, procbody, scope} triple for a method key, or NULL if the key is
+ * absent or its FIFO list is empty.
+ *
+ * Records are appended by ReadMethod in serialization order, which equals the
+ * source's definition order.  Consuming the front therefore hands each
+ * definition site the body the source defined at that point — this is what
+ * makes interleaved same-key redefinitions (e.g. `oo::define C { method m … }`
+ * observed, then redefined, then observed again) install the right body each
+ * time, where a single-slot last-write-wins hash could not.
+ *
+ * The popped triple is moved onto os->retired (which keeps a reference) rather
+ * than returned with a transferred reference, so its precompiled Proc stays
+ * alive for the remainder of the load.  The caller therefore borrows the
+ * result and must NOT DecrRefCount it. */
+static Tcl_Obj *OOShim_TakeRecord(OOShim *os, const char *key) {
+    Tcl_HashEntry *he = Tcl_FindHashEntry(&os->methodsByKey, key);
+    if (!he)
+        return NULL;
+    Tcl_Obj *list = (Tcl_Obj *)Tcl_GetHashValue(he);
+    if (!list)
+        return NULL;
+    Tcl_Size n = 0;
+    if (Tcl_ListObjLength(NULL, list, &n) != TCL_OK || n <= 0)
+        return NULL;
+    Tcl_Obj *front = NULL;
+    if (Tcl_ListObjIndex(NULL, list, 0, &front) != TCL_OK || !front)
+        return NULL;
+    /* Retain on os->retired BEFORE removing from the FIFO so the triple's
+       refcount never transiently reaches zero (which would free its Proc). */
+    if (os->retired)
+        Tcl_ListObjAppendElement(NULL, os->retired, front);
+    Tcl_ListObjReplace(NULL, list, 0, 1, 0, NULL);
+    return front;
 }
 
 /* TbcxApplyExportVisibility — set a freshly-installed method's export state
@@ -643,7 +698,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
            `method NAME -export|-unexport ARGS BODY`.
          - PUBLIC/UNEXPORTED on `classmethod` (which does NOT accept options):
            create name-default, then apply export/unexport via TclOO.
-         - DEFAULT: name-case visibility (the historical behavior). */
+         - DEFAULT: name-case visibility. */
     if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
         const char *kwStr = (kind == TBCX_METH_CLASS) ? "classmethod" : "method";
         Tcl_IncrRefCount(nameOpt);
@@ -913,9 +968,7 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
     }
 }
 
-static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
-    Tcl_HashSearch s;
-    Tcl_HashEntry *e;
+static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *builderBody) {
     int            rc             = TCL_OK;
     Tcl_Size       fqnLen         = 0;
     const char    *fqn            = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
@@ -927,9 +980,6 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
 
        Visibility is read DIRECTLY from each Method's PUBLIC_METHOD flag via the
        class's `classMethods` hash — one O(methods) pass, no introspection.
-       (The previous implementation ran two `info class methods` evals plus an
-       O(methods^2) name diff per class; this reads the same ground truth far
-       cheaper, with no wire-format change.)
 
        Two mirror lists, applied via oo::define after the swaps:
          - unexportedList: methods PRIVATE now whose name-default is public
@@ -972,18 +1022,35 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
         }
     }
 
-    for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s)) {
-        const char *k = (const char *)Tcl_GetHashKey(&os->methodsByKey, e);
-        if (!k)
+    /* Install only the methods of THIS builder, in definition order, mirroring
+       PrecompObject.  Parsing the just-forwarded (stubbed) builder body tells us
+       exactly which (kind, name) this builder defined and how many times; for
+       each, consume that many FIFO records and install the LAST (within-builder
+       redefinition is last-wins).  A later builder's same-key records stay
+       untouched for its own replay — this is what keeps interleaved same-class
+       redefinitions correct.  `self` methods are NOT collected here; they
+       install via flat `oo::define … self method` stubs (their own FIFO
+       records), since a body swap done through this path does not survive
+       TclOO's method-chain rebuilds.  A method whose body is not the stub
+       sentinel was left verbatim by the saver and is skipped. */
+    Tcl_HashTable keys;
+    Tcl_InitHashTable(&keys, TCL_STRING_KEYS);
+    ClassBuilderCollectMethods(ip, clsFqn, builderBody, &keys);
+
+    Tcl_HashSearch ks;
+    Tcl_HashEntry *ke;
+    for (ke = Tcl_FirstHashEntry(&keys, &ks); ke && rc == TCL_OK; ke = Tcl_NextHashEntry(&ks)) {
+        const char *k     = (const char *)Tcl_GetHashKey(&keys, ke);
+        Tcl_Size    count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(ke);
+        if (!k || count <= 0)
             continue;
-        Tcl_Size kLen = (Tcl_Size)strlen(k);
-        /* match "fqn\x1F" prefix */
-        if (!(kLen > fqnLen + 1 && memcmp(k, fqn, (size_t)fqnLen) == 0 && k[fqnLen] == '\x1F')) {
+        /* Parse kind and name from the key (FQN \x1F kind \x1F origin \x1F name);
+           origin is always class here, set by ClassBuilderCollectMethods. */
+        Tcl_Size    kLen = (Tcl_Size)strlen(k);
+        if (!(kLen > fqnLen + 1 && k[fqnLen] == '\x1F'))
             continue;
-        }
-        /* parse kind */
-        const char *p = k + fqnLen + 1;    /* after first \x1F */
-        const char *q = strchr(p, '\x1F'); /* second sep */
+        const char *p = k + fqnLen + 1;     /* after first \x1F (kind) */
+        const char *q = strchr(p, '\x1F');  /* second sep (after kind) */
         if (!q)
             continue;
         unsigned kind = 0;
@@ -994,25 +1061,37 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             }
             kind = (unsigned)(kind * 10 + (unsigned)(*snum - '0'));
         }
-        const char *nameStr = q + 1; /* may be empty */
-        /* Skip SELF methods — they are installed by the oo::objdefine stub
-           in the top-level bytecode, which forwards to the saved original
-           oo::objdefine with the precompiled body substituted.  Installing
-           SELF methods here via DefOO's create-then-swap corrupts TclOO's
-           dispatch chain (the Method exists in the hash but is invisible
-           to the cached method chain). */
-        if (kind == TBCX_METH_SELF)
+        const char *o  = q + 1;             /* origin digit(s) */
+        const char *r2 = strchr(o, '\x1F'); /* third sep (after origin) */
+        if (!r2)
             continue;
-        Tcl_Obj *pair = (Tcl_Obj *)Tcl_GetHashValue(e); /* {args, procbody, scope} */
-        if (!pair)
-            continue;
+        const char *nameStr = r2 + 1; /* may be empty for ctor/dtor */
+
+        /* Consume `count` FIFO records (front == this builder's, in definition
+           order); keep the last. */
+        Tcl_Obj *pair = NULL;
+        for (Tcl_Size i = 0; i < count; i++) {
+            Tcl_Obj *rec = OOShim_TakeRecord(os, k);
+            if (rec)
+                pair = rec; /* borrowed (owned by os->retired) */
+        }
+        if (!pair) {
+            /* The builder defined this method (sentinel body) but no precompiled
+               record was available — fail loudly rather than leave a no-op. */
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing precompiled method body for %s %s", fqn, nameStr));
+            rc = TCL_ERROR;
+            break;
+        }
         Tcl_Obj *savedArgs = NULL, *procBody = NULL;
         int      methScope = TBCX_MSCOPE_DEFAULT;
         {
             Tcl_Size  pairLen   = 0;
             Tcl_Obj **pairElems = NULL;
-            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) != TCL_OK || pairLen < 2)
-                continue;
+            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) != TCL_OK || pairLen < 2) {
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: malformed method record", -1));
+                rc = TCL_ERROR;
+                break;
+            }
             savedArgs = pairElems[0];
             procBody  = pairElems[1];
             methScope = PairScope(ip, pair);
@@ -1023,17 +1102,18 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
             nameO = Tcl_NewStringObj(nameStr, -1);
             Tcl_IncrRefCount(nameO);
         }
-        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO, (kind == TBCX_METH_DTOR ? savedArgs /* may be "" */ : savedArgs), procBody, methScope);
+        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO, savedArgs /* "" for dtor */, procBody, methScope);
         if (nameO)
             Tcl_DecrRefCount(nameO);
-        if (rc != TCL_OK) {
-            /* leave the interp error as-is */
-            if (unexportedList)
-                Tcl_DecrRefCount(unexportedList);
-            if (reexportList)
-                Tcl_DecrRefCount(reexportList);
-            return rc;
-        }
+    }
+    Tcl_DeleteHashTable(&keys);
+    if (rc != TCL_OK) {
+        /* leave the interp error as-is */
+        if (unexportedList)
+            Tcl_DecrRefCount(unexportedList);
+        if (reexportList)
+            Tcl_DecrRefCount(reexportList);
+        return rc;
     }
     /* Restore method visibility lost during DefOO body swaps.  DefOO
        re-creates methods via oo::define, which resets each method's
@@ -1043,8 +1123,8 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
            is public (lowercase) — re-unexport them.
          - reexportList:   methods PUBLIC before the swap whose name-default
            is private (e.g. an in-body `export Bar` on a PascalCase name) —
-           re-export them.  Without this half, in-body exports such as
-           DoFlush were silently lost.
+           re-export them.  Without this half, an in-body export (e.g.
+           `export DoFlush`) would be lost.
        The two sets are disjoint (one from the private set, one from the
        public set), so order is irrelevant.
 
@@ -1105,6 +1185,514 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn) {
     return rc;
 }
 
+/* ==========================================================================
+ * Per-object builder replay (PrecompObject)
+ *
+ * A braced `oo::objdefine OBJ { … }` whose body is non-pure (scope options,
+ * private{}, export/unexport, …) is saved as a stubbed builder body and
+ * replayed here.  CmdOOShimObjDef forwards the stubbed body to TclOO (creating
+ * the methods with empty bodies and correct visibility), then calls
+ * PrecompObject to swap in the precompiled bodies on the object's OWN method
+ * table — never through class-definition (oo::define) machinery, even when the
+ * target object is itself a class.
+ * ========================================================================== */
+
+/* LdNextWord — advance to the next word token in a parsed command. */
+static inline const Tcl_Token *LdNextWord(const Tcl_Token *wordTok) {
+    return wordTok + 1 + wordTok->numComponents;
+}
+
+/* LdCmdCore — strip a leading ::-qualified prefix from a command word so a
+ * fully-qualified builder subcommand matches its bare keyword. */
+static inline const char *LdCmdCore(const char *s) {
+    if (!s)
+        return "";
+    while (s[0] == ':' && s[1] == ':')
+        s += 2;
+    return s;
+}
+
+/* LdWordLiteralObj — extract a word token's constant string value, or NULL if
+ * the word is not a static literal (contains variable/command substitution).
+ * Mirrors the save side's WordLiteralObj so load-side parsing of a stubbed
+ * builder body yields identical word values.  Returns a refcount-1 Tcl_Obj. */
+static Tcl_Obj *LdWordLiteralObj(const Tcl_Token *wordTok) {
+    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents == 1) {
+        const Tcl_Token *t = wordTok + 1;
+        if (t->type == TCL_TOKEN_TEXT) {
+            Tcl_Obj *o = Tcl_NewStringObj(t->start, t->size);
+            Tcl_IncrRefCount(o);
+            return o;
+        }
+    }
+    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents > 1) {
+        int allLiteral = 1;
+        for (Tcl_Size i = 0; i < wordTok->numComponents; i++) {
+            const Tcl_Token *sub = wordTok + 1 + i;
+            if (sub->type != TCL_TOKEN_TEXT && sub->type != TCL_TOKEN_BS) {
+                allLiteral = 0;
+                break;
+            }
+        }
+        if (allLiteral) {
+            Tcl_DString ds;
+            Tcl_DStringInit(&ds);
+            for (Tcl_Size i = 0; i < wordTok->numComponents; i++) {
+                const Tcl_Token *sub = wordTok + 1 + i;
+                if (sub->type == TCL_TOKEN_TEXT) {
+                    Tcl_DStringAppend(&ds, sub->start, sub->size);
+                } else {
+                    char buf[8];
+                    int  count     = 0;
+                    int  resultLen = Tcl_UtfBackslash(sub->start, &count, buf);
+                    Tcl_DStringAppend(&ds, buf, resultLen);
+                }
+            }
+            Tcl_Obj *o = Tcl_NewStringObj(Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
+            Tcl_DStringFree(&ds);
+            Tcl_IncrRefCount(o);
+            return o;
+        }
+    }
+    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD) {
+        const char *s = wordTok->start;
+        Tcl_Size    n = wordTok->size;
+        if (n >= 2 && s[0] == '{' && s[n - 1] == '}') {
+            Tcl_Obj *o = Tcl_NewStringObj(s + 1, n - 2);
+            Tcl_IncrRefCount(o);
+            return o;
+        }
+        Tcl_Obj *o = Tcl_NewStringObj(s, n);
+        Tcl_IncrRefCount(o);
+        return o;
+    }
+    {
+        const char *s = wordTok->start;
+        Tcl_Size    n = wordTok->size;
+        if (n >= 2 && s[0] == '{' && s[n - 1] == '}') {
+            Tcl_Obj *o = Tcl_NewStringObj(s + 1, n - 2);
+            Tcl_IncrRefCount(o);
+            return o;
+        }
+    }
+    return NULL;
+}
+
+/* Recursion bound for nested `private { … }` blocks in a builder body —
+ * matches the save side's TBCX_MAX_BLOCK_DEPTH so a hostile artifact cannot
+ * drive unbounded recursion. */
+#define TBCX_OBJBUILD_MAX_DEPTH 64
+
+/* Per-object builder replay collects, for each method NAME the builder defines,
+ * a COUNT of how many times it is defined (within-builder redefinition is
+ * last-wins).  The loader consumes that many FIFO records for the name and
+ * installs the last.  A separate whole-builder *anyVerbatim flag is raised when
+ * any method body is not the tbcx stub sentinel: that proves the saver emitted
+ * the entire builder verbatim (a non-literal name/args/body, or a runtime-
+ * variable target), so its real bytecode is already installed by the forward
+ * and none of its methods may be patched. */
+static void ObjBuilderCollectMethodsRec(Tcl_Interp *ip, const char *bstr, Tcl_Size blen, Tcl_HashTable *namesOut, int *sawUnsup, int *anyVerbatim, int depth) {
+    if (depth > TBCX_OBJBUILD_MAX_DEPTH)
+        return;
+    Tcl_Parse   p;
+    const char *cur    = bstr;
+    Tcl_Size    remain = blen;
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 1) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = LdWordLiteralObj(w0);
+            if (cmd) {
+                const char *kw = LdCmdCore(Tcl_GetString(cmd));
+                if (strcmp(kw, "method") == 0 && p.numWords >= 4) {
+                    /* Name is always the word right after `method` (a scope
+                       option, if any, sits between name and args). */
+                    const Tcl_Token *wN   = LdNextWord(w0);
+                    Tcl_Obj         *name = wN ? LdWordLiteralObj(wN) : NULL;
+                    /* Body is the last word.  Only the exact tbcx stub sentinel
+                       marks a captured method; any other body (a real body, a
+                       genuinely-empty {}, or a non-literal word) means the saver
+                       left this whole builder verbatim. */
+                    const Tcl_Token *wB = w0;
+                    for (Tcl_Size wi = 0; wi + 1 < p.numWords; wi++)
+                        wB = LdNextWord(wB);
+                    int      isStub = 0;
+                    Tcl_Obj *body   = LdWordLiteralObj(wB);
+                    if (body) {
+                        Tcl_Size    bln = 0;
+                        const char *bs  = Tbcx_GetStringFromObjSafe(body, &bln);
+                        if (bln == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs, TBCX_METH_STUB_BODY, (size_t)bln) == 0)
+                            isStub = 1;
+                        Tcl_DecrRefCount(body);
+                    }
+                    if (!isStub && anyVerbatim)
+                        *anyVerbatim = 1;
+                    if (name) {
+                        int            isNew = 0;
+                        Tcl_HashEntry *he    = Tcl_CreateHashEntry(namesOut, Tcl_GetString(name), &isNew);
+                        intptr_t       prev  = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
+                        Tcl_SetHashValue(he, (void *)(prev + 1)); /* occurrence count */
+                        Tcl_DecrRefCount(name);
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
+                    /* Block form: recurse into `private { … }`. */
+                    const Tcl_Token *wBlock = LdNextWord(w0);
+                    Tcl_Obj         *block  = wBlock ? LdWordLiteralObj(wBlock) : NULL;
+                    if (block) {
+                        Tcl_Size    bl2 = 0;
+                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                        ObjBuilderCollectMethodsRec(ip, bs2, bl2, namesOut, sawUnsup, anyVerbatim, depth + 1);
+                        Tcl_DecrRefCount(block);
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                    /* Inline form: `private method NAME …` — recurse over the
+                       tail (everything after the leading `private` word). */
+                    const char *raw  = p.commandStart;
+                    Tcl_Size    rl   = p.commandSize;
+                    Tcl_Size    skip = 0;
+                    while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
+                        skip++;
+                    while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
+                        skip++;
+                    if (skip < rl)
+                        ObjBuilderCollectMethodsRec(ip, raw + skip, rl - skip, namesOut, sawUnsup, anyVerbatim, depth + 1);
+                } else if (strcmp(kw, "classmethod") == 0 || strcmp(kw, "constructor") == 0 || strcmp(kw, "destructor") == 0) {
+                    /* Body-bearing forms that object-definition replay cannot
+                       install as per-object methods. */
+                    if (sawUnsup)
+                        *sawUnsup = 1;
+                } else if (strcmp(kw, "self") == 0 && p.numWords >= 3) {
+                    const Tcl_Token *wSub = LdNextWord(w0);
+                    Tcl_Obj         *sub  = wSub ? LdWordLiteralObj(wSub) : NULL;
+                    if (sub) {
+                        if (strcmp(Tcl_GetString(sub), "method") == 0 && sawUnsup)
+                            *sawUnsup = 1;
+                        Tcl_DecrRefCount(sub);
+                    }
+                }
+                Tcl_DecrRefCount(cmd);
+            }
+        }
+        cur    = p.commandStart + p.commandSize;
+        remain = (bstr + blen) - cur;
+        Tcl_FreeParse(&p);
+    }
+}
+
+/* ObjBuilderCollectMethods — collect the exact per-object method NAMES defined
+ * by a just-forwarded `oo::objdefine OBJ { … }` builder body, so PrecompObject
+ * patches only those object-method shells (never a same-FQN class method, never
+ * a pre-existing object method).  Recurses through `private { … }` and inline
+ * `private method …`.  Only `method` definitions contribute names; export and
+ * unexport are intentionally skipped (they may target methods defined elsewhere
+ * and never imply a precompiled body is available).  Sets *sawUnsup when a body
+ * form object replay cannot install (classmethod/self method/constructor/
+ * destructor) is present, and *anyVerbatimOut when any method body is not the
+ * stub sentinel (whole-builder verbatim).  namesOut must be an initialized
+ * TCL_STRING_KEYS table; each name maps to its occurrence count in the builder. */
+static int ObjBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *builderBody, Tcl_HashTable *namesOut, int *sawUnsupportedBodyFormOut, int *anyVerbatimOut) {
+    if (sawUnsupportedBodyFormOut)
+        *sawUnsupportedBodyFormOut = 0;
+    if (anyVerbatimOut)
+        *anyVerbatimOut = 0;
+    Tcl_Size    blen = 0;
+    const char *bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
+    ObjBuilderCollectMethodsRec(ip, bstr, blen, namesOut, sawUnsupportedBodyFormOut, anyVerbatimOut, 0);
+    return TCL_OK;
+}
+
+/* ClassBuilderCollectMethodsRec — parse a just-forwarded (stubbed) oo::define
+ * class builder body and tally, per method KEY, how many times THIS builder
+ * defines it.  Only method/classmethod/constructor/destructor whose body is the
+ * tbcx stub sentinel are counted; a non-sentinel body means the saver left this
+ * whole builder verbatim (its real bytecode is already installed by the
+ * forward), so it is skipped.  `self` forms are skipped entirely — they install
+ * via flat `oo::define … self method` stubs.  Recurses through `private { … }`
+ * and inline `private method …`.  keysOut maps each method KEY
+ * (FQN\x1Fkind\x1Forigin=class\x1Fname, as built by MethodKeyBuf) to its
+ * occurrence count. */
+static void ClassBuilderCollectMethodsRec(Tcl_Interp *ip, Tcl_Obj *clsFqn, const char *bstr, Tcl_Size blen, Tcl_HashTable *keysOut, int depth) {
+    if (depth > TBCX_OBJBUILD_MAX_DEPTH)
+        return;
+    Tcl_Parse   p;
+    const char *cur    = bstr;
+    Tcl_Size    remain = blen;
+    while (remain > 0) {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+            Tcl_FreeParse(&p);
+            break;
+        }
+        if (p.numWords >= 1) {
+            const Tcl_Token *w0 = p.tokenPtr;
+            if (w0->type == TCL_TOKEN_COMMAND)
+                w0++;
+            Tcl_Obj *cmd = LdWordLiteralObj(w0);
+            if (cmd) {
+                const char *kw          = LdCmdCore(Tcl_GetString(cmd));
+                uint8_t     mkind       = TBCX_METH_NONE;
+                Tcl_Obj    *name        = NULL; /* method/classmethod name only */
+                int         bodyBearing = 0;
+                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+                    mkind = (strcmp(kw, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
+                    const Tcl_Token *wN = LdNextWord(w0);
+                    name                = wN ? LdWordLiteralObj(wN) : NULL;
+                    bodyBearing         = 1;
+                } else if (strcmp(kw, "constructor") == 0 && p.numWords >= 2) {
+                    mkind       = TBCX_METH_CTOR;
+                    bodyBearing = 1;
+                } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
+                    mkind       = TBCX_METH_DTOR;
+                    bodyBearing = 1;
+                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
+                    const Tcl_Token *wBlock = LdNextWord(w0);
+                    Tcl_Obj         *block  = wBlock ? LdWordLiteralObj(wBlock) : NULL;
+                    if (block) {
+                        Tcl_Size    bl2 = 0;
+                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                        ClassBuilderCollectMethodsRec(ip, clsFqn, bs2, bl2, keysOut, depth + 1);
+                        Tcl_DecrRefCount(block);
+                    }
+                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                    const char *raw  = p.commandStart;
+                    Tcl_Size    rl   = p.commandSize;
+                    Tcl_Size    skip = 0;
+                    while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
+                        skip++;
+                    while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
+                        skip++;
+                    if (skip < rl)
+                        ClassBuilderCollectMethodsRec(ip, clsFqn, raw + skip, rl - skip, keysOut, depth + 1);
+                }
+                /* `self` forms: skipped (no branch). */
+
+                if (bodyBearing) {
+                    /* Body is the last word; only the sentinel marks a captured
+                       (stubbed) method.  Any other body was left verbatim. */
+                    const Tcl_Token *wB = w0;
+                    for (Tcl_Size wi = 0; wi + 1 < p.numWords; wi++)
+                        wB = LdNextWord(wB);
+                    int      isStub = 0;
+                    Tcl_Obj *body   = LdWordLiteralObj(wB);
+                    if (body) {
+                        Tcl_Size    bln = 0;
+                        const char *bs  = Tbcx_GetStringFromObjSafe(body, &bln);
+                        if (bln == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs, TBCX_METH_STUB_BODY, (size_t)bln) == 0)
+                            isStub = 1;
+                        Tcl_DecrRefCount(body);
+                    }
+                    if (isStub) {
+                        Tcl_DString keyDs;
+                        if (MethodKeyBuf(&keyDs, clsFqn, mkind, TBCX_MORIGIN_CLASS, (mkind == TBCX_METH_INST || mkind == TBCX_METH_CLASS) ? name : NULL)) {
+                            int            isNew = 0;
+                            Tcl_HashEntry *he    = Tcl_CreateHashEntry(keysOut, Tcl_DStringValue(&keyDs), &isNew);
+                            intptr_t       prev  = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
+                            Tcl_SetHashValue(he, (void *)(prev + 1));
+                            Tcl_DStringFree(&keyDs);
+                        }
+                    }
+                }
+                if (name)
+                    Tcl_DecrRefCount(name);
+                Tcl_DecrRefCount(cmd);
+            }
+        }
+        cur    = p.commandStart + p.commandSize;
+        remain = (bstr + blen) - cur;
+        Tcl_FreeParse(&p);
+    }
+}
+
+static void ClassBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *builderBody, Tcl_HashTable *keysOut) {
+    Tcl_Size    blen = 0;
+    const char *bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
+    ClassBuilderCollectMethodsRec(ip, clsFqn, bstr, blen, keysOut, 0);
+}
+
+/* DefOOObj — install a precompiled body onto a normal (exported / unexported,
+ * not true-private) per-object method via the saved original oo::objdefine
+ * handler in the canonical `oo::objdefine OBJ method NAME ARGS preBody` form.
+ * preBody carries the precompiled procbody internal rep, so TclOO installs the
+ * bytecode (its ";" string rep is never compiled).  Visibility is NOT applied
+ * here — re-defining a method resets it to the name-case default; the caller
+ * restores any non-default export state afterward via TbcxApplyObjExportVisibility. */
+static int DefOOObj(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody) {
+    Tcl_Obj *objdefWord = Tcl_NewStringObj("oo::objdefine", -1);
+    Tcl_IncrRefCount(objdefWord);
+    Tcl_Obj *methodWord = Tcl_NewStringObj("method", -1);
+    Tcl_IncrRefCount(methodWord);
+    Tcl_IncrRefCount(objFqn);
+    Tcl_IncrRefCount(name);
+    Tcl_IncrRefCount(args);
+    Tcl_IncrRefCount(preBody);
+    Tcl_Obj *av[6] = {objdefWord, objFqn, methodWord, name, args, preBody};
+    int      rc    = os->savedObjdefProc(os->savedObjdefCD, ip, 6, av);
+    Tcl_DecrRefCount(preBody);
+    Tcl_DecrRefCount(args);
+    Tcl_DecrRefCount(name);
+    Tcl_DecrRefCount(objFqn);
+    Tcl_DecrRefCount(methodWord);
+    Tcl_DecrRefCount(objdefWord);
+    return rc;
+}
+
+static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *builderBody) {
+    /* 1. Collect the exact method names defined by the just-forwarded builder. */
+    Tcl_HashTable names;
+    Tcl_InitHashTable(&names, TCL_STRING_KEYS);
+    int sawUnsupported = 0;
+    int anyVerbatim    = 0;
+    ObjBuilderCollectMethods(ip, builderBody, &names, &sawUnsupported, &anyVerbatim);
+
+    /* 2. Resolve the target object.  Per-object replay patches the object's
+       OWN method table even when the object is also a class — never via
+       oo::define / Tcl_GetObjectAsClass. */
+    Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, objFqn);
+    if (!tclObj) {
+        Tcl_DeleteHashTable(&names);
+        return TCL_ERROR; /* leave TclOO's "no such object" error in the interp */
+    }
+    Object *oPtr = (Object *)tclObj;
+
+    /* A body-bearing form object replay cannot install slipped past a
+       successful forward (TclOO normally rejects classmethod/self method/
+       constructor/destructor for oo::objdefine, so rc would already be an
+       error and PrecompObject would not run).  Fail loudly rather than leave
+       an unpatched stub installed. */
+    if (sawUnsupported) {
+        Tcl_DeleteHashTable(&names);
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: unsupported per-object method form (classmethod/self/constructor/destructor) in oo::objdefine builder for %s", Tbcx_GetStringSafe(objFqn)));
+        return TCL_ERROR;
+    }
+
+    /* Declarative-only builder (no methods): nothing to patch. */
+    Tcl_HashSearch s;
+    Tcl_HashEntry *e;
+    if (Tcl_FirstHashEntry(&names, &s) == NULL) {
+        Tcl_DeleteHashTable(&names);
+        return TCL_OK;
+    }
+
+    /* 2a. Whole-builder verbatim short-circuit.  The saver leaves an ENTIRE
+       braced builder verbatim when any one of its methods cannot be captured
+       (non-literal name/args/body, or a runtime-variable target).  A stubbed
+       builder, in contrast, gives every method the tbcx stub sentinel as its
+       body, so any non-sentinel method body proves the whole builder was
+       emitted verbatim and its real bytecode is already installed by the
+       forward.  None of its methods may be patched (and it owns no records to
+       patch from), so leave them all intact — deciding per method would let an
+       empty-bodied sibling be wrongly patched from another builder's record. */
+    if (anyVerbatim) {
+        Tcl_DeleteHashTable(&names);
+        return TCL_OK;
+    }
+
+    /* 3. Install: for each builder method name, consume its `count` FIFO
+       records (within-builder redefinition is last-wins) and install the LAST.
+       Records arrive in definition order, so the front `count` belong to THIS
+       builder; consuming them keeps a later builder's same-name records intact
+       for its own replay.  Per-object replay installs instance-kind
+       (TBCX_METH_INST) object-origin records only. */
+    int rc = TCL_OK;
+    for (e = Tcl_FirstHashEntry(&names, &s); e && rc == TCL_OK; e = Tcl_NextHashEntry(&s)) {
+        const char *nm    = (const char *)Tcl_GetHashKey(&names, e);
+        Tcl_Size    count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(e);
+        if (count <= 0)
+            continue;
+        Tcl_Obj *nameObj = Tcl_NewStringObj(nm, -1);
+        Tcl_IncrRefCount(nameObj);
+
+        /* Snapshot this method's post-forward visibility (TclOO ground truth,
+           established by the builder's scope options / private{} / export /
+           unexport) BEFORE the install below resets it to the name-case
+           default.  Installing an EARLIER name does not disturb this one, so a
+           per-name read just before its own install is exact. */
+        int haveSnap  = 0;
+        int snapFlags = 0;
+        if (oPtr->methodsPtr) {
+            Tcl_HashEntry *me = Tcl_FindHashEntry(oPtr->methodsPtr, (const char *)nameObj);
+            if (me) {
+                Method *mPtr = (Method *)Tcl_GetHashValue(me);
+                if (mPtr) {
+                    haveSnap  = 1;
+                    snapFlags = mPtr->flags;
+                }
+            }
+        }
+
+        Tcl_DString keyDs;
+        if (!MethodKeyBuf(&keyDs, objFqn, TBCX_METH_INST, TBCX_MORIGIN_OBJECT, nameObj)) {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid object-method key", -1));
+            Tcl_DecrRefCount(nameObj);
+            rc = TCL_ERROR;
+            break;
+        }
+        /* Consume `count` records (front of the FIFO); keep the last. */
+        Tcl_Obj *pair = NULL;
+        for (Tcl_Size k = 0; k < count; k++) {
+            Tcl_Obj *rec = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
+            if (rec)
+                pair = rec; /* borrowed (owned by os->retired) */
+        }
+        Tcl_DStringFree(&keyDs);
+        if (!pair) {
+            /* The builder defined this method (sentinel body) but no precompiled
+               record was available.  Fail loudly: a surviving stub body would
+               convert a compile-time gap into wrong runtime behavior. */
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing precompiled object method body for %s %s", Tbcx_GetStringSafe(objFqn), nm));
+            Tcl_DecrRefCount(nameObj);
+            rc = TCL_ERROR;
+            break;
+        }
+        Tcl_Obj *savedArgs = NULL, *preBody = NULL;
+        int      pairScope = TBCX_MSCOPE_DEFAULT;
+        {
+            Tcl_Size  plen = 0;
+            Tcl_Obj **pel  = NULL;
+            if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) != TCL_OK || plen < 2) {
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: malformed object-method record", -1));
+                Tcl_DecrRefCount(nameObj);
+                rc = TCL_ERROR;
+                break;
+            }
+            savedArgs = pel[0];
+            preBody   = pel[1];
+            pairScope = PairScope(ip, pair);
+        }
+
+        /* Final visibility.  Prefer the post-forward flags (TclOO ground truth);
+           fall back to the saved scope byte when the method is absent from the
+           object table (defensive; should not occur for a forwarded builder). */
+        int defPublic = (nm[0] >= 'a' && nm[0] <= 'z');
+        int isPrivate, isPublic;
+        if (haveSnap) {
+            isPrivate = (snapFlags & TRUE_PRIVATE_METHOD) ? 1 : 0;
+            isPublic  = (snapFlags & PUBLIC_METHOD) ? 1 : 0;
+        } else {
+            isPrivate = (pairScope == TBCX_MSCOPE_TRUE_PRIVATE) ? 1 : 0;
+            isPublic  = (pairScope == TBCX_MSCOPE_PUBLIC) ? 1 : (pairScope == TBCX_MSCOPE_UNEXPORTED) ? 0 : defPublic;
+        }
+
+        if (isPrivate) {
+            /* True-private: re-create via the flat private form so TclOO
+               re-establishes the TIP 500 scope around the precompiled body. */
+            rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameObj, savedArgs, preBody, TBCX_METH_INST);
+        } else {
+            rc = DefOOObj(ip, os, objFqn, nameObj, savedArgs, preBody);
+            if (rc == TCL_OK && isPublic != defPublic)
+                rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameObj, isPublic);
+        }
+        Tcl_DecrRefCount(nameObj);
+    }
+
+    Tcl_DeleteHashTable(&names);
+    return rc;
+}
+
 /* OOShim_IdentifyMethod — parse the oo::define subcommand to determine
  * method kind, body index, args reference, and hash key for precompiled
  * body lookup.  Sets *hasKeyOut=1 and initializes keyDs on success. */
@@ -1123,7 +1711,7 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
             Tcl_Size nameIdx = objc - 3, argsIdx = objc - 2;
             *bodyIdxOut     = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
-            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, objv[nameIdx]))
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, objv[nameIdx]))
                 *hasKeyOut = 1;
             *nameOOut = objv[nameIdx];
         }
@@ -1133,7 +1721,7 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
             Tcl_Size argsIdx = objc - 2;
             *bodyIdxOut      = objc - 1;
             *runtimeArgsOut  = objv[argsIdx];
-            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, NULL))
                 *hasKeyOut = 1;
         }
     } else if (strcmp(subc, "destructor") == 0) {
@@ -1142,14 +1730,14 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
             Tcl_Size argsIdx = objc - 2;
             *bodyIdxOut      = objc - 1;
             *runtimeArgsOut  = objv[argsIdx];
-            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, NULL))
                 *hasKeyOut = 1;
         } else if (objc == 4) {
             *bodyIdxOut     = 3;
             *runtimeArgsOut = Tcl_NewStringObj("", 0);
             Tcl_IncrRefCount(*runtimeArgsOut);
             *tmpEmptyArgsOut = *runtimeArgsOut;
-            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, NULL))
+            if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, NULL))
                 *hasKeyOut = 1;
         }
     }
@@ -1164,33 +1752,8 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
             *bodyIdxOut     = objc - 1;
             *runtimeArgsOut = objv[objc - 2];
             *nameOOut       = objv[objc - 3];
-            if (MethodKeyBuf(keyDs, clsFqn, TBCX_METH_SELF, *nameOOut))
+            if (MethodKeyBuf(keyDs, clsFqn, TBCX_METH_SELF, TBCX_MORIGIN_CLASS, *nameOOut))
                 *hasKeyOut = 1;
-        }
-    }
-}
-
-/* OOShim_LookupPair — look up the precompiled {args, procbody, scope} triple
- * for the given method key.  Returns the elements via out-params. */
-static void OOShim_LookupPair(Tcl_Interp *ip, OOShim *os, Tcl_DString *keyDs, int hasKey, Tcl_Size bodyIdx, Tcl_Obj *runtimeArgs, Tcl_Obj **savedArgsOut, Tcl_Obj **preBodyOut, int *scopeOut) {
-    *savedArgsOut = NULL;
-    *preBodyOut   = NULL;
-    if (scopeOut)
-        *scopeOut = TBCX_MSCOPE_DEFAULT;
-    if (hasKey && bodyIdx >= 0 && runtimeArgs != NULL) {
-        Tcl_HashEntry *he = Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(keyDs));
-        if (he) {
-            Tcl_Obj *pair = (Tcl_Obj *)Tcl_GetHashValue(he);
-            if (pair) {
-                Tcl_Size  pairLen   = 0;
-                Tcl_Obj **pairElems = NULL;
-                if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) == TCL_OK && pairLen >= 2) {
-                    *savedArgsOut = pairElems[0];
-                    *preBodyOut   = pairElems[1];
-                    if (scopeOut)
-                        *scopeOut = PairScope(ip, pair);
-                }
-            }
         }
     }
 }
@@ -1266,59 +1829,49 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
     uint8_t     kind         = TBCX_METH_NONE; /* TBCX_METH_* */
     int         methScope    = TBCX_MSCOPE_DEFAULT;
 
-    /* Identify the OO subcommand and look up a precompiled pair. */
+    /* Identify the OO subcommand and build its method key. */
     OOShim_IdentifyMethod(subc, objc, objv, clsFqn, &keyDs, &kind, &bodyIdx, &runtimeArgs, &nameO, &tmpEmptyArgs, &hasKey);
-    OOShim_LookupPair(ip, os, &keyDs, hasKey, bodyIdx, runtimeArgs, &savedArgs, &preBody, &methScope);
-
-    /* If we have a precompiled body and the signature matches byte-wise,
-       substitute the body argument and call the original. */
-    if (preBody && savedArgs && !isBuilderForm) {
-        if (kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) {
-            rc = DefOO(ip, os, clsFqn, kind, NULL, (kind == TBCX_METH_CTOR ? savedArgs : NULL), preBody, TBCX_MSCOPE_DEFAULT);
-            goto cleanup;
-        }
-        Tcl_Size _dummyLen = 0;
-        /* Force list-shimmering so the string rep is canonical before
-           byte-wise comparison.  If conversion fails the comparison still
-           works on the existing string rep; clear the interp result to
-           avoid contaminating later evaluation. */
-        if (Tcl_ListObjLength(ip, runtimeArgs, &_dummyLen) != TCL_OK)
-            Tcl_ResetResult(ip);
-        if (Tcl_ListObjLength(ip, savedArgs, &_dummyLen) != TCL_OK)
-            Tcl_ResetResult(ip);
-        Tcl_Size    aLen = 0, bLen = 0;
-        const char *a = Tbcx_GetStringFromObjSafe(runtimeArgs, &aLen);
-        const char *b = Tbcx_GetStringFromObjSafe(savedArgs, &bLen);
-
-        if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0) {
-            rc = DefOO(ip, os, clsFqn, kind, (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) ? nameO : NULL, (kind == TBCX_METH_DTOR ? savedArgs : savedArgs), preBody, methScope);
-            goto cleanup;
-        }
-        /* Fast path for stubbed empty bodies: install precompiled body directly. */
-        if (preBody && bodyIdx >= 0) {
-            Tcl_Size bodyLen = 0;
-            (void)Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bodyLen);
-            if (bodyLen == 0) {
-                if (kind == TBCX_METH_CTOR) {
-                    Tcl_Obj *argsForCtor = savedArgs ? savedArgs : Tcl_NewObj();
-                    if (!savedArgs)
-                        Tcl_IncrRefCount(argsForCtor);
-                    rc = DefOO(ip, os, clsFqn, TBCX_METH_CTOR, NULL, argsForCtor, preBody, TBCX_MSCOPE_DEFAULT);
-                    if (!savedArgs)
-                        Tcl_DecrRefCount(argsForCtor);
-                } else if (kind == TBCX_METH_DTOR) {
-                    rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody, TBCX_MSCOPE_DEFAULT);
-                } else {
-                    rc = DefOO(ip, os, clsFqn, kind, nameO, savedArgs, preBody, methScope);
-                }
-                /* cleanup and return */
-                goto cleanup;
-            }
-        }
-    }
 
     if (!isBuilderForm) {
-        /* Fallback: forward to the original without substitution.
+        /* A flat method/ctor/dtor/self statement the saver stubbed carries the
+           stub sentinel as its body.  A statement the saver left VERBATIM (a
+           runtime-variable target, or a non-literal name/args/body it never
+           captured) carries its real body, which is never the sentinel, so it
+           is never patched from a precompiled record — even one a sibling
+           builder keyed the same.  This is the class-side mirror of the
+           per-object sentinel gate. */
+        int bodyIsStub = 0;
+        if (bodyIdx >= 0) {
+            Tcl_Size    bl0 = 0;
+            const char *bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
+            bodyIsStub      = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
+        }
+        if (hasKey && bodyIsStub) {
+            /* One flat statement installs one method: consume exactly one FIFO
+               record (front == this statement's, in definition order). */
+            Tcl_Obj *pair = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
+            if (pair) {
+                Tcl_Size  plen = 0;
+                Tcl_Obj **pel  = NULL;
+                if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) == TCL_OK && plen >= 2) {
+                    savedArgs = pel[0];
+                    preBody   = pel[1];
+                    methScope = PairScope(ip, pair);
+                }
+                if (preBody) {
+                    if (kind == TBCX_METH_CTOR) {
+                        rc = DefOO(ip, os, clsFqn, TBCX_METH_CTOR, NULL, savedArgs, preBody, TBCX_MSCOPE_DEFAULT);
+                    } else if (kind == TBCX_METH_DTOR) {
+                        rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody, TBCX_MSCOPE_DEFAULT);
+                    } else { /* INST / CLASS / SELF */
+                        rc = DefOO(ip, os, clsFqn, kind, nameO, savedArgs, preBody, methScope);
+                    }
+                    goto cleanup;
+                }
+            }
+        }
+
+        /* Not a tbcx stub (or no record left): forward to the original.
          * Special tolerance for destructor with accidental empty-args list:
          * If objc>=5 and args=={}, collapse to canonical 4-arg form.
          */
@@ -1342,7 +1895,7 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 Tcl_DecrRefCount(clsFqn);
             }
         } else {
-            /* For builder form and other subcommands, ensure class arg is FQN */
+            /* Forward other subcommands; ensure class arg is FQN */
             if (objc >= 2) {
                 argv2[1] = clsFqn;
                 Tcl_IncrRefCount(clsFqn);
@@ -1352,9 +1905,11 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
                 Tcl_DecrRefCount(clsFqn);
         }
     } else {
-        /* Builder form: run the builder block first, then apply precompiled bodies
-         * for this class (namespace-relative class names resolved to FQN above). */
-        /* Ensure class arg is FQN and stay in current namespace (not global) */
+        /* Builder form: run the builder block first, then install the
+           precompiled bodies for THIS builder via PrecompClass (which parses
+           the just-forwarded builder body — objv[2] == sub).  Builder-scoping
+           is what keeps interleaved same-class redefinitions correct: each
+           builder installs only its own methods, in definition order. */
         if (objc >= 2) {
             argv2[1] = clsFqn;
             Tcl_IncrRefCount(clsFqn);
@@ -1363,54 +1918,9 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
         if (objc >= 2)
             Tcl_DecrRefCount(clsFqn);
         if (rc == TCL_OK) {
-            int patchRc = PrecompClass(ip, os, clsFqn);
+            int patchRc = PrecompClass(ip, os, clsFqn, sub);
             if (patchRc != TCL_OK) {
                 rc = patchRc; /* leave error in interp */
-            }
-        }
-    }
-    /*
-     * HARDENING: Even if the inline substitution above didn’t trigger,
-     * ensure the precompiled body is installed. If we have a saved
-     * {args,procbody} pair for this exact define form, re-apply it now
-     * using the saved original handler. This
-     * guarantees the constructor/method ends up with the compiled body
-     * instead of the empty stub emitted by the saver.
-     */
-    if (rc == TCL_OK && hasKey) {
-        Tcl_HashEntry *he2 = Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs));
-        if (he2) {
-            Tcl_Obj *pair2      = (Tcl_Obj *)Tcl_GetHashValue(he2);
-            Tcl_Obj *savedArgs2 = NULL, *preBody2 = NULL;
-            int      scope2     = TBCX_MSCOPE_DEFAULT;
-            if (pair2) {
-                Tcl_Size  p2Len   = 0;
-                Tcl_Obj **p2Elems = NULL;
-                if (Tcl_ListObjGetElements(ip, pair2, &p2Len, &p2Elems) == TCL_OK && p2Len >= 2) {
-                    savedArgs2 = p2Elems[0];
-                    preBody2   = p2Elems[1];
-                    scope2     = PairScope(ip, pair2);
-                }
-            }
-            if (savedArgs2 && preBody2) {
-                /* Normalize class arg to FQN for deterministic resolution */
-                Tcl_Obj *clsForCall = clsFqn;
-                if (clsForCall != cls)
-                    Tcl_IncrRefCount(clsForCall);
-                int rc2 = TCL_OK;
-                if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) {
-                    if (nameO) {
-                        rc2 = DefOO(ip, os, clsForCall, kind, nameO, savedArgs2, preBody2, scope2);
-                    }
-                } else if (kind == TBCX_METH_CTOR) {
-                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_CTOR, NULL, savedArgs2, preBody2, TBCX_MSCOPE_DEFAULT);
-                } else if (kind == TBCX_METH_DTOR) {
-                    rc2 = DefOO(ip, os, clsForCall, TBCX_METH_DTOR, NULL, NULL, preBody2, TBCX_MSCOPE_DEFAULT);
-                }
-                if (rc2 != TCL_OK)
-                    rc = rc2;
-                if (clsForCall != cls)
-                    Tcl_DecrRefCount(clsForCall);
             }
         }
     }
@@ -1490,20 +2000,23 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
 
         if ((strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) && objc >= 6) {
             kind    = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
+            /* Syntax: oo::objdefine OBJ method NAME ?-export|-unexport|-private? ARGS BODY.
+               NAME is ALWAYS objv[3]; ARGS/BODY are the last two words, with any
+               scope option in between. */
             bodyIdx = objc - 1;
-            nameO   = objv[objc - 3];
-            if (MethodKeyBuf(&keyDs, objFqn, kind, nameO))
+            nameO   = objv[3];
+            if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, nameO))
                 hasKey = 1;
             /* Fallback: for "method" in oo::objdefine context, the saver
                may have stored it as TBCX_METH_SELF (kind=4).  Try that key
                if the INST key has no match. */
             if (strcmp(subc, "method") == 0 && hasKey && !Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs))) {
                 Tcl_DString selfDs;
-                if (MethodKeyBuf(&selfDs, objFqn, TBCX_METH_SELF, nameO)) {
+                if (MethodKeyBuf(&selfDs, objFqn, TBCX_METH_SELF, TBCX_MORIGIN_OBJECT, nameO)) {
                     if (Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&selfDs))) {
                         /* Rebuild keyDs with the SELF key */
                         Tcl_DStringFree(&keyDs);
-                        MethodKeyBuf(&keyDs, objFqn, TBCX_METH_SELF, nameO);
+                        MethodKeyBuf(&keyDs, objFqn, TBCX_METH_SELF, TBCX_MORIGIN_OBJECT, nameO);
                         kind = TBCX_METH_SELF;
                     }
                     Tcl_DStringFree(&selfDs);
@@ -1512,22 +2025,37 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
         } else if (strcmp(subc, "constructor") == 0 && objc >= 5) {
             kind    = TBCX_METH_CTOR;
             bodyIdx = objc - 1;
-            if (MethodKeyBuf(&keyDs, objFqn, kind, NULL))
+            if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, NULL))
                 hasKey = 1;
         } else if (strcmp(subc, "destructor") == 0 && objc >= 4) {
             kind    = TBCX_METH_DTOR;
             bodyIdx = objc - 1;
-            if (MethodKeyBuf(&keyDs, objFqn, kind, NULL))
+            if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, NULL))
                 hasKey = 1;
         }
 
-        if (hasKey && bodyIdx >= 0) {
-            Tcl_HashEntry *he = Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs));
-            if (he) {
-                Tcl_Obj *pair      = (Tcl_Obj *)Tcl_GetHashValue(he);
-                Tcl_Obj *savedArgs = NULL, *preBody = NULL;
-                int      objScope  = TBCX_MSCOPE_DEFAULT;
+        /* Only a flat statement the saver stubbed carries the stub sentinel as
+           its body; a verbatim statement (e.g. a runtime-variable target the
+           saver left unchanged) has a real body and must never be patched from
+           a precompiled record — even one keyed the same by another builder. */
+        int bodyIsStub = 0;
+        if (bodyIdx >= 0) {
+            Tcl_Size    bl0 = 0;
+            const char *bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
+            bodyIsStub      = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
+        }
+        if (hasKey) {
+            if (bodyIsStub && bodyIdx >= 0) {
+                /* One flat statement installs one method: consume exactly one
+                   FIFO record (front == this statement's, in definition order).
+                   A self method delegated here from `oo::define CLS self method`
+                   carries the ";" placeholder (never the sentinel), so kind is
+                   never SELF on this gated path; the oo::define self path
+                   consumes its own FIFO record. */
+                Tcl_Obj *pair = (kind == TBCX_METH_SELF) ? NULL : OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
                 if (pair) {
+                    Tcl_Obj *savedArgs = NULL, *preBody = NULL;
+                    int      objScope  = TBCX_MSCOPE_DEFAULT;
                     Tcl_Size  pLen   = 0;
                     Tcl_Obj **pElems = NULL;
                     if (Tcl_ListObjGetElements(ip, pair, &pLen, &pElems) == TCL_OK && pLen >= 2) {
@@ -1535,40 +2063,20 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
                         preBody   = pElems[1];
                         objScope  = PairScope(ip, pair);
                     }
-                }
-                if (preBody) {
-                    /* CRITICAL: Do NOT substitute procbody for SELF methods.
-                       When oo::define CLS self method ... is processed,
-                       TclOO's "self" subcommand internally delegates to
-                       oo::objdefine, which hits this shim.  Substituting
-                       the procbody here creates a method that doesn't
-                       survive TclOO's method chain rebuilds (triggered by
-                       subclass "superclass" declarations).  Instead, just
-                       forward with the original ";" body so TclOO creates
-                       a valid Method+Proc.  The DefOO SELF create-then-swap
-                       in the define shim will handle the bytecode installation
-                       by swapping the Proc's bodyPtr after oo::define returns. */
-                    if (kind == TBCX_METH_SELF) {
-                        Tcl_DStringFree(&keyDs);
-                        goto objdefine_forward; /* skip second DStringFree */
-                    } else if ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && objScope == TBCX_MSCOPE_TRUE_PRIVATE) {
-                        /* True-private per-object method: install via the flat
-                           private form so TclOO establishes the scope. */
-                        rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameO, savedArgs ? savedArgs : objv[objc - 2], preBody, kind);
-                        Tcl_DStringFree(&keyDs);
-                        if (objFqn != obj)
-                            Tcl_DecrRefCount(objFqn);
-                        if (argv2 != argvStack)
-                            Tcl_Free(argv2);
-                        return rc;
-                    } else {
-                        /* Substitute the body argument and forward */
-                        argv2[bodyIdx] = preBody;
-                        rc             = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
-                        /* Apply explicit export/unexport scope (per-object
-                           methods default to name-case visibility otherwise). */
-                        if (rc == TCL_OK && (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && (objScope == TBCX_MSCOPE_PUBLIC || objScope == TBCX_MSCOPE_UNEXPORTED) && nameO)
-                            rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameO, objScope == TBCX_MSCOPE_PUBLIC);
+                    if (preBody) {
+                        if ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && objScope == TBCX_MSCOPE_TRUE_PRIVATE) {
+                            /* True-private per-object method: install via the
+                               flat private form so TclOO establishes the scope. */
+                            rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameO, savedArgs ? savedArgs : objv[objc - 2], preBody, kind);
+                        } else {
+                            /* Substitute the body argument and forward. */
+                            argv2[bodyIdx] = preBody;
+                            rc             = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
+                            /* Apply explicit export/unexport scope (per-object
+                               methods default to name-case visibility). */
+                            if (rc == TCL_OK && (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && (objScope == TBCX_MSCOPE_PUBLIC || objScope == TBCX_MSCOPE_UNEXPORTED) && nameO)
+                                rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameO, objScope == TBCX_MSCOPE_PUBLIC);
+                        }
                         Tcl_DStringFree(&keyDs);
                         if (objFqn != obj)
                             Tcl_DecrRefCount(objFqn);
@@ -1582,17 +2090,20 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
         }
     }
 
-objdefine_forward:
     /* Builder form or unmatched: forward to real oo::objdefine */
     rc = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
 
-    /* After builder form execution, apply precompiled bodies.
-       Use the saved oo::define handler for body installation via PrecompClass,
-       since per-object methods can also be set through oo::define on the object. */
+    /* After a braced builder runs, patch the precompiled per-object method
+       bodies onto the OBJECT's own method table via PrecompObject.  objv[2] is
+       the (stubbed) builder body — PrecompObject parses it to learn exactly
+       which method names this builder defined and patches only those, honouring
+       scope options, private{} blocks, and export/unexport.  This is object-
+       definition semantics, not oo::define class machinery, so it is correct
+       even when objFqn names a class object. */
     if (isBuilderForm && rc == TCL_OK) {
-        int patchRc = PrecompClass(ip, os, objFqn);
+        int patchRc = PrecompObject(ip, os, objFqn, objv[2]);
         if (patchRc != TCL_OK) {
-            rc = patchRc; /* preserve PrecompClass() error/result */
+            rc = patchRc; /* preserve PrecompObject() error/result */
         }
     }
 
@@ -1666,11 +2177,16 @@ static void OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldNa
 static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
     memset(os, 0, sizeof(*os));
     Tcl_InitHashTable(&os->methodsByKey, TCL_STRING_KEYS);
+    /* Retains every triple consumed from a methodsByKey FIFO so its precompiled
+       Proc outlives the consumption and is freed once, here, at DelOOShim. */
+    os->retired = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(os->retired);
 
     /* Find and patch oo::define */
     Tcl_Command defToken = Tcl_FindCommand(ip, "oo::define", NULL, 0);
     if (!defToken) {
         Tcl_DeleteHashTable(&os->methodsByKey);
+        Tcl_DecrRefCount(os->retired);
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: oo::define not found", -1));
         return TCL_ERROR;
     }
@@ -1681,6 +2197,7 @@ static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
 
     if (Tcl_TraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os) != TCL_OK) {
         Tcl_DeleteHashTable(&os->methodsByKey);
+        Tcl_DecrRefCount(os->retired);
         return TCL_ERROR;
     }
     os->defineTraceInstalled         = 1;
@@ -1745,11 +2262,18 @@ static void DelOOShim(Tcl_Interp *ip, OOShim *os) {
     Tcl_HashSearch s;
     Tcl_HashEntry *e;
     for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s)) {
+        /* Each value is a FIFO list owning its remaining (unconsumed) triples;
+           dropping the list frees them. */
         Tcl_Obj *val = (Tcl_Obj *)Tcl_GetHashValue(e);
         if (val)
             Tcl_DecrRefCount(val);
     }
     Tcl_DeleteHashTable(&os->methodsByKey);
+    /* Free every triple that was consumed (moved here by OOShim_TakeRecord). */
+    if (os->retired) {
+        Tcl_DecrRefCount(os->retired);
+        os->retired = NULL;
+    }
 }
 
 Tcl_Namespace *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn) {
@@ -2259,7 +2783,7 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    /* scope byte (v92 amendment) — read immediately after kind. */
+    /* scope byte — read immediately after kind. */
     uint8_t scope = 0;
     if (!Tbcx_R_U8(r, &scope)) {
         Tcl_DecrRefCount(clsFqn);
@@ -2267,6 +2791,17 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     }
     if (scope > TBCX_MSCOPE_TRUE_PRIVATE) {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method scope byte", -1));
+        Tcl_DecrRefCount(clsFqn);
+        return TCL_ERROR;
+    }
+    /* origin byte (class-definition vs object-definition) — keys the record. */
+    uint8_t origin = 0;
+    if (!Tbcx_R_U8(r, &origin)) {
+        Tcl_DecrRefCount(clsFqn);
+        return TCL_ERROR;
+    }
+    if (origin > TBCX_MORIGIN_OBJECT) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method origin byte", -1));
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
@@ -2411,14 +2946,14 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     procPtr->refCount++;
 
     Tcl_DString keyDs;
-    if (!MethodKeyBuf(&keyDs, clsFqn, kind, (mnL ? nameObj : NULL))) {
+    if (!MethodKeyBuf(&keyDs, clsFqn, kind, origin, (mnL ? nameObj : NULL))) {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
         /* Release procBodyObj first — its freeIntRep drops
          * procPtr->refCount from 2 to 1.  Then call TclProcCleanupProc
          * (which decrements to 0 and frees the Proc + its locals +
          * releases its own ref on bodyBC).  Finally drop our local
-         * bodyBC reference and the rest.  Without this sequence the
-         * Proc leaked on every malformed-key input. */
+         * bodyBC reference and the rest.  This sequence avoids leaking
+         * the Proc on a malformed-key input. */
         Tcl_DecrRefCount(procBodyObj); /* procPtr: 2 -> 1 */
         TclProcCleanupProc(procPtr);   /* procPtr: 1 -> 0, frees Proc */
         Tcl_DecrRefCount(bodyBC);      /* local reference */
@@ -2452,11 +2987,18 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(argsObj);
         return TCL_ERROR;
     }
-    /* Atomic swap: set new value, then release old */
-    Tcl_Obj *oldPair = isNew ? NULL : (Tcl_Obj *)Tcl_GetHashValue(he);
-    Tcl_SetHashValue(he, pair);
-    if (oldPair)
-        Tcl_DecrRefCount(oldPair);
+    /* Append the triple to the key's FIFO list (records arrive in
+       serialization == definition order).  Create the list on first insert;
+       the list owns each triple.  A same-key redefinition does NOT overwrite —
+       both triples coexist so each definition site can consume its own. */
+    Tcl_Obj *fifo = isNew ? NULL : (Tcl_Obj *)Tcl_GetHashValue(he);
+    if (!fifo) {
+        fifo = Tcl_NewListObj(0, NULL);
+        Tcl_IncrRefCount(fifo);
+        Tcl_SetHashValue(he, fifo);
+    }
+    Tcl_ListObjAppendElement(NULL, fifo, pair); /* fifo takes its own ref on pair */
+    Tcl_DecrRefCount(pair);                     /* drop local ref; fifo holds it now */
     Tcl_DecrRefCount(scopeObj);
     Tcl_DecrRefCount(procBodyObj);
     Tcl_DecrRefCount(bodyBC); /* local reference */
@@ -3323,9 +3865,9 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
  *
  * Returns TCL_OK on success; on failure, sets an interpreter result
  * describing the offending instruction and returns TCL_ERROR. */
-/* Currently uncalled — operand validation is omitted for load speed (see the
- * note at its former call site in Tbcx_ReadBlock).  Kept in-source, marked
- * unused, so it can be restored without re-deriving the validation logic. */
+/* Currently uncalled — operand validation is omitted for load speed.  Kept
+ * in-source, marked unused, so it can be restored without re-deriving the
+ * validation logic. */
 static int TBCX_MAYBE_UNUSED ValidateBlockOperands(
     Tcl_Interp *ip,
     const unsigned char *code, uint32_t codeLen,
@@ -3757,12 +4299,11 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
     }
 
     /* The per-block operand-validation pass (ValidateBlockOperands) is
-     * intentionally OMITTED for load speed (project decision, 2026-06-12).
-     * It guarded against hostile .tbcx artifacts: Tcl core does not
-     * re-validate bytecode operands at runtime, so a crafted file could
-     * OOB-read a literal or jump off-boundary.  By accepting that risk the
-     * loader TRUSTS its input — load ONLY artifacts you produced/trust.
-     * See doc/tbcx.n §SECURITY.  (Re-enable by restoring the call here.) */
+     * intentionally OMITTED for load speed.  It guards against hostile
+     * .tbcx artifacts: Tcl core does not re-validate bytecode operands at
+     * runtime, so a crafted file could OOB-read a literal or jump
+     * off-boundary.  The loader TRUSTS its input — load ONLY artifacts you
+     * produced/trust.  Re-enable by restoring the call here. */
 
     /* Build bytecode object */
     Tcl_Obj *bc = ByteCodeObj(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack, setPrecompiled);
@@ -3867,6 +4408,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint
  * handler pointers have been captured from the first slow-path proc.
  * Returns TCL_OK on success, TCL_ERROR on command-creation failure. */
 static int ProcShim_DirectInstall(ProcShim *ps, Tcl_Interp *ip, Tcl_Obj *fqn, Tcl_Obj *nameObj, Proc *preProc, Tcl_Obj *savedArgs) {
+    (void)nameObj; /* install keys off fqn; name kept in the signature for callers */
     /* Build a new Proc directly from our precompiled data. */
     Proc *newProc = (Proc *)Tcl_Alloc(sizeof(Proc));
     memset(newProc, 0, sizeof(Proc));
@@ -4101,19 +4643,19 @@ static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const o
  * The DELETE case is simple: the Command struct is about to be freed; we
  * just null our cached pointer so DelProcShim skips the restore.
  *
- * The RENAME case is subtler and was the site of an internal-review UAF:
+ * The RENAME case is subtler and is a use-after-return hazard:
  * Tcl keeps the Command struct alive across a rename (it just re-keys the
  * hash-table entry).  The struct's objProc2 field still holds
  * CmdProcShim, and its objClientData2 still points at *our* ProcShim —
  * which is stack-allocated inside LoadTbcxStream and disappears when
  * LoadTbcxStream returns.
  *
- * If we merely null ps->procCmdPtr here (as the old code did), DelProcShim
- * sees the NULL and skips the in-place restore.  The renamed command
- * is then left with a dangling clientData pointer; invoking it after
- * tbcx::load returns produces a stack-use-after-return that typically
- * crashes with "called Tcl_FindHashEntry on deleted table / illegal
- * instruction" or worse.
+ * Nulling only ps->procCmdPtr here would make DelProcShim see the NULL
+ * and skip the in-place restore.  The renamed command would then be left
+ * with a dangling clientData pointer; invoking it after tbcx::load
+ * returns produces a stack-use-after-return that typically crashes with
+ * "called Tcl_FindHashEntry on deleted table / illegal instruction" or
+ * worse.
  *
  * The correct RENAME handling is to do the in-place restore *now*,
  * while ps->procCmdPtr is still valid, and THEN null it so DelProcShim
@@ -4871,11 +5413,8 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
      * the fall-through to namespace resolution never happens the way
      * the compiler expected.
      *
-     * Prior code targeted rootFramePtr because TCL_EVAL_GLOBAL forced
-     * the engine onto the root frame; that assumption no longer holds
-     * after the namespace fix.  varFramePtr is correct regardless of
-     * whether tbcx::load was called from global, namespace-eval, or
-     * proc-body context. */
+     * varFramePtr is correct regardless of whether tbcx::load was called
+     * from global, namespace-eval, or proc-body context. */
     CallFrame *f    = iPtr->varFramePtr;
     if (!f)
         f = iPtr->rootFramePtr; /* very-early-init defensive fallback */
@@ -4903,10 +5442,8 @@ static void TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *s
         return;
     }
     /* Allocate compiled locals and directly link each slot to the target Var
-     * in the caller's namespace — NOT the global namespace.  Before the
-     * namespace fix this linked against :: because top-level bytecode was
-     * forced to run at :: via TCL_EVAL_GLOBAL; now that the eval scope is
-     * the caller's, the linkage targets must follow. */
+     * in the caller's namespace — NOT the global namespace.  The eval scope
+     * is the caller's namespace, so the linkage targets must match it. */
     {
         size_t varBytes;
         if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes)) {
@@ -5030,15 +5567,12 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
      *       the engine does not switch to global scope before running
      *       the first opcode.
      *
-     * Before this change both points were wrong: `::` was hard-coded
-     * here and TCL_EVAL_GLOBAL was passed below.  The combined effect
-     * forced every top-level block to execute at `::` regardless of
-     * the caller's namespace, which meant that any tbcx-loaded script
-     * with bare `$var` or `variable x` at its top — including the
-     * ooxml scripts/text module and the `namespace eval ::wg3 {...}`
-     * blocks in scripts/xml and scripts/toc — resolved those against
-     * the wrong namespace and failed with `can't read "<name>": no
-     * such variable`. */
+     * Hard-coding `::` here and passing TCL_EVAL_GLOBAL below would force
+     * every top-level block to execute at `::` regardless of the caller's
+     * namespace, so any tbcx-loaded script with a bare `$var` or
+     * `variable x` at its top — or a `namespace eval ::ns {...}` block —
+     * would resolve those against the wrong namespace and fail with
+     * `can't read "<name>": no such variable`. */
     Namespace *curNs   = (Namespace *)Tcl_GetCurrentNamespace(ip);
     uint32_t   dummyNL = 0;
 

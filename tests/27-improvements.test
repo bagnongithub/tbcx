@@ -308,7 +308,7 @@ test imp2.5 {multiple self methods} -body {
 } -result {alpha beta gamma}
 
 # =====================================================================
-# GROUP I3: combined / regression
+# GROUP I3: combined
 # =====================================================================
 
 test imp3.1 {foreach inside OO method body still works} -body {

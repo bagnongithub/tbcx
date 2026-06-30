@@ -4,8 +4,7 @@
 # These tests exercise near-limit scenarios for allocations, large
 # literal pools, many procs/methods, large bytecode blocks, and
 # concurrent multi-interp usage.  They verify that the checked-multiply
-# guards (Finding 5) and Tcl_Size conversions (Finding 4) hold under
-# non-trivial workloads.
+# guards and Tcl_Size conversions hold under non-trivial workloads.
 
 package require tbcx
 package require tcltest 2.5
@@ -215,7 +214,7 @@ test lim.13 {limits: different scripts in different interps} -body {
 
 
 # =====================================================================
-# Large jump tables (Finding 5 - checked multiply)
+# Large jump tables (checked multiply)
 # =====================================================================
 
 test lim.14 {limits: switch with 200 string cases} -body {

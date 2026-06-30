@@ -268,7 +268,7 @@ test p2.12 {P2: proc inside if inside namespace eval} -body {
     tbcx::load $out
 } -result ns-if-proc
 
-test p2.13 {P2: long foreach over large list (regression for stress.7)} -body {
+test p2.13 {P2: long foreach over large list} -body {
     set body "set lst \[list"
     for {set i 1} {$i <= 200} {incr i} {
         append body " $i"
@@ -279,7 +279,7 @@ test p2.13 {P2: long foreach over large list (regression for stress.7)} -body {
     tbcx::load $out
 } -result 20100
 
-test p2.14 {P2: foreach with proc and variable list (regression for adv.8)} -body {
+test p2.14 {P2: foreach with proc and variable list} -body {
     set in [makeFile {
         proc p2mkperson {name age} {
             dict create name $name age $age
@@ -591,8 +591,8 @@ test p8.1 {P8: proc body source statements not in dump} -body {
     list $found $result
 } -result {0 333}
 
-test p8.2 {P8: proc body source stripped by default (v92), preserved with -include-source} -body {
-    # v92 STRIPS proc body source text by default — matching the 25-year
+test p8.2 {P8: proc body source stripped by default, preserved with -include-source} -body {
+    # Proc body source is stripped by default — matching the 25-year
     # TclPro/tbcload precedent for Tcl AOT compile output.  The loader
     # substitutes a diagnostic sentinel so `info body` returns a loud
     # string rather than silently returning empty.  The `-include-source`
