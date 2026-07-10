@@ -6388,14 +6388,12 @@ static int EmitTbcxStream(Tcl_Obj *scriptObj, TbcxOut *w, unsigned saveFlags, Tc
     if (w->err)
         goto cleanup;
 
-    /* 5. Procs section: nameFqn, namespace, args, srcText, block
-     *    srcText is the original proc body as authored — attached at load
-     *    time via Tcl_InitStringRep so `info body`, TIP #280 attribution,
-     *    stack-trace line numbers, and introspection-based clones
-     *    (ooxml's cloneRule / installTocRule pattern) all round-trip
-     *    correctly.  Only emitted when -include-source was specified;
-     *    otherwise the field is written empty and the loader
-     *    substitutes a diagnostic sentinel. */
+    /* 5. Procs section: nameFqn, namespace, args, srcText, block srcText is the
+     *    original proc body as authored — attached at load time via
+     *    Tcl_InitStringRep so `info body`, TIP #280 attribution, stack-trace
+     *    line numbers, and introspection-based clones all round-trip correctly.
+     *    Only emitted when -include-source was specified; otherwise the field
+     *    is written empty and the loader substitutes a diagnostic sentinel. */
     uint32_t numProcs = 0;
     for (Tcl_Size i = 0; i < defs.n; i++) {
         if (defs.v[i].kind == DEF_KIND_PROC)

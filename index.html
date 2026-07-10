@@ -2,8 +2,8 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Apr 23, 2026'>
-  <meta name='generator' content='tbcx 1.1'>
+  <meta name='date' content='Jul 9, 2026'>
+  <meta name='generator' content='tbcx 1.12'>
   <style>
     :root{
         --bg: #ffffff;
@@ -58,7 +58,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.1 Apr 23, 2026</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.12 Jul 9, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -141,15 +141,31 @@ tbcx::gc</code></pre>
             <li><i>Writable channel</i> &mdash; an open channel; binary mode (<code>-translation binary -eofchar {}</code>) is enforced. The caller&rsquo;s channel settings are mutated and <i>not</i> restored. The channel is <i>not</i> closed.</li>
             <li><i>Writable path</i> &mdash; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.</li>
           </ul>
-          <p><b>-include-source</b> &mdash; Optional flag. Embeds the authored source text of every <b>proc</b> and TclOO method body in the artifact as an LPString. Required when consumers depend on <b>info body</b>, <b>info class definition</b>, TIP #280 line attribution in stack traces, disassembly annotations, or introspection-based clone idioms (e.g. <b>cloneRule</b>, <b>installTocRule</b>) to return the original authored text. Artifact size grows proportional to the aggregate source text of all procs and methods.</p>
-          <p><b>Default behavior (no -include-source):</b> Every proc/method body source field is emitted as an empty LPString. At load time the loader substitutes the diagnostic sentinel described in <a href='#source-preservation'>SOURCE PRESERVATION</a> below, so <b>info body</b> returns a loud string instead of silently returning empty. This matches the 25-year <i>tclcompiler</i>/<i>tbcload</i> precedent for Tcl AOT compile output: deployment artifacts are typically distributed instead of source, and stripping keeps the artifact smaller and preserves the IP-protection angle.</p>
+          <p><b>-include-source</b> &mdash; Optional flag. Embeds the authored source text of every <b>proc</b> and TclOO method body in the artifact as an LPString. Required when consumers depend on <b>info body</b>, <b>info class definition</b>, TIP #280 line attribution in stack traces, disassembly annotations, or introspection-based clone idioms (e.g. <code>proc $new [info args $src] [info body $src]</code>) to return the original authored text. Artifact size grows proportional to the aggregate source text of all procs and methods.</p>
+          <p><b>Default behavior (no -include-source):</b> Every proc/method body source field is emitted as an empty LPString. At load time the loader substitutes the diagnostic sentinel described in <a href='#source-preservation'>SOURCE PRESERVATION</a> below, so <b>info body</b> returns a loud string instead of silently returning empty. This matches the <i>tclcompiler</i>/<i>tbcload</i> precedent of stripping body source from compiled deployment output: deployment artifacts are typically distributed instead of source, and stripping keeps the artifact smaller and preserves the IP-protection angle.</p>
         </dd>
         <dt>Behavior</dt>
         <dd>
           <ul>
             <li>Performs a single-pass capture and rewrite of the script, extracting <b>proc</b>,
                 <b>namespace eval</b>, <b>oo::class create</b>, <b>oo::define</b>/<b>oo::objdefine</b>,
-                and <b>self method</b> definitions while producing a rewritten script with method bodies replaced by stubs.</li>
+                and <b>self method</b> definitions while producing a rewritten script with method bodies
+                replaced by recognizable stub sentinels. Each captured method&rsquo;s TclOO visibility is
+                recorded in a per-record scope byte (default / public / unexported / TIP #500 true-private),
+                derived from the <b>-export</b>/<b>-unexport</b>/<b>-private</b> definition options, lexical
+                <b>private { &hellip; }</b> and <b>self { &hellip; }</b> context, and same-body
+                <b>export</b>/<b>unexport</b>/<b>self export</b>/<b>self unexport</b> commands. An origin
+                byte distinguishes class-definition methods (<b>oo::define</b> / <b>oo::class create</b>)
+                from per-object methods (<b>oo::objdefine</b>).</li>
+            <li>Compiles the top-level script at true global scope even when <b>tbcx::save</b> is
+                invoked from inside a proc: the compile environment&rsquo;s proc pointer is cleared
+                and the caller frame&rsquo;s LocalCache is hidden for the duration of the compile,
+                because a serialized top level carries no local-variable table and must never index
+                the calling proc&rsquo;s local slots.</li>
+            <li>Rejects, with a diagnostic, a <b>self method</b> (or a method inside a
+                <b>self { &hellip; }</b> block) written in an <b>oo::objdefine</b> builder &mdash;
+                <b>oo::objdefine</b> has no <b>self method</b> form, so such a definition cannot be
+                reconstructed and would otherwise load as a silent no-op.</li>
             <li>Pre-compiles namespace eval body literals and other script-body patterns
                 (<b>try</b>/<b>on</b>/<b>trap</b>/<b>finally</b>, <b>foreach</b>, <b>lmap</b>,
                 <b>while</b>, <b>for</b>, <b>catch</b>, <b>if</b>/<b>elseif</b>/<b>else</b>,
@@ -165,7 +181,10 @@ tbcx::gc</code></pre>
             <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
                 enabling cross-interpreter recompilation.</li>
             <li>When the input is a readable file path, the normalized path is recorded in the header via <b>Tcl_FSGetNormalizedPath</b> so the loader can restore <b>info script</b> to the authored value.</li>
-            <li>Serializes the header, top-level block, Procs table (with per-proc source-text LPString), Classes catalog (advisory), and Methods table (with per-method source-text LPString and kind 4 for self methods).</li>
+            <li>Serializes the header, top-level block, Procs table (with per-proc source-text LPString),
+                Classes catalog (advisory, alphabetically sorted for deterministic output), and Methods
+                table in definition order (with per-method scope byte, origin byte, source-text LPString,
+                and kind 4 for self methods; ctor/dtor records always carry the default scope).</li>
             <li>Lambda literals (<b>apply</b> forms) are compiled and serialized as lambda-bytecode literals.</li>
             <li>Conflicting proc definitions across if/else branches are handled via indexed markers,
                 enabling position-based matching at load time.</li>
@@ -174,7 +193,7 @@ tbcx::gc</code></pre>
         <dt>Returns</dt>
         <dd>The output object: either the normalized path written, or the writable channel handle.</dd>
         <dt>Errors</dt>
-        <dd>Typical errors include: unreadable input; unwritable output;
+        <dd>Typical errors include: read error from the input channel or opened file; unwritable output;
             unknown/unsupported AuxData; size limit exceeded; runaway serialization
             (too many literals, blocks, excessive recursion depth, or output too large);
             short read/write.</dd>
@@ -230,17 +249,32 @@ try {
                 representation is set to either the preserved source text (artifacts built with
                 <b>-include-source</b>) or the diagnostic sentinel (default stripped mode).</li>
             <li>Installs a temporary <b>OOShim</b> that intercepts <b>oo::define</b> and <b>oo::objdefine</b>
-                to substitute precompiled method/constructor/destructor bodies. Self methods (kind 4,
-                <b>TBCX_METH_SELF</b>) are installed via <b>oo::define { self method }</b> to preserve
-                metaclass inheritance for subclasses. Method body string representations follow the
-                same preserved-or-sentinel rule as proc bodies.</li>
+                by patching the commands&rsquo; handler pointers in place (the commands are <i>not</i>
+                renamed) to substitute precompiled method/constructor/destructor bodies. Method records
+                are keyed by <i>(class FQN, kind, name, origin)</i> and held in definition-order FIFOs;
+                each definition site the rewritten script executes consumes the front record, and only
+                bodies carrying the tbcx stub sentinel are patched &mdash; a method the saver left
+                verbatim is never overwritten by a stale same-key record. After installing each body,
+                the loader applies the record&rsquo;s visibility scope (public, unexported, or TIP #500
+                true-private). Self methods (kind 4, <b>TBCX_METH_SELF</b>) are installed via
+                <b>oo::define { self method }</b> to preserve metaclass inheritance for subclasses.
+                Per-object methods are installed precompiled by replaying the <b>oo::objdefine</b>
+                builder body against object-origin records; true-private per-object methods are
+                re-created via the flat <b>private</b> form. Method body string representations follow
+                the same preserved-or-sentinel rule as proc bodies.</li>
+            <li>The shims protect themselves with command traces on <b>proc</b>, <b>oo::define</b>,
+                <b>oo::objdefine</b>, and <b>apply</b>: if any of these is renamed or deleted while a
+                shim is active, the trace restores the original handlers in place immediately, so a
+                renamed command never remains wired to freed shim state.</li>
             <li>Registers precompiled lambdas in a persistent per-interpreter <b>ApplyShim</b> that
                 recovers the compiled representation if type shimmer evicts it.</li>
             <li>Executes the precompiled top-level block via <b>Tcl_EvalObjEx</b> with flags <b>0</b>
                 (no <b>TCL_EVAL_GLOBAL</b>), evaluating in the caller&rsquo;s current namespace.
                 <b>iPtr-&gt;scriptFile</b> is saved, set to the header&rsquo;s source path (or the tbcx
-                artifact path as a fallback), and restored after evaluation &mdash; matching
-                <b>Tcl_FSEvalFileEx</b>&rsquo;s handling in <b>tclIOUtil.c</b>.
+                artifact path as a fallback when loading from a file), and restored after evaluation
+                &mdash; matching <b>Tcl_FSEvalFileEx</b>&rsquo;s handling in <b>tclIOUtil.c</b>.
+                When loading from an already-open channel and the header carries no recorded path,
+                <b>info script</b> is left untouched.
                 Compiled locals for the top-level frame are installed on the caller&rsquo;s active
                 variable frame by linking named variables to existing same-name variables in
                 the caller&rsquo;s scope. A top-level <b>return</b> is handled identically to <b>source</b>.</li>
@@ -293,7 +327,7 @@ proc moduleLoad {path} {
         <dt>Behavior</dt>
         <dd>Reads the artifact and prints: header fields (including the authored source path when recorded); section summaries; literals and AuxData; exception ranges;
             disassembly of the top-level, proc, method, and lambda bodies; and the
-            preserved body source text (indented inline, no truncation) for each proc and method when the artifact was built with <b>-include-source</b>. For stripped artifacts (the default), each body record shows <code>source: &lt;stripped at save time&gt;</code>.</dd>
+            preserved body source text (indented inline, no truncation) for each proc and method when the artifact was built with <b>-include-source</b>. For stripped artifacts (the default), each body record shows <code>source: &lt;stripped at save time&gt;</code>. Each method record also shows its visibility <b>scope</b> and <b>origin</b> (class-definition vs object-definition). Literal operands in the disassembly are annotated using the instruction table&rsquo;s operand types rather than instruction-name heuristics.</dd>
         <dt>Returns</dt>
         <dd>A string containing the formatted dump.</dd>
         <dt>Errors</dt>
@@ -378,11 +412,20 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue);
             (2) Procs (FQN, ns, arg spec, body-source LPString, compiled block);
             (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top-level script);
-            (4) Methods (class, kind 0&ndash;4, name, args, body-source LPString, compiled block).</dd>
+            (4) Methods, in definition order (class FQN; kind u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self;
+            scope u8: 0=default, 1=public, 2=unexported, 3=TIP #500 true-private &mdash; ctor/dtor always 0;
+            origin u8: 0=class definition, 1=object definition; name &mdash; empty for ctor/dtor; args;
+            body-source LPString; compiled block). Records are keyed at load by
+            <i>(class FQN, kind, name, origin)</i>, so a class-instance method and a per-object method
+            sharing a name coexist.</dd>
         <dt>Literal kinds</dt>
-        <dd>boolean, (wide)int/uint, double, bignum, string, bytearray, list,
-            dict (insertion order preserved), bytesrc (bytecode + source text for cross-interp recompilation),
-            and <b>lambda-bytecode</b> literals for use with <b>apply</b>.</dd>
+        <dd>Tagged u32 values: 0 bignum (sign u8, magnitude length u32, little-endian magnitude bytes),
+            1 boolean (one byte), 2 bytearray (length + raw bytes), 3 dict (pair count, then key/value
+            literal pairs; insertion order preserved), 4 double (IEEE-754 bits as u64), 5 list (element
+            count, then nested literals), 6 string (LPString), 7 wideint (signed 64-bit as u64),
+            8 wideuint (unsigned 64-bit), 9 <b>lambda-bytecode</b> (namespace FQN, arguments, compiled
+            block, body source text) for use with <b>apply</b>, and 10 bytesrc (source text, namespace
+            FQN, compiled block) enabling cross-interpreter recompilation.</dd>
         <dt>AuxData families</dt>
         <dd>jump tables (string or numeric), dictupdate, and NewForeachInfo.</dd>
       </dl>
@@ -391,7 +434,10 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
       <p>
         Literals in the script that represent <i>lambdas</i> for <b>apply</b> (lists of the form
         <code>{args body ?ns?}</code>) are compiled and serialized as lambda-bytecode literals at
-        save time. On load, the compiled body, argument list, and optional namespace element are
+        save time. A candidate is accepted only when its list value round-trips faithfully as a
+        Tcl lambda &mdash; rebuilt the way the loader rebuilds it, including validation that the
+        optional namespace element is absolute &mdash; so data lists that merely resemble lambdas
+        remain ordinary data. On load, the compiled body, argument list, and optional namespace element are
         rehydrated into a <b>Proc</b> and registered in the <b>ApplyShim</b> so that the first
         call to <b>apply</b> does not trigger compilation. If type shimmer later evicts the
         lambdaExpr internal representation, the ApplyShim transparently re-installs it on the
@@ -429,10 +475,20 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         method rename/delete/export changes, metaclasses with <b>self method</b>, and
         <b>next</b>-based constructor chaining.</p>
       <p>
+        Method visibility survives the round-trip however it was expressed: definition options
+        (<b>-export</b>, <b>-unexport</b>, <b>-private</b>), lexical <b>private { &hellip; }</b>
+        blocks (TIP #500 true-private), and same-body <b>export</b>/<b>unexport</b> (and
+        <b>self export</b>/<b>self unexport</b>) commands are all folded into the per-method scope
+        byte at save time and re-applied at load. Class-instance and per-object methods sharing the
+        same name coexist (distinct origin keys), and per-object methods &mdash; including
+        true-private ones &mdash; are installed with precompiled bodies. A method the saver left
+        verbatim (non-literal name, arguments, or body) always keeps its authored body; precompiled
+        records are matched positionally, in definition order, and patch only stub-sentinel bodies.</p>
+      <p>
         With <b>-include-source</b>, <b>info class definition</b>, <b>info class constructor</b>,
         <b>info class destructor</b>, and <b>info object method</b> all return the authored body
-        text byte-for-byte, enabling introspection-based idioms such as <code>cloneMethod src dst</code>
-        patterns to work identically to the <b>source</b>-based baseline.</p>
+        text byte-for-byte, enabling introspection-based clone and copy idioms to work
+        identically to the <b>source</b>-based baseline.</p>
 
       <h2 id='multi-interpreter-and-thread-support'>MULTI-INTERPRETER AND THREAD SUPPORT</h2>
       <p>
@@ -444,9 +500,13 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         returns <b>TCL_ERROR</b> with a diagnostic message.</p>
       <p>
         Artifacts are designed to load into interpreters other than the originating one.
-        Interpreter-specific state (ApplyShim lambda registry, load depth, OO shim
-        hidden-ID counter) remains strictly per-interpreter and is cleaned up
-        automatically when the interpreter is deleted.</p>
+        Interpreter-specific state (ApplyShim lambda registry, load depth, OO shim state) is
+        consolidated in a single per-interpreter record and cleaned up automatically when the
+        interpreter is deleted. Shared process-wide state &mdash; the save-side opcode dispatch
+        table &mdash; is initialized exactly once, under a mutex, at package initialization, so
+        concurrent <b>tbcx::save</b> calls from multiple threads are safe. Debug builds (or builds
+        compiled with <code>-DTBCX_THREAD_CHECKS</code>) additionally assert interpreter-thread
+        ownership inside internal helpers.</p>
 
       <h2 id='limits'>LIMITS</h2>
       <p>
@@ -465,22 +525,23 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         &ldquo;input is neither an open channel nor a readable file&rdquo;,
         &ldquo;runaway serialization detected&rdquo;,
         &ldquo;tbcx::save: unknown option &hellip;; expected -include-source&rdquo;,
+        &ldquo;tbcx: called from non-owning thread&rdquo;,
         and Tcl errors from top-level evaluation.</p>
 
       <h2 id='security'>SECURITY</h2>
-      <p>Loading executes code. Only load artifacts you trust.
-         Safe interpreters receive no <b>tbcx::*</b> commands by default; use
+      <p>Loading executes code. Only load artifacts you trust.</p>
+      <p>Safe interpreters receive no <b>tbcx::*</b> commands by default; use
          <b>interp alias</b> or <b>interp expose</b> from a parent interpreter to
          grant selective access.</p>
 
       <h2 id='see-also'>SEE ALSO</h2>
-      <p>source(n), TclOO(n), info(n), tclcompiler (historical Tcl 8.x AOT tool)</p>
+      <p>source(n), TclOO(n), info(n), apply(n), interp(n), tclcompiler and tbcload (historical Tcl 8.x bytecode compiler and loader)</p>
 
       <h2 id='copyright'>COPYRIGHT</h2>
       <p>&copy; 2025&ndash;2026 Miguel Banon</p>
       <p>MIT License.</p>
 
-      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.1 (format v92)</div>
+      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.12 (format v92)</div>
     </div>
     <a href='#top' class='back-to-top'>&uarr; Top</a>
   </body>
