@@ -272,7 +272,7 @@ Records are keyed at load by *(class FQN, kind, name, origin)*, so a class-insta
 
 This package uses **Tcl 9.1** APIs and selected internals (e.g., `tclInt.h`, `tclCompile.h`).
 You'll need Tcl 9.1 headers/libs on your include path and to build as a standard loadable extension.
-The entry point `tbcx_Init` registers commands and provides `tbcx 1.12`.
+The entry point `tbcx_Init` registers commands and provides `tbcx 1.2`.
 The safe entry point `tbcx_SafeInit` provides the package and type infrastructure but registers **no commands**; use `interp alias` or `interp expose` from a parent interpreter to grant selective access.
 
 Example (TEA Linux/macOS):

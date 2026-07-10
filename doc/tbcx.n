@@ -1,4 +1,4 @@
-.TH tbcx 3 "Jul 9, 2026" "tbcx 1.12" "Tcl Bytecode eXchange"
+.TH tbcx 3 "Jul 9, 2026" "tbcx 1.2" "Tcl Bytecode eXchange"
 .SH NAME
 tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.
 .SH SYNOPSIS
