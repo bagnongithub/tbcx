@@ -14,13 +14,12 @@ For versions prior to Tcl 9.1, please check
 ```tcl
 package require tbcx
 
-# Save: source text → .tbcx (body source stripped by default, following
-# the tclcompiler/tbcload precedent for compiled deployment artifacts).
+# Save: source text → strict compiled-only .tbcx. All designated
+# executable-source fields are empty by default.
 tbcx::save ./hello.tcl ./hello.tbcx
 
-# Save with body source preserved for `info body` / `info class definition`
-# round-trip fidelity, TIP #280 attribution, and introspection-based
-# clone idioms.
+# Save with executable source preserved for introspection. Execution still
+# uses the serialized bytecode and never falls back to the retained text.
 tbcx::save ./hello.tcl ./hello.tbcx -include-source
 
 # Load: .tbcx → installs procs/methods/lambdas and executes top level
@@ -38,31 +37,32 @@ puts [tbcx::dump ./hello.tbcx]
 
 - **Save**: Compile a script and write a `.tbcx` artifact containing:
   - Top-level bytecode (with literals, AuxData, exception ranges, local names)
-  - All discovered `proc`s, each as precompiled bytecode with an optional source-text field
-  - TclOO classes (advisory catalog of discovered class names for dump/introspection) and methods/constructors/destructors as precompiled bytecode with optional source-text fields. Class creation and superclass structure are reconstructed by executing the rewritten top-level script during `tbcx::load`, not from a standalone serialized class graph.
+  - All discovered `proc`s, each as precompiled bytecode with a policy-controlled source-text field
+  - TclOO classes (advisory catalog of discovered class names for dump/introspection) and methods/constructors/destructors as precompiled bytecode with policy-controlled source-text fields. Class creation and superclass structure are reconstructed by executing the rewritten top-level script during `tbcx::load`, not from a standalone serialized class graph.
   - **Self methods** (`self method` inside `oo::define`) serialized with kind `TBCX_METH_SELF`; loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses
-  - Lambda literals (`apply {args body ?ns?}` forms) compiled and serialized as lambda‑bytecode literals. A candidate is accepted only when its list value **round-trips faithfully** as a Tcl lambda — rebuilt the way the loader rebuilds it, including validation that the optional namespace element is absolute — so data lists that merely resemble lambdas remain ordinary data
+  - Lambda literals in statically recognized `apply {args body ?ns?}` argument occurrences compiled and serialized as lambda‑bytecode literals. Classification is occurrence-based, so an equal list used as ordinary data remains ordinary data
   - Bodies found in `namespace eval $ns { ... }` and other script-body contexts (compiled and bound to the correct namespace)
   - **Authored source path**: when the input is a readable file path, the normalized source path is recorded in the header so `info script` at load time returns the original `.tcl` path — matching `Tcl_FSEvalFileEx`/`source` semantics
-  - **Optional body source preservation** (`-include-source` flag): per-proc and per-method LPString fields carrying the authored body text. Without the flag, bodies are stripped and the loader installs a diagnostic sentinel (see *Source preservation* below).
+  - **Executable-source policy**: default saves write strict compiled-only policy and zero-length proc, method, `BYTESRC`, and lambda source fields. `-include-source` retains their exact authored bytes for introspection only; execution remains precompiled (see *Source preservation* below).
   - **Method visibility (scope)**: each method record carries a scope byte — default (from name case), forced public, unexported, or TIP #500 true-private — captured from `-export`/`-unexport`/`-private` definition options, lexical `private { ... }` / `self { ... }` context, and same-body `export`/`unexport`/`self export`/`self unexport` commands inside builder bodies. The loader re-applies the recorded visibility after installing each precompiled body, so exported PascalCase callbacks stay dispatchable and true-private methods stay private. Constructors/destructors always carry the default scope.
   - **Method origin**: each method record carries an origin byte distinguishing class-definition methods (`oo::define` / `oo::class create`) from per-object methods (`oo::objdefine`). Records are keyed by *(class FQN, kind, name, origin)* at load, so a class-instance method and a per-object method with the same name coexist — each gets its own precompiled body. Per-object methods (including TIP #500 true-private per-object methods) are installed precompiled via builder replay.
-  - **Instruction-level body detection** (Phase 1): analyzes `invokeStk` patterns to identify and precompile bodies for `eval`, `uplevel`, `try`/`on`/`trap`/`finally`, `catch`, `foreach`, `while`, `for`, `if`/`elseif`/`else`, `time`, `timerate`, `dict for`/`map`/`update`/`with` (including FQN `::tcl::dict::*` forms), and `self method`
-  - **Unpushed literal detection** (Phase 2): identifies dead-reference body literals from Tcl 9.1's inline-compiled `foreach`/`lmap` loops (compiled to `foreach_start` opcodes) and precompiles them
+  - **Occurrence-level body detection**: compiles new-policy blocks with generic command dispatch, analyzes exact `push` occurrences reaching `invokeStk`, and rewrites only the executable operand. Repeated equal scripts each receive compiled records; an equal data occurrence retains its ordinary literal record
   - **O(1) opcode dispatch**: instruction scanner uses a 256-entry `opMap[]` lookup table covering all 120 Tcl 9.1 instruction types, replacing per-instruction string comparisons
   - **Bytearray detection**: strings with bytes ≥ 0x80 are probed and emitted as `TBCX_LIT_BYTEARR` to avoid UTF-8 encoding corruption on round-trip
-  - **`startCommand` stripping**: at save time, `startCommand` debugging instructions (~15% of bytecode) are replaced with `nop` bytes, reducing execution overhead while preserving jump offsets and exception ranges
-  - **Cross-interpreter support**: body literals are emitted as `TBCX_LIT_BYTESRC` (bytecode + preserved source text); loaded with `setPrecompiled=0` so Tcl can gracefully recompile from source in child interpreters or after epoch bumps
-- **Load**: Read a `.tbcx`, reconstruct precompiled procs, method bodies, and literal lambdas, then execute the top-level block in the **caller's current namespace** with source-equivalent frame and scope semantics. `iPtr->scriptFile` is set to the artifact's recorded authored path for the duration of the evaluation so `info script` returns the correct value. Class creation, namespace setup, and other top-level effects happen naturally when the rewritten script runs.
-- **Dump**: Pretty-print / disassemble `.tbcx` contents — header (including the authored source path), literals, AuxData summaries, exception ranges, full instruction streams, and preserved body source text (indented inline) when `-include-source` was used at save time.
+  - **Epoch safety**: strict and include-source blocks use Tcl's generic command dispatch and are marked `TCL_BYTECODE_PRECOMPILED`, so command implementation changes do not require recompilation from source.
+  - **Cross-interpreter boundary**: an artifact can be loaded independently in multiple interpreters. Transferring an embedded compiled script object through a statically recognized `interp eval` form is currently rejected with `TBCX EVAL CROSSINTERP UNSUPPORTED`; no authored-source fallback is used.
+- **Load**: Read and completely preflight a `.tbcx` into an interpreter-neutral owned-byte image before constructing namespaces, Tcl objects, bytecode, procs, methods, or shims. It then reconstructs the precompiled entities and executes the top-level block in the **caller's current namespace** with source-equivalent frame and scope semantics. `iPtr->scriptFile` is set to the artifact's recorded authored path for the duration of the evaluation.
+- **Dump**: Validate through the same preflight path, then pretty-print / disassemble `.tbcx` contents, including `sourcePolicy`, executable-source field/nonempty/byte totals, the authored source path, literals, AuxData, exceptions, instruction streams, and retained source when present.
 - **Safe interp support**: In safe interpreters, `tbcx_SafeInit` provides the package and type infrastructure but does **not** register any `tbcx::*` commands. A parent interpreter may selectively grant access with `interp alias` or `interp expose`.
-- **Tcl 9.1 aware**: Uses Tcl 9.1 internal bytecode structures, literal encodings, and AuxData types; exposes them via a stable binary format header (`TBCX_FORMAT = 92`).
+- **Tcl 9.1 aware**: Uses Tcl 9.1 internal bytecode structures, literal encodings, and AuxData types; exposes them via binary format 93. Legacy format-92 artifacts are rejected because their removed `startCommand` instructions cannot be reconstructed.
 
 ---
 
 ## Source preservation
 
-TBCX follows the TclPro tclcompiler/tbcload precedent of stripping body source from compiled deployment artifacts: **body source is stripped by default**. Without `-include-source`, every proc and method body is emitted with an empty source-text field on the wire, and the loader installs a two-line diagnostic sentinel as the body's string representation:
+TBCX follows the TclPro tclcompiler/tbcload precedent of stripping source from compiled deployment artifacts. A default save is **strict compiled-only**: every designated executable-source field—proc body, method/constructor/destructor body, `TBCX_LIT_BYTESRC` prefix, and lambda body suffix—has length zero on the wire. Ordinary bytecode literals such as command names, variable names, constants, and messages remain visible; source stripping is not encryption.
+
+For stripped proc and method bodies, the loader installs this two-line diagnostic sentinel as the body's string representation:
 
 ```
 # tbcx: body source stripped at save time; info body unavailable
@@ -73,7 +73,9 @@ The shape matches tclcompiler's canonical pattern (Compiler8.html, "Example 1: C
 1. A `#` comment line — shows up at the top of any error traceback, making the cause visible at a glance.
 2. An `error` call — so that if downstream code does `proc new [info args orig] [info body orig]` and invokes `new`, the clone fails loudly rather than silently running as a no-op.
 
-**When to use `-include-source`.** Some Tcl idioms depend on `info body` returning the authored source text — cloning a command via `proc $new [info args $src] [info body $src]`, `info class definition`, TIP #280 line-number attribution in stack traces, and other introspection-driven diagnostic tools. For artifacts whose consumers need these idioms, pass `-include-source` to `tbcx::save`. The wire-format overhead is proportional to the aggregate source text of all procs and methods.
+Stripped lambdas receive a separate fixed, list-shaped diagnostic string representation. Registered `apply` occurrences retain their compiled `Proc`; a newly constructed string containing only that diagnostic has lost TBCX identity and fails loudly instead of executing authored source.
+
+**When to use `-include-source`.** Some Tcl idioms depend on introspection returning authored text—for example, cloning via `proc $new [info args $src] [info body $src]`, `info class definition`, TIP #280 attribution, and diagnostic tooling. For these consumers, pass `-include-source` to `tbcx::save`. Exact authored bytes are retained in all four executable-source field kinds, but both policy modes execute the compiled representation. Mutating retained source without changing bytecode does not change execution.
 
 **Comparison with tclcompiler/tbcload:**
 
@@ -99,7 +101,7 @@ Compile and serialize to `.tbcx`.
 - **`out`** may be:
   - an **open writable channel** — binary mode (`-translation binary -eofchar {}`) is enforced; the channel is *not* closed. Note: the caller's channel settings are mutated and not restored.
   - a **path** — TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.
-- **`-include-source`** — optional flag. Embeds authored proc/method body source text in the artifact. Required if consumers need `info body`, `info class definition`, TIP #280 line numbers, or introspection-based cloning to work. Artifact size grows proportional to aggregate source text.
+- **`-include-source`** — optional flag. Selects include-source policy and embeds exact authored executable-source bytes for proc, method, `BYTESRC`, and lambda records. It is required for byte-exact `info body`/TclOO introspection and similar tooling. Retained text is never an execution fallback.
 - **Result**: returns the output channel handle or normalized output path.
 
 What gets saved:
@@ -108,7 +110,7 @@ What gets saved:
 - The **authored source path** (when `in` was a readable file) — stored as an LPString in the header.
 - All discovered **`proc`** bodies, precompiled with correct namespace bindings. Conflicting definitions across `if`/`else` branches are handled via indexed proc markers. Each proc record carries an optional body-source LPString (populated under `-include-source`).
 - TclOO **methods/constructors/destructors**, precompiled. Each method record carries a visibility scope byte (default / public / unexported / TIP #500 true-private), an origin byte (class definition vs. `oo::objdefine` per-object definition), and an optional body-source LPString (populated under `-include-source`).
-- **Lambda literals** appearing in the script (e.g. `apply {args body ?ns?}` forms) are compiled and serialized as **lambda‑bytecode literals** so they do **not** recompile on first use after load.
+- **Lambda arguments** in statically recognized literal `apply` occurrences are compiled and serialized as **lambda‑bytecode literals** so they do **not** recompile on first use after load.
 - **Namespace eval bodies** and other script-body literals (try, foreach, while, for, catch, if/elseif/else bodies) are detected and pre-compiled to bytecode when safe to do so.
 
 ### `tbcx::load in`
@@ -125,7 +127,7 @@ Load semantics for source-equivalent behavior:
 - When a `.tbcx` is wrapped inside a proc that the user invokes externally, callers should use `uplevel 1 [list tbcx::load $path]` to reach the caller's frame — identical to the pattern already required for `source` in the same position.
 
 ### `tbcx::dump filename`
-Produce a human‑readable string describing the artifact: the header (including the recorded authored source path), a **disassembly** of each compiled block with literal operands annotated from the instruction table's operand types, any **lambda literals**, and per‑method **visibility scope** and **origin** lines. Each proc/method record shows its body source inline, or `<stripped at save time>` for default‑mode artifacts.
+Produce a human‑readable string describing the artifact: the header (including the recorded authored source path and source policy), executable-source field/nonempty/byte totals, a **disassembly** of each compiled block with literal operands annotated from the instruction table's operand types, any **lambda literals**, and per‑method **visibility scope** and **origin** lines. Each proc/method record shows its body source inline, or `<stripped at save time>` for strict default‑mode artifacts. An exact empty body retained by `-include-source` is reported as `(0 bytes)`, not as stripped.
 
 - **`filename`** must be a path to a readable `.tbcx` file.
 - **Output**: header (including authored source path, if any), summaries, literal listings, AuxData and exception info, disassembly of the top‑level/proc/method/lambda bytecode, and **preserved body source text** (indented inline, no truncation) for each proc and method when the artifact was built with `-include-source`.
@@ -139,29 +141,26 @@ Explicitly purge stale entries from the per‑interpreter lambda shimmer‑recov
 
 ## How saving works
 
-`tbcx::save` may be invoked from inside a proc: the top‑level script is always compiled at true global scope (the compile environment's proc pointer is cleared and the caller frame's LocalCache is hidden for the duration of the compile), because a serialized top level carries no local‑variable table and must never index the calling proc's local slots.
+`tbcx::save` may be invoked from inside a proc: the top-level script is compiled without borrowing the saver caller's procedure-local slot table (the compile environment's proc pointer is cleared and the caller frame's LocalCache is hidden during compilation). At load time it still executes in the load caller's current namespace and frame, matching `eval`/`source` variable resolution without indexing unrelated saved-call locals.
 
 `tbcx::save` compiles the given script and **captures** definitions in a single pass:
 
 - **Capture and rewrite**: `CaptureAndRewriteScript` walks the script's token tree once, extracting `proc`, `namespace eval`, `oo::class create`, `oo::define` (method/constructor/destructor/self method), and `oo::objdefine` forms. It records each method's visibility scope (from `-export`/`-unexport`/`-private` options, `private { ... }` / `self { ... }` lexical context, and same-body `export`/`unexport` commands) and its origin (class vs. per-object). It simultaneously produces a **rewritten** script where captured method/constructor/destructor bodies are replaced with recognizable stub sentinels and captured proc bodies with indexed markers, ensuring the top-level bytecode doesn't redundantly contain their full source and letting the loader patch only what the saver actually stubbed.
-- **Namespace body scanning**: The rewritten script and captured definition bodies are scanned (`ScanScriptBodiesRec`) for nested script-body patterns — `namespace eval`, `try`/`on`/`trap`/`finally`, `foreach`, `while`, `for`, `catch`, `if`/`elseif`/`else`, `uplevel`, `eval`, `dict for`/`map`/`update`/`with`, `lsort -command` — building a mapping from body text to namespace FQN.
-- **Pre‑compilation**: Matched namespace eval body literals in the top-level literal pool are compiled into a **side table** (never modifying the pool itself) so they serialize as bytecode rather than source text.
-  - Strips `startCommand` debugging instructions from all compiled blocks (replaced with `nop` bytes for ~15% leaner execution).
-- **Instruction scanning** (`InstrScanBodyLiterals`): Two-phase bytecode analysis runs on each compiled block:
-  - **Phase 1** (invokeStk analysis): Models the operand stack using the process-wide 256-entry `opMap[]` dispatch table, initialized once from the instruction table during package/type initialization under the type-init mutex and immutable thereafter, with O(1) per-instruction dispatch. Tracks literal indices through `push`/`loadStk`/`storeStk`/`swap` etc. to identify which literal is the command argument for each `invokeStk` call. Marks body literals for `eval`, `try`/`on`/`trap`/`finally`, `catch`, `foreach`, `while`, `for`, `if`, `uplevel`, `time`, `timerate`, `dict for`/`map`/`update`/`with` (including FQN `::tcl::dict::*`), and `self method`.
-  - **Phase 2** (unpushed literal detection): For blocks containing `foreach_start` opcodes, identifies literal pool entries that are never referenced by any `push` instruction — these are dead body-text references kept by Tcl's compiler for error reporting. Marks them for precompilation via `LooksLikeScriptBody()` filtering.
+- **Script-context analysis**: The rewritten script and captured definition bodies are scanned for supported nested script positions and namespace binding. Static forms that require authored-source reconstruction, including known cross-interpreter transfers, are rejected rather than weakened to a string fallback.
+- **Generic compilation**: Every strict/include-source top-level, proc, method, lambda, and nested script block is compiled with `DONT_COMPILE_CMDS_INLINE` and loaded as `TCL_BYTECODE_PRECOMPILED`. Retained include-source text is never consulted to recover from command-epoch changes.
+- **Occurrence plan** (`InstrScanBodyLiterals`): A forward stack model tracks each exact literal-producing `push` through generic `invokeStk` calls. Each executable occurrence receives a fresh tag-9 or tag-10 record and only that push operand is rewritten. The original literal stays when any data use needs it. Consequently, equal script bodies are not collapsed and a Tcl object shared by script and data positions preserves both roles.
 - **Bytearray detection**: `WriteLit_Untyped` probes string literals for bytes ≥ 0x80; if all code points ≤ 255, emits as `TBCX_LIT_BYTEARR` to prevent UTF-8 encoding corruption on round-trip.
 - **Source path recording**: When the input is a readable file path, `Tcl_FSGetNormalizedPath` records the authored source path in the header for later `info script` restoration at load time.
 - **Serialize**: Emit:
   - A **header** (magic, format version, Tcl version, code length, exception/literal/AuxData/local counts, max stack depth, authored source path LPString).
-  - The **top-level compiled block** (code bytes, literals, AuxData, exception ranges, locals epilogue). Captured proc bodies are stripped during this phase. Body literals are emitted as `TBCX_LIT_BYTESRC` (source text + compiled bytecode).
+  - The **top-level compiled block** (code bytes, literals, AuxData, exception ranges, locals epilogue). Captured proc bodies are stripped during this phase. Script-body occurrences are emitted as `TBCX_LIT_BYTESRC`; their source prefix is empty under strict policy and exact under include-source policy.
   - A table of **procs**: name FQN, namespace, argument spec, body source text LPString (empty without `-include-source`), then the separately compiled body block.
   - **Classes** *(advisory)* — discovered class names, sorted alphabetically for deterministic output (currently `nSupers = 0`; actual class structure is reconstructed by the top-level script at load time), then **methods** in definition order (class FQN, kind 0–4, scope byte, origin byte, name, argument spec, body source text LPString, compiled body block). Self methods use kind 4 (`TBCX_METH_SELF`); ctor/dtor records always carry the default scope.
   - A final flush of any buffered output.
 
 **Runaway protection**: The serializer tracks total literal calls, block calls, recursion depth, and output bytes. If any limit is exceeded (2M literals, 256K blocks, depth 64, or 256 MB output), serialization aborts with a diagnostic error.
 
-Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, bytesrc** (bytecode + source text for cross-interp recompilation).
+Supported literal kinds: **bignum, boolean, bytearray, dict** (insertion order preserved), **double, list, string, wideint, wideuint, lambda‑bytecode, bytesrc** (namespace-bound compiled bytecode plus a policy-controlled introspection source field).
 
 Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachInfo**.
 
@@ -169,11 +168,11 @@ Supported AuxData: **jump tables (string and numeric), dict-update, NewForeachIn
 
 ## How loading works
 
-`tbcx::load` reads the header, validates magic/format/Tcl‑version compatibility, then deserializes sections:
+`tbcx::load` first reads the bounded artifact into an owned, interpreter-neutral byte image. A complete preflight pass validates the header, exact Tcl version, every section/count/tag, executable-source policy, opcode and instruction boundary, operand, literal/local/AuxData reference, jump target, exception range, nested policy field, and exact EOF. No namespace, Tcl object, `ByteCode`, `Proc`, method, or persistent shim is created until that pass succeeds. Materialization then reads the same validated image:
 
 1. **Header source path**: If the header carries a non-empty authored source path (artifacts built from a file), it's read into an owned Tcl_Obj that the loader will use for `iPtr->scriptFile` during top-level evaluation.
-2. **Top-level block**: Deserialized and marked `TCL_BYTECODE_PRECOMPILED` so Tcl skips compile-epoch checks and executes the bytecode directly. `TBCX_LIT_BYTESRC` literals within the block are loaded with `setPrecompiled=0` and their source text restored as string rep, allowing Tcl to recompile from source when needed (e.g. cross-interpreter evaluation or epoch mismatch).
-3. **Procs**: A temporary **ProcShim** intercepts the `proc` command by patching its `objProc2` and `nreProc2` handler pointers in place (no renaming). When the top-level block evaluates a `proc` call matching a saved definition (by FQN + argument signature, or by indexed marker for conflicting definitions), the shim substitutes the precompiled body. Records for a given key are kept in a definition-order FIFO, and only stubbed bodies (recognizable sentinels the saver wrote) are ever patched — a `proc` the saver left verbatim keeps its authored body. The body's string representation is set to the preserved source text (via `Tcl_InvalidateStringRep` + `Tcl_InitStringRep`) if the artifact was built with `-include-source`, or to the diagnostic sentinel otherwise. Unmatched `proc` calls pass through to Tcl's original handler.
+2. **Top-level block**: Deserialized into one final packed `ByteCode` allocation with one code-byte copy and no compile-environment staging arrays. New-policy top-level and nested `TBCX_LIT_BYTESRC` blocks are marked `TCL_BYTECODE_PRECOMPILED`; include-source bytes are restored only as string representations. Legacy policy-zero format-93 artifacts retain their historical source-fallback semantics.
+3. **Procs**: A temporary **ProcShim** intercepts the `proc` command by patching its `objProc2` and `nreProc2` handler pointers in place (no renaming). When the top-level block evaluates a matching saved definition (by FQN + argument signature, or by indexed marker for conflicting definitions), the shim passes the already-built `procbody` to Tcl's original `proc` handler. Tcl therefore performs normal marker-time command creation, replacement traces, namespace/export/import handling, argument validation, and standard dispatch while reusing the deserialized `Proc` and compiled-local chain instead of rebuilding them. Records for a given key are kept in definition order, and only stubbed bodies are substituted; a `proc` the saver left verbatim keeps its authored body. The body string is the byte-exact source under `-include-source`, or the documented diagnostic sentinel otherwise. Unmatched `proc` calls pass through unchanged.
 4. **Classes and methods**: An **OOShim** intercepts `oo::define` (and `oo::objdefine` when available) by patching the commands' `objProc2`/clientData handlers in place — the commands are *not* renamed. Method records are keyed by *(class FQN, kind, name, origin)* and kept in definition-order FIFOs; each definition site the rewritten script executes consumes the front record, and only bodies carrying the tbcx stub sentinel are patched, so a method left verbatim by the saver is never overwritten by a stale same-key record. After installing each body, the loader applies the record's visibility scope (public / unexported / TIP #500 true-private). Constructors and destructors use a create-then-swap pattern (placeholder body `";"` → TclOO builds dispatch → bytecode swap) to preserve `next` routing through the constructor chain. **Self methods** (kind 4) are installed via `oo::define CLASS { self method NAME ARGS BODY }` through the original handler, which properly sets up the metaclass inheritance chain so subclass class-objects inherit the method. **Per-object methods** are installed precompiled by replaying the `oo::objdefine` builder body and matching its stubbed method statements against object-origin records; true-private per-object methods are re-created through the flat `private` form so TclOO wires them correctly. Each method body likewise receives either the preserved source text or the sentinel, depending on the artifact.
 5. **Rename/delete safety**: The shims register command traces on `proc`, `oo::define`, `oo::objdefine`, and `apply`. If any of these is renamed or deleted while a shim is active, the trace restores the original handlers in place immediately (a Command struct survives a rename), so a renamed command never remains wired to freed shim state.
 6. **Lambda recovery**: An **ApplyShim** is installed as persistent per-interpreter `AssocData`. When a precompiled lambda's `lambdaExpr` internal rep gets evicted by shimmer, the shim detects the missing rep on the next `[apply]` call and re-installs the precompiled `Proc*` from its registry before forwarding to Tcl's real `[apply]`.
@@ -191,7 +190,7 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | Field | Type | Description |
 |-------|------|-------------|
 | `magic` | u32 | `0x58434254` ("TBCX") |
-| `format` | u32 | `92` (Tcl 9.1, v92 feature set) |
+| `format` | u32 | `93` (Tcl 9.1, command-safe instruction streams) |
 | `tcl_version` | u32 | `maj<<24 \| min<<16 \| patch<<8 \| type` |
 | `codeLenTop` | u64 | Code byte count for top-level block |
 | `numExceptTop` | u32 | Exception range count |
@@ -202,10 +201,12 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | `sourcePath` | LPString | Authored source file path (empty for inline/channel inputs) |
 
 **Sections (in order):**
-1. **Top‑level block** — code bytes, literal array, AuxData array, exception ranges, epilogue (maxStack, reserved, numLocals, local names).
-2. **Procs** — u32 count, then repeated tuples: name FQN (LPString), namespace (LPString), argument spec (LPString), body source text (LPString — empty without `-include-source`), compiled block.
+1. **Top‑level block** — code bytes, literal array, AuxData array, exception ranges, epilogue (maxStack, source policy, numLocals, local names). Nested blocks keep this field zero.
+2. **Procs** — u32 count, then repeated tuples: name FQN (LPString), namespace (LPString), argument spec (LPString), policy-controlled body source text, compiled block.
 3. **Classes** *(advisory)* — u32 count, then class FQN; currently records discovered class names for dump/introspection only. Class creation and superclass structure are reconstructed by the rewritten top-level script at load time.
-4. **Methods** — u32 count, then repeated tuples: class FQN, kind (u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self), scope (u8, see *Method scopes* below; ctor/dtor always 0), origin (u8: 0=class definition, 1=object definition), name (empty for ctor/dtor), argument spec, body source text (LPString — empty without `-include-source`), compiled block.
+4. **Methods** — u32 count, then repeated tuples: class FQN, kind (u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self), scope (u8, see *Method scopes* below; ctor/dtor always 0), origin (u8: 0=class definition, 1=object definition), name (empty for ctor/dtor), argument spec, policy-controlled body source text, compiled block.
+
+The top policy is `0` for legacy format-93 artifacts, `1` for strict compiled-only, or `2` for include-source. New saves write `1` by default or `2` with `-include-source`. Both new policies execute precompiled material. An older r91 loader intentionally rejects new artifacts because it requires this formerly reserved field to be zero; no package, format, Tcl compatibility, or literal tag number changed.
 
 **Literal tags** (u32):
 | Tag | Kind | Payload |
@@ -219,8 +220,8 @@ Endianness is detected and handled so that hosts read/write a consistent little-
 | 6 | STRING | LPString (u32 length + bytes) |
 | 7 | WIDEINT | signed 64-bit as u64 |
 | 8 | WIDEUINT | unsigned 64-bit as u64 |
-| 9 | LAMBDA_BC | ns FQN, args, compiled block, body source text |
-| 10 | BYTESRC | source text (LPString) + ns FQN + compiled block (enables cross-interp recompilation) |
+| 9 | LAMBDA_BC | ns FQN, args, compiled block, policy-controlled body source text |
+| 10 | BYTESRC | policy-controlled source text + ns FQN + compiled block |
 
 **AuxData tags** (u32):
 | Tag | Kind | Payload |
@@ -263,8 +264,8 @@ Records are keyed at load by *(class FQN, kind, name, origin)*, so a class-insta
 
 - **Functional equivalence**: `tbcx::load` aims to be *functionally identical* to `source` of the original script. With `-include-source`, byte-for-byte introspection round-trip (`info body`, `info class definition`, `info class constructor`) is preserved. TclOO method visibility — exported, unexported, or TIP #500 true-private, however it was expressed at definition time — survives the round-trip. The authored source path is recorded at save time and reinstalled during load, so `info script` returns the original `.tcl` path and `[file dirname [info script]]` works naturally.
 - **Namespaces and frames**: The top-level block is evaluated in the caller's current namespace (no `TCL_EVAL_GLOBAL`). Saved blocks carry namespace metadata to bind compiled code correctly. Lambda literals that include a namespace element keep that association. When `tbcx::load` is wrapped inside a proc, callers should use `uplevel 1 [list tbcx::load $path]` to reach the caller's frame — same pattern as `source`.
-- **Version check**: The loader requires an exact major.minor Tcl version match (e.g. 9.1). Bytecode instruction semantics can change between minor versions.
-- **Sanity limits**: Code ≤ 64 MiB; literal/AuxData/exception pools ≤ 1M entries; LPString ≤ 4 MiB; output ≤ 256 MB; recursion depth ≤ 64.
+- **Version check**: The loader requires the exact packed Tcl producer version, including major, minor, patch, and alpha/beta/final release type. TBCX reconstructs private structures whose ABI is not guaranteed across patch builds.
+- **Validation and limits**: Before any interpreter-owned artifact material is constructed, the neutral preflight validates policy/source fields, every opcode, operand, literal/local/AuxData index, jump target, exception boundary, supported AuxData payload, nested reserved field, and exact EOF. Code ≤ 64 MiB; literal/AuxData/exception pools ≤ 1M entries; LPString ≤ 4 MiB; artifact/output image ≤ 256 MB; recursion depth ≤ 64.
 
 ---
 
@@ -272,7 +273,7 @@ Records are keyed at load by *(class FQN, kind, name, origin)*, so a class-insta
 
 This package uses **Tcl 9.1** APIs and selected internals (e.g., `tclInt.h`, `tclCompile.h`).
 You'll need Tcl 9.1 headers/libs on your include path and to build as a standard loadable extension.
-The entry point `tbcx_Init` registers commands and provides `tbcx 1.2`.
+The entry point `tbcx_Init` registers commands and provides `tbcx 1.2.1`; the value comes from the configure-generated `PACKAGE_VERSION`.
 The safe entry point `tbcx_SafeInit` provides the package and type infrastructure but registers **no commands**; use `interp alias` or `interp expose` from a parent interpreter to grant selective access.
 
 Example (TEA Linux/macOS):
@@ -281,26 +282,30 @@ Example (TEA Linux/macOS):
 ./configure
 make install
 make test
+make benchmark-smoke
 ```
 
 On Windows, build with `nmake -f win/makefile.vc`. The makefile passes `/std:c11 /experimental:c11atomics` (the code uses C11 atomics, and MSVC needs both switches to enable them) and links no TomMath import library — bignum operations go exclusively through Tcl's TomMath stubs table, so the extension links against both static and dynamic Tcl builds.
 
-The test suite ships with **643 test declarations across 32 test files (~10,500 lines)** — four of them live in a parameterized helper invoked 35 times, expanding to roughly 780 executed test cases — covering datatypes, auxdata round-trips, exception handling, proc and OO lifecycles, namespace binding, channel I/O, multi-interpreter and threaded scenarios (including opcode-cache races and rename-during-load safety), Unicode edge cases, stress tests, security regressions, method-scope/visibility matrices checked against a `source` oracle, and specific regression tests for body source round-trip, sentinel behavior, cloned-body failure semantics, list-literal quoting, and `info script` path resolution.
+The test suite currently executes **822 cases across 34 test files**, covering datatypes, auxdata round-trips, exception handling, proc and OO lifecycles, namespace binding, channel I/O, multi-interpreter and threaded scenarios, Unicode edge cases, stress tests, malformed opcode/operand/AuxData/jump/exception mutations, source-policy and transactional source-field mutations, repeated-equal and data-sharing executable occurrences, dump source accounting, caller frames, command epochs and limits, method visibility, include-source execution isolation, lambda lifecycle, and `info script` path resolution.
+
+`make benchmark` runs the deterministic matrix in `bench/run.tcl`; it prints the exact package/library provenance, alternates source/artifact order, verifies every result, and reports stripped plus `-include-source` placebo rows. See `bench/README.md` for benchmark-only structural counters.
 
 ---
 
 ## Usage notes & caveats
 
 - **Security**: Loading a `.tbcx` executes code (top-level) and installs commands/classes. Only load artifacts you trust.
-- **Compatibility**: `TBCX_FORMAT` is `92` (Tcl 9.1). An artifact whose format does not match is rejected cleanly at load time as a bad/unknown artifact format (`tbcx: bad header`); the required exact major.minor Tcl version match is a separate check. Re-run `tbcx::save` to regenerate v91 artifacts in v92.
+- **Compatibility**: `TBCX_FORMAT` remains `93` and the loader still requires an exact packed Tcl producer version. Legacy policy-zero format-93 artifacts remain readable. New saves use the formerly reserved top-block word for source policy, so older r91 loaders reject them loudly; format 92 remains unsupported.
 - **AuxData coverage**: The saver asserts that all AuxData items in a block are of known kinds (jump tables, dict-update, NewForeachInfo). Unknown kinds cause the save to abort.
+- **32-bit numeric switches**: Numeric jump tables use Tcl's `TCL_ONE_WORD_KEYS` representation on every platform. On 32-bit builds, a serialized `switch -integer` key outside the signed pointer-sized domain is rejected at load with a `tbcx:` diagnostic instead of being truncated or treated as a string key.
 - **OO coverage**: Supports `oo::class create`, `oo::define` (method/classmethod/constructor/destructor/self method plus declarative keywords like variable/superclass/mixin/filter/forward), and `oo::objdefine`. A `self method` (or a method inside a `self { ... }` block) written in an `oo::objdefine` builder is not representable — `oo::objdefine` has no `self method` form — and is rejected at save time with a diagnostic rather than silently loading as a no-op. Builder-form class bodies are expanded into multi-word stubs for correct load-time reconstruction. Self methods (`self method` inside `oo::define`) are serialized with kind 4 (`TBCX_METH_SELF`) and loaded via `oo::define { self method ... }` to preserve metaclass inheritance for subclasses; their visibility (including in-body `self export`/`self unexport`) is folded into the scope byte, and their bodies never appear in the rewritten top-level script.
 - **Method visibility**: Visibility expressed via `-export`/`-unexport`/`-private` options, `private { ... }` blocks (TIP #500 true-private), or in-body `export`/`unexport` commands is recorded per method and restored on load — for class methods and per-object methods alike.
 - **Verbatim safety**: A method or proc whose name, arguments, or body is not a static literal (or whose target is a runtime variable) is left verbatim by the saver and compiles normally at load; the loader's stub-sentinel check guarantees such definitions are never overwritten by a precompiled record for the same name.
-- **Lambda shimmer recovery**: Precompiled lambdas are registered in a persistent per-interpreter ApplyShim. If the `lambdaExpr` internal rep is evicted by shimmer, the shim transparently re-installs it on the next `[apply]` call.
+- **Lambda shimmer recovery**: Precompiled lambdas are registered in a persistent per-interpreter ApplyShim. If the `lambdaExpr` internal rep is evicted on the registered object, the shim reinstalls the precompiled `Proc` on the next `[apply]`. If only the stripped diagnostic string is copied into a newly created object, its TBCX identity is intentionally lost and it fails rather than compiling that diagnostic as an authored body.
 - **Precompilation boundary**: TBCX precompiles bodies and lambdas only when they are present in statically identifiable literal positions. Strings assembled at runtime (e.g. with `format`, interpolation, or `list` construction) still round-trip correctly, but they remain ordinary data and compile at execution time when Tcl evaluates them.
 - **OO coverage (runtime)**: TBCX preserves normal TclOO class/object construction semantics by executing the rewritten top-level script, while substituting precompiled bodies for recognized `oo::define` / `oo::objdefine` method forms. Class-instance and per-object methods sharing the same name coexist (distinct origin keys). Tested scenarios include class methods, self methods, per-object methods (including true-private ones), private methods, inheritance (including diamond), mixins, filters, forwards, abstract/singleton metaclasses, method rename/delete/export changes, metaclasses with `self method`, and `next`-based constructor chaining. Declarative TclOO builder commands (`variable`, `superclass`, `mixin`, `filter`, `forward`) are preserved in the rewritten top-level.
-- **Multi-interpreter and threads**: TBCX follows Tcl's standard threading model: only the thread that created an interpreter may call `tbcx::save`, `tbcx::load`, `tbcx::dump`, or `tbcx::gc` on that interpreter. Multi-thread support means multiple independent interpreters (each used by its owning thread), not sharing one interpreter across threads. Calling a TBCX command from a non-owning thread returns `TCL_ERROR` with a diagnostic message; debug builds (or builds with `-DTBCX_THREAD_CHECKS`) additionally assert ownership inside internal helpers. Shared process-wide state (the save-side opcode dispatch table) is initialized exactly once, under a mutex, at package init, so concurrent `tbcx::save` from multiple threads is safe. Artifacts are designed to load into interpreters other than the originating one. Interpreter-specific state (ApplyShim lambda registry, load depth, OO shim state) is consolidated in a single per-interpreter record and cleaned up automatically when the interpreter is deleted.
+- **Multi-interpreter and threads**: TBCX follows Tcl's standard threading model: only the thread that created an interpreter may call `tbcx::save`, `tbcx::load`, `tbcx::dump`, or `tbcx::gc` on that interpreter. Multiple independent interpreters may each load the same artifact. Moving an already-materialized embedded bytecode object between interpreters is different: pending approval of the proposed private interp shim, statically recognized `interp eval` literal crossings are rejected with `TBCX EVAL CROSSINTERP UNSUPPORTED`. No strict/include-source path recompiles retained text. Shared process-wide scanner state is initialized once under a mutex; interpreter-specific state is cleaned up with its owner.
 - **`tbcx::gc`**: Safe to call before any load (no-op) and safe to call repeatedly. Does not interfere with subsequent save/load operations.
 - **Load reentrancy**: Nested or reentrant `tbcx::load` calls are capped at depth 8 per interpreter.
 - **Conflicting proc definitions**: When multiple branches define a proc with the same name (e.g. `if {$cond} {proc p ...} else {proc p ...}`), the saver emits indexed markers so the loader matches by position rather than by FQN alone.
@@ -315,6 +320,7 @@ The test suite ships with **643 test declarations across 32 test files (~10,500 
 - `tbcxsave.c` — capture, rewrite, compile, and serialize; `-include-source` handling
 - `tbcxload.c` — deserialize, shim, materialize, and execute; scriptFile/namespace/frame handling
 - `tbcxdump.c` — disassembler/dumper with body-source display
+- `bench/` — exact-provenance source/artifact benchmark and structural-counter checks
 
 ---
 

@@ -6,7 +6,7 @@
 #
 # Optional: Thread package (tests with -constraints haveThread)
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -18,7 +18,7 @@ test thread.2 {thread + sub-interpreter} -constraints haveThread -body {
     tbcx::save $in $out
     set tid [thread::create]
     thread::send $tid {interp create J}
-    thread::send $tid {interp eval J {package require tbcx}}
+    thread::send $tid {interp eval J {package require -exact tbcx 1.2.1}}
     set res [thread::send $tid [list interp eval J [list tbcx::load $out]]]
     thread::send $tid {interp delete J}
     thread::release $tid

@@ -8,7 +8,7 @@
 # Requires: Tcl 9.1, tbcx, tcltest 2.5
 # Optional: Thread package (tests with -constraints haveThread)
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -27,7 +27,7 @@ test mt.interp.1 {N child interps load same file independently} -body {
     set results {}
     for {set i 0} {$i < 5} {incr i} {
         interp create C$i
-        interp eval C$i [list package require tbcx]
+        interp eval C$i [list package require -exact tbcx 1.2.1]
         lappend results [interp eval C$i [list tbcx::load $out]]
         interp delete C$i
     }
@@ -49,8 +49,8 @@ test mt.interp.2 {per-interp OO class isolation} -body {
     } $out2
     interp create I1
     interp create I2
-    interp eval I1 [list package require tbcx]
-    interp eval I2 [list package require tbcx]
+    interp eval I1 [list package require -exact tbcx 1.2.1]
+    interp eval I2 [list package require -exact tbcx 1.2.1]
     set r1 [interp eval I1 [list tbcx::load $out1]]
     set r2 [interp eval I2 [list tbcx::load $out2]]
     interp delete I1
@@ -75,7 +75,7 @@ test mt.interp.3 {per-interp OO unexport isolation} -body {
     set results {}
     foreach name {I1 I2 I3} {
         interp create $name
-        interp eval $name [list package require tbcx]
+        interp eval $name [list package require -exact tbcx 1.2.1]
         lappend results [interp eval $name [list tbcx::load $out]]
         interp delete $name
     }
@@ -91,8 +91,8 @@ test mt.interp.4 {per-interp lambda isolation} -body {
     } $out
     interp create A
     interp create B
-    interp eval A [list package require tbcx]
-    interp eval B [list package require tbcx]
+    interp eval A [list package require -exact tbcx 1.2.1]
+    interp eval B [list package require -exact tbcx 1.2.1]
     set rA [interp eval A [list tbcx::load $out]]
     set rB [interp eval B [list tbcx::load $out]]
     interp eval A {
@@ -113,8 +113,8 @@ test mt.interp.5 {per-interp load depth independence} -body {
     tbcx::save $outerScript $outer
     interp create I1
     interp create I2
-    interp eval I1 [list package require tbcx]
-    interp eval I2 [list package require tbcx]
+    interp eval I1 [list package require -exact tbcx 1.2.1]
+    interp eval I2 [list package require -exact tbcx 1.2.1]
     set r1 [interp eval I1 [list tbcx::load $outer]]
     set r2 [interp eval I2 [list tbcx::load $inner]]
     interp delete I1
@@ -130,8 +130,8 @@ test mt.interp.6 {per-interp GC does not affect other interps} -body {
     } $out
     interp create G1
     interp create G2
-    interp eval G1 [list package require tbcx]
-    interp eval G2 [list package require tbcx]
+    interp eval G1 [list package require -exact tbcx 1.2.1]
+    interp eval G2 [list package require -exact tbcx 1.2.1]
     interp eval G1 [list tbcx::load $out]
     set r2 [interp eval G2 [list tbcx::load $out]]
     interp eval G1 {tbcx::gc}
@@ -156,7 +156,7 @@ test mt.interp.7 {rapid interp create/load/delete cycle} -body {
     set ok 0
     for {set i 0} {$i < 20} {incr i} {
         interp create T
-        interp eval T [list package require tbcx]
+        interp eval T [list package require -exact tbcx 1.2.1]
         set r [interp eval T [list tbcx::load $out]]
         interp delete T
         if {$r eq {ok 42 lam}} { incr ok }
@@ -178,7 +178,7 @@ test mt.interp.8 {multiple OO loads in same interp get distinct shim IDs} -body 
         return [[B new] val]
     } $out2
     interp create M
-    interp eval M [list package require tbcx]
+    interp eval M [list package require -exact tbcx 1.2.1]
     set r1 [interp eval M [list tbcx::load $out1]]
     set r2 [interp eval M [list tbcx::load $out2]]
     interp delete M
@@ -205,7 +205,7 @@ test mt.thread.1 {concurrent save from N threads (P0 opcode race)} \
         lappend outfiles [makeFile "" mt.thread.1-$i.tbcx]
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{script f} {
@@ -233,7 +233,7 @@ test mt.thread.2 {concurrent load from N threads} \
     for {set i 0} {$i < $N} {incr i} {
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{f} {
@@ -253,9 +253,9 @@ test mt.thread.3 {mixed concurrent save+load} \
     set out [makeFile "" mt.thread.3.tbcx]
     tbcx::save {return "base"} $out
     set tA [thread::create]
-    thread::send $tA [list package require tbcx]
+    thread::send $tA [list package require -exact tbcx 1.2.1]
     set tB [thread::create]
-    thread::send $tB [list package require tbcx]
+    thread::send $tB [list package require -exact tbcx 1.2.1]
     set saveFile [makeFile "" mt.thread.3-save.tbcx]
     thread::send -async $tA [list apply {{f} {
         for {set i 0} {$i < 5} {incr i} {
@@ -300,9 +300,9 @@ test mt.thread.4 {thread with child interps loading OO} \
     set results {}
     foreach tid $tids {
         set r [thread::send $tid [list apply {{f} {
-            package require tbcx
+            package require -exact tbcx 1.2.1
             interp create child
-            interp eval child [list package require tbcx]
+            interp eval child [list package require -exact tbcx 1.2.1]
             set r [interp eval child [list tbcx::load $f]]
             interp delete child
             set r
@@ -326,7 +326,7 @@ test mt.thread.5 {concurrent lambda loads across threads} \
     for {set i 0} {$i < $N} {incr i} {
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     set results {}
     foreach tid $tids {
@@ -351,7 +351,7 @@ test mt.thread.6 {stress: N threads save+load+eval independently} \
         }]
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{script f} {
@@ -379,7 +379,7 @@ test mt.thread.7 {rapid thread create/load/destroy cycle} \
     for {set i 0} {$i < 10} {incr i} {
         set tid [thread::create]
         set r [thread::send $tid [list apply {{f} {
-            package require tbcx
+            package require -exact tbcx 1.2.1
             tbcx::load $f
         }} $out]]
         thread::release $tid
@@ -408,7 +408,7 @@ test mt.thread.8 {concurrent OO+unexport loads across threads} \
     for {set i 0} {$i < $N} {incr i} {
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     set results {}
     foreach tid $tids {
@@ -492,7 +492,7 @@ test mt.lifecycle.5 {PrecompClass failure detected (not suppressed)} -body {
     set results {}
     for {set i 0} {$i < 3} {incr i} {
         interp create V$i
-        interp eval V$i [list package require tbcx]
+        interp eval V$i [list package require -exact tbcx 1.2.1]
         lappend results [interp eval V$i [list tbcx::load $out]]
         interp delete V$i
     }
@@ -519,7 +519,7 @@ test mt.stress.1 {stress: N threads full OO save+load} \
         }]
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{script f} {
@@ -550,7 +550,7 @@ test mt.stress.2 {stress: N threads lambda save+load+apply} \
         }]
         set tid [thread::create]
         lappend tids $tid
-        thread::send $tid [list package require tbcx]
+        thread::send $tid [list package require -exact tbcx 1.2.1]
     }
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{script f} {
@@ -586,11 +586,11 @@ test mt.stress.3 {stress: threads creating child interps with OO+lambda loads} \
     set results {}
     foreach tid $tids {
         set r [thread::send $tid [list apply {{f M} {
-            package require tbcx
+            package require -exact tbcx 1.2.1
             set rs {}
             for {set j 0} {$j < $M} {incr j} {
                 interp create child$j
-                interp eval child$j [list package require tbcx]
+                interp eval child$j [list package require -exact tbcx 1.2.1]
                 lappend rs [interp eval child$j [list tbcx::load $f]]
                 interp delete child$j
             }
@@ -611,10 +611,11 @@ test mt.stress.3 {stress: threads creating child interps with OO+lambda loads} \
 # ========================================================================
 
 # --- 5.1  Concurrent package require + immediate save ---
-#     Tests the P0 fix directly: multiple threads do [package require tbcx]
+#     Tests the P0 fix directly: multiple threads do [package require -exact tbcx 1.2.1]
 #     concurrently (racing through TbcxInitTypes / TbcxSaveInitOpcodesLocked),
 #     then immediately exercise tbcx::save with a script complex enough to
-#     hit startCommand stripping.  No serial pre-initialization.
+#     hit opcode scanning and retained startCommand sequences.  No serial
+#     pre-initialization.
 
 test mt.init.1 {concurrent package require + save (P0 init race)} \
     -constraints haveThread -body {
@@ -648,7 +649,7 @@ test mt.init.1 {concurrent package require + save (P0 init race)} \
     # Each thread races through TbcxInitTypes concurrently.
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{script f} {
-            package require tbcx
+            package require -exact tbcx 1.2.1
             tbcx::save $script $f
             set ::_done 1
         }} $script [lindex $outfiles $i]]
@@ -689,7 +690,7 @@ test mt.init.2 {concurrent package require + load (P0 init race)} \
     # Fire concurrent package require + load — no serial pre-init
     for {set i 0} {$i < $N} {incr i} {
         thread::send -async [lindex $tids $i] [list apply {{f} {
-            package require tbcx
+            package require -exact tbcx 1.2.1
             set ::_result [tbcx::load $f]
         }} $out]
     }

@@ -1,0 +1,612 @@
+# -*-Tcl-*-
+# 34-source-policy.test -- compiled-only executable-source policy regressions.
+
+package require -exact tbcx 1.2.1
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+namespace eval ::source34 {}
+
+proc ::source34::readBinary {path} {
+    set ch [open $path rb]
+    try {
+        read $ch
+    } finally {
+        close $ch
+    }
+}
+
+proc ::source34::writeBinary {path data} {
+    set ch [open $path wb]
+    try {
+        puts -nonewline $ch $data
+    } finally {
+        close $ch
+    }
+}
+
+proc ::source34::need {data offset count} {
+    if {$offset < 0 || $count < 0 ||
+            $offset + $count > [string length $data]} {
+        error "short artifact field at $offset (need $count bytes)"
+    }
+}
+
+proc ::source34::getU8 {data offset} {
+    need $data $offset 1
+    binary scan [string index $data $offset] c value
+    expr {$value & 255}
+}
+
+proc ::source34::getU32LE {data offset} {
+    need $data $offset 4
+    binary scan [string range $data $offset [expr {$offset + 3}]] c* b
+    expr {([lindex $b 0] & 255) |
+          (([lindex $b 1] & 255) << 8) |
+          (([lindex $b 2] & 255) << 16) |
+          (([lindex $b 3] & 255) << 24)}
+}
+
+proc ::source34::putU32LE {data offset value} {
+    need $data $offset 4
+    binary scan $data c* octets
+    for {set i 0} {$i < 4} {incr i} {
+        lset octets [expr {$offset + $i}] \
+            [expr {($value >> (8 * $i)) & 255}]
+    }
+    binary format c* $octets
+}
+
+proc ::source34::readU32 {data offsetVar} {
+    upvar 1 $offsetVar offset
+    set value [getU32LE $data $offset]
+    incr offset 4
+    return $value
+}
+
+proc ::source34::readLP {data offsetVar} {
+    upvar 1 $offsetVar offset
+    set lengthAt $offset
+    set length [readU32 $data offset]
+    need $data $offset $length
+    if {$length == 0} {
+        set bytes ""
+    } else {
+        set bytes [string range $data $offset [expr {$offset + $length - 1}]]
+    }
+    incr offset $length
+    list $lengthAt $length $bytes
+}
+
+proc ::source34::walkExecutableSource {
+        data offsetVar findingsVar kind args} {
+    upvar 1 $offsetVar offset $findingsVar findings
+    lassign [readLP $data offset] lengthAt length bytes
+    set finding [dict create kind $kind offset $lengthAt \
+        length $length bytes $bytes]
+    foreach {key value} $args {
+        dict set finding $key $value
+    }
+    lappend findings $finding
+    expr {[llength $findings] - 1}
+}
+
+proc ::source34::walkLiteral {
+        data offsetVar findingsVar blocksVar stringsVar depth} {
+    upvar 1 $offsetVar offset $findingsVar findings \
+        $blocksVar blocks $stringsVar strings
+    if {$depth > 64} {error "literal nesting too deep in source34 walker"}
+    set tagAt $offset
+    set tag [readU32 $data offset]
+    switch -- $tag {
+        0 {
+            incr offset                 ;# sign
+            set magnitude [readU32 $data offset]
+            need $data $offset $magnitude
+            incr offset $magnitude
+        }
+        1 {incr offset}
+        2 {readLP $data offset}
+        3 {
+            set pairs [readU32 $data offset]
+            for {set i 0} {$i < 2 * $pairs} {incr i} {
+                walkLiteral $data offset findings blocks strings \
+                    [expr {$depth + 1}]
+            }
+        }
+        4 - 7 - 8 {
+            need $data $offset 8
+            incr offset 8
+        }
+        5 {
+            set count [readU32 $data offset]
+            for {set i 0} {$i < $count} {incr i} {
+                walkLiteral $data offset findings blocks strings \
+                    [expr {$depth + 1}]
+            }
+        }
+        6 {
+            lassign [readLP $data offset] lengthAt length bytes
+            lappend strings [dict create tagAt $tagAt offset $lengthAt \
+                length $length bytes $bytes]
+        }
+        9 {
+            readLP $data offset         ;# namespace
+            set numArgs [readU32 $data offset]
+            for {set i 0} {$i < $numArgs} {incr i} {
+                readLP $data offset     ;# argument name
+                set hasDefault [getU8 $data $offset]
+                incr offset
+                if {$hasDefault} {
+                    walkLiteral $data offset findings blocks strings \
+                        [expr {$depth + 1}]
+                }
+            }
+            set body [walkBlock $data offset findings blocks strings 0]
+            walkExecutableSource $data offset findings lambda \
+                codeLen [dict get $body codeLen] tagAt $tagAt
+        }
+        10 {
+            set findingIndex [walkExecutableSource $data offset findings \
+                bytesrc tagAt $tagAt]
+            readLP $data offset         ;# execution namespace
+            set body [walkBlock $data offset findings blocks strings 0]
+            set finding [lindex $findings $findingIndex]
+            dict set finding codeLen [dict get $body codeLen]
+            lset findings $findingIndex $finding
+        }
+        default {error "unknown literal tag $tag at $tagAt"}
+    }
+    return $tag
+}
+
+proc ::source34::walkAux {data offsetVar} {
+    upvar 1 $offsetVar offset
+    set count [readU32 $data offset]
+    for {set i 0} {$i < $count} {incr i} {
+        set tag [readU32 $data offset]
+        switch -- $tag {
+            0 {
+                set entries [readU32 $data offset]
+                for {set k 0} {$k < $entries} {incr k} {
+                    readLP $data offset
+                    incr offset 4
+                }
+            }
+            1 {
+                set entries [readU32 $data offset]
+                incr offset [expr {12 * $entries}]
+            }
+            2 {
+                set entries [readU32 $data offset]
+                incr offset [expr {4 * $entries}]
+            }
+            3 {
+                set numLists [readU32 $data offset]
+                incr offset 12          ;# loopCt, firstValue, duplicate count
+                for {set k 0} {$k < $numLists} {incr k} {
+                    set vars [readU32 $data offset]
+                    incr offset [expr {4 * $vars}]
+                }
+            }
+            default {error "unknown aux tag $tag"}
+        }
+        need $data 0 $offset
+    }
+    return $count
+}
+
+proc ::source34::walkBlock {
+        data offsetVar findingsVar blocksVar stringsVar isTop} {
+    upvar 1 $offsetVar offset $findingsVar findings \
+        $blocksVar blocks $stringsVar strings
+    set blockAt $offset
+    set codeLen [readU32 $data offset]
+    set codeAt $offset
+    need $data $offset $codeLen
+    incr offset $codeLen
+    set numLits [readU32 $data offset]
+    for {set i 0} {$i < $numLits} {incr i} {
+        walkLiteral $data offset findings blocks strings 0
+    }
+    set numAux [walkAux $data offset]
+    set numExceptions [readU32 $data offset]
+    need $data $offset [expr {25 * $numExceptions}]
+    incr offset [expr {25 * $numExceptions}]
+    set maxStack [readU32 $data offset]
+    set policyAt $offset
+    set policy [readU32 $data offset]
+    set numLocals [readU32 $data offset]
+    for {set i 0} {$i < $numLocals} {incr i} {
+        readLP $data offset
+    }
+    set block [dict create at $blockAt codeAt $codeAt codeLen $codeLen \
+        numLits $numLits numAux $numAux numExceptions $numExceptions \
+        maxStack $maxStack policyAt $policyAt policy $policy top $isTop]
+    lappend blocks $block
+    return $block
+}
+
+proc ::source34::walkArtifact {data} {
+    set offset 0
+    set findings {}
+    set blocks {}
+    set strings {}
+    set magic [readU32 $data offset]
+    set format [readU32 $data offset]
+    set tclVersion [readU32 $data offset]
+    need $data $offset 8
+    incr offset 8                    ;# top code length (u64)
+    for {set i 0} {$i < 5} {incr i} {
+        readU32 $data offset         ;# top section counts/stack
+    }
+    lassign [readLP $data offset] sourcePathAt sourcePathLength sourcePath
+    set top [walkBlock $data offset findings blocks strings 1]
+
+    set numProcs [readU32 $data offset]
+    for {set i 0} {$i < $numProcs} {incr i} {
+        readLP $data offset          ;# FQN
+        readLP $data offset          ;# namespace
+        readLP $data offset          ;# arguments
+        walkExecutableSource $data offset findings proc record $i
+        walkBlock $data offset findings blocks strings 0
+    }
+
+    set numClasses [readU32 $data offset]
+    for {set i 0} {$i < $numClasses} {incr i} {
+        readLP $data offset
+        set numSupers [readU32 $data offset]
+        for {set k 0} {$k < $numSupers} {incr k} {
+            readLP $data offset
+        }
+    }
+
+    set numMethods [readU32 $data offset]
+    for {set i 0} {$i < $numMethods} {incr i} {
+        readLP $data offset          ;# class/object FQN
+        need $data $offset 3
+        incr offset 3                ;# kind, scope, origin
+        readLP $data offset          ;# method name
+        readLP $data offset          ;# arguments
+        walkExecutableSource $data offset findings method record $i
+        walkBlock $data offset findings blocks strings 0
+    }
+
+    if {$offset != [string length $data]} {
+        error "source34 walker stopped at $offset of [string length $data]"
+    }
+    dict create magic $magic format $format tclVersion $tclVersion \
+        sourcePathAt $sourcePathAt sourcePathLength $sourcePathLength \
+        sourcePath $sourcePath policy [dict get $top policy] \
+        policyAt [dict get $top policyAt] findings $findings \
+        blocks $blocks strings $strings numProcs $numProcs \
+        numClasses $numClasses numMethods $numMethods
+}
+
+proc ::source34::insertSourceByte {data finding byte} {
+    set lengthAt [dict get $finding offset]
+    if {[dict get $finding length] != 0} {
+        error "source field at $lengthAt is not empty"
+    }
+    set insertAt [expr {$lengthAt + 4}]
+    set rebuilt [string range $data 0 [expr {$insertAt - 1}]]
+    append rebuilt $byte [string range $data $insertAt end]
+    set data $rebuilt
+    putU32LE $data $lengthAt 1
+}
+
+proc ::source34::replaceSourceBytes {data finding replacement} {
+    set length [dict get $finding length]
+    if {[string length $replacement] != $length} {
+        error "source replacement length changed"
+    }
+    set first [expr {[dict get $finding offset] + 4}]
+    string replace $data $first [expr {$first + $length - 1}] $replacement
+}
+
+proc ::source34::combinedScript {} {
+    return {
+        set ::source34SideEffect touched
+        proc ::source34_proc {x} {
+            if {$x} {return PROC-YES}
+            return PROC-NO
+        }
+        oo::class create ::Source34Class {
+            method answer {} {return METHOD-OK}
+        }
+        set n 0
+        if 1 {incr n}
+        set lambda [apply {{x {delta 2}} {expr {$x + $delta}} ::} 3]
+        set o [::Source34Class new]
+        set result [list [::source34_proc 1] [$o answer] $n $lambda]
+        $o destroy
+        return $result
+    }
+}
+
+proc ::source34::cleanupRuntime {} {
+    catch {rename ::source34_proc {}}
+    catch {::Source34Class destroy}
+    unset -nocomplain ::source34SideEffect ::source34NestedValue
+}
+
+test source34.strict.structure {strict policy covers every executable source kind} -setup {
+    set out [makeFile "" source34-strict.tbcx]
+    tbcx::save [::source34::combinedScript] $out
+} -body {
+    set layout [::source34::walkArtifact [::source34::readBinary $out]]
+    set kinds {}
+    set allEmpty 1
+    foreach finding [dict get $layout findings] {
+        lappend kinds [dict get $finding kind]
+        if {[dict get $finding length] != 0} {set allEmpty 0}
+    }
+    set nestedZero 1
+    foreach block [dict get $layout blocks] {
+        if {![dict get $block top] && [dict get $block policy] != 0} {
+            set nestedZero 0
+        }
+    }
+    list [dict get $layout policy] [lsort -unique $kinds] $allEmpty \
+        $nestedZero [dict get $layout format]
+} -cleanup {
+    ::source34::cleanupRuntime
+    removeFile $out
+} -result {1 {bytesrc lambda method proc} 1 1 93}
+
+test source34.strict.functional {strict artifact executes its compiled material} -setup {
+    set out [makeFile "" source34-functional.tbcx]
+    tbcx::save [::source34::combinedScript] $out
+} -body {
+    tbcx::load $out
+} -cleanup {
+    ::source34::cleanupRuntime
+    removeFile $out
+} -result {PROC-YES METHOD-OK 1 5}
+
+test source34.strict.mutations {every nonempty strict source kind is rejected transactionally} -setup {
+    set out [makeFile "" source34-mutation-base.tbcx]
+    tbcx::save [::source34::combinedScript] $out
+    set original [::source34::readBinary $out]
+    set layout [::source34::walkArtifact $original]
+} -body {
+    set result {}
+    foreach kind {bytesrc lambda method proc} {
+        set selected ""
+        foreach finding [dict get $layout findings] {
+            if {[dict get $finding kind] eq $kind} {
+                set selected $finding
+                break
+            }
+        }
+        if {$selected eq ""} {error "fixture has no $kind source field"}
+        set bad [::source34::insertSourceByte $original $selected X]
+        ::source34::writeBinary $out $bad
+        unset -nocomplain ::source34SideEffect
+        set loadCode [catch {tbcx::load $out} loadMessage loadOptions]
+        set dumpCode [catch {tbcx::dump $out} dumpMessage dumpOptions]
+        lappend result $kind $loadCode [dict get $loadOptions -errorcode] \
+            $dumpCode [dict get $dumpOptions -errorcode] \
+            [info exists ::source34SideEffect]
+    }
+    set result
+} -cleanup {
+    ::source34::cleanupRuntime
+    removeFile $out
+} -result {bytesrc 1 {TBCX LOAD SOURCE bytesrc} 1 {TBCX LOAD SOURCE bytesrc} 0 lambda 1 {TBCX LOAD SOURCE lambda} 1 {TBCX LOAD SOURCE lambda} 0 method 1 {TBCX LOAD SOURCE method} 1 {TBCX LOAD SOURCE method} 0 proc 1 {TBCX LOAD SOURCE proc} 1 {TBCX LOAD SOURCE proc} 0}
+
+test source34.include.exact-and-compiled {-include-source is introspection-only} -setup {
+    set out [makeFile "" source34-include.tbcx]
+    set script {
+        proc ::source34_inc_proc {} {return PROC-ORIGINAL}
+        oo::class create ::Source34Inc {
+            method value {} {return METHOD-ORIGINAL}
+        }
+        if 1 {set ::source34NestedValue BYTESRC-ORIGINAL}
+        set lambda [apply {{} {return LAMBDA-ORIGINAL} ::}]
+        set o [::Source34Inc new]
+        set result [list [::source34_inc_proc] [$o value] \
+            $::source34NestedValue $lambda]
+        $o destroy
+        return $result
+    }
+    tbcx::save $script $out -include-source
+} -body {
+    set data [::source34::readBinary $out]
+    set layout [::source34::walkArtifact $data]
+    set replacements [dict create \
+        {return PROC-ORIGINAL} {return PROC-MUTATED!} \
+        {return METHOD-ORIGINAL} {return METHOD-MUTATED!} \
+        {set ::source34NestedValue BYTESRC-ORIGINAL} \
+            {set ::source34NestedValue BYTESRC-MUTATED!} \
+        {return LAMBDA-ORIGINAL} {return LAMBDA-MUTATED!}]
+    set seen {}
+    foreach finding [dict get $layout findings] {
+        set source [dict get $finding bytes]
+        if {[dict exists $replacements $source]} {
+            dict set seen [dict get $finding kind] $source
+            set data [::source34::replaceSourceBytes $data $finding \
+                [dict get $replacements $source]]
+        }
+    }
+    ::source34::writeBinary $out $data
+    list [dict get $layout policy] [lsort [dict keys $seen]] \
+        [tbcx::load $out]
+} -cleanup {
+    catch {rename ::source34_inc_proc {}}
+    catch {::Source34Inc destroy}
+    ::source34::cleanupRuntime
+    removeFile $out
+} -result {2 {bytesrc lambda method proc} {PROC-ORIGINAL METHOD-ORIGINAL BYTESRC-ORIGINAL LAMBDA-ORIGINAL}}
+
+test source34.policy.invalid {both and unknown policy bits fail load and dump} -setup {
+    set out [makeFile "" source34-policy.tbcx]
+    tbcx::save {return POLICY} $out
+    set original [::source34::readBinary $out]
+    set layout [::source34::walkArtifact $original]
+} -body {
+    set result {}
+    foreach policy {3 4} {
+        set bad [::source34::putU32LE $original \
+            [dict get $layout policyAt] $policy]
+        ::source34::writeBinary $out $bad
+        set lc [catch {tbcx::load $out} lm lo]
+        set dc [catch {tbcx::dump $out} dm do]
+        lappend result $lc [dict get $lo -errorcode] \
+            $dc [dict get $do -errorcode]
+    }
+    set result
+} -cleanup {
+    removeFile $out
+} -result {1 {TBCX LOAD POLICY} 1 {TBCX LOAD POLICY} 1 {TBCX LOAD POLICY} 1 {TBCX LOAD POLICY}}
+
+test source34.policy.nested {nested block policy fields remain reserved} -setup {
+    set out [makeFile "" source34-nested-policy.tbcx]
+    tbcx::save {if 1 {return NESTED}} $out
+    set original [::source34::readBinary $out]
+    set layout [::source34::walkArtifact $original]
+} -body {
+    set nested ""
+    foreach block [dict get $layout blocks] {
+        if {![dict get $block top]} {set nested $block; break}
+    }
+    if {$nested eq ""} {error "fixture has no nested block"}
+    set bad [::source34::putU32LE $original [dict get $nested policyAt] 1]
+    ::source34::writeBinary $out $bad
+    set lc [catch {tbcx::load $out} lm]
+    set dc [catch {tbcx::dump $out} dm]
+    list $lc [string match {*nested block policy*} $lm] \
+        $dc [string match {*nested block policy*} $dm]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1 1}
+
+test source34.policy.legacy {policy-zero format-93 artifact remains readable} -setup {
+    set out [makeFile "" source34-legacy.tbcx]
+    tbcx::save {return LEGACY-93} $out
+    set data [::source34::readBinary $out]
+    set layout [::source34::walkArtifact $data]
+    set data [::source34::putU32LE $data [dict get $layout policyAt] 0]
+    ::source34::writeBinary $out $data
+} -body {
+    list [dict get [::source34::walkArtifact \
+        [::source34::readBinary $out]] policy] [tbcx::load $out]
+} -cleanup {
+    removeFile $out
+} -result {0 LEGACY-93}
+
+test source34.source-path {source path is metadata, not executable source} -setup {
+    set in [makeFile {return SOURCE-PATH-OK} source34-input.tcl]
+    set out [makeFile "" source34-source-path.tbcx]
+    tbcx::save $in $out
+} -body {
+    set layout [::source34::walkArtifact [::source34::readBinary $out]]
+    list [expr {[dict get $layout sourcePathLength] > 0}] \
+        [llength [dict get $layout findings]] [tbcx::load $out]
+} -cleanup {
+    removeFile $in
+    removeFile $out
+} -result {1 0 SOURCE-PATH-OK}
+
+test source34.occurrence.repeated-equal {equal executable bodies each remain tag 10} -setup {
+    set out [makeFile "" source34-repeated.tbcx]
+    tbcx::save {
+        set n 0
+        if 1 {incr n}
+        if 1 {incr n}
+        return $n
+    } $out
+} -body {
+    set layout [::source34::walkArtifact [::source34::readBinary $out]]
+    set codeLengths {}
+    foreach finding [dict get $layout findings] {
+        if {[dict get $finding kind] eq "bytesrc"} {
+            lappend codeLengths [dict get $finding codeLen]
+        }
+    }
+    list [llength $codeLengths] \
+        [expr {[lindex $codeLengths 0] > 0 && [lindex $codeLengths 1] > 0}] \
+        [tbcx::load $out]
+} -cleanup {
+    removeFile $out
+} -result {2 1 2}
+
+test source34.occurrence.data-sharing {one equal value can be data and executable} -setup {
+    set out [makeFile "" source34-data-sharing.tbcx]
+    tbcx::save {
+        set command {incr n}
+        set n 0
+        if 1 {incr n}
+        return [list $command $n]
+    } $out
+} -body {
+    set layout [::source34::walkArtifact [::source34::readBinary $out]]
+    set dataCopies 0
+    foreach string [dict get $layout strings] {
+        if {[dict get $string bytes] eq {incr n}} {incr dataCopies}
+    }
+    set scriptCopies 0
+    foreach finding [dict get $layout findings] {
+        if {[dict get $finding kind] eq "bytesrc"} {incr scriptCopies}
+    }
+    list $dataCopies $scriptCopies [tbcx::load $out]
+} -cleanup {
+    removeFile $out
+} -result {1 1 {{incr n} 1}}
+
+test source34.dump.accounting {dump reports neutral preflight source accounting} -setup {
+    set strictOut [makeFile "" source34-dump-strict.tbcx]
+    set includeOut [makeFile "" source34-dump-include.tbcx]
+    set script [::source34::combinedScript]
+    tbcx::save $script $strictOut
+    tbcx::save $script $includeOut -include-source
+} -body {
+    set result {}
+    foreach {file policyName} [list \
+            $strictOut strict-compiled-only \
+            $includeOut include-source] {
+        set layout [::source34::walkArtifact [::source34::readBinary $file]]
+        set fieldCount [llength [dict get $layout findings]]
+        set nonemptyCount 0
+        set sourceBytes 0
+        foreach finding [dict get $layout findings] {
+            set length [dict get $finding length]
+            if {$length != 0} {incr nonemptyCount}
+            incr sourceBytes $length
+        }
+        set dump [tbcx::dump $file]
+        lappend result [expr {
+            [string first "  sourcePolicy = $policyName\n" $dump] >= 0 &&
+            [string first "  executableSourceFields = $fieldCount\n" $dump] >= 0 &&
+            [string first "  nonemptyExecutableSourceFields = $nonemptyCount\n" $dump] >= 0 &&
+            [string first "  executableSourceBytes = $sourceBytes\n" $dump] >= 0
+        }]
+    }
+    set result
+} -cleanup {
+    ::source34::cleanupRuntime
+    removeFile $strictOut
+    removeFile $includeOut
+} -result {1 1}
+
+test source34.dump.empty-retained {empty include-source body is not called stripped} -setup {
+    set out [makeFile "" source34-dump-empty.tbcx]
+    tbcx::save {
+        proc ::source34_empty {} {}
+        return EMPTY-SOURCE
+    } $out -include-source
+} -body {
+    set layout [::source34::walkArtifact [::source34::readBinary $out]]
+    set dump [tbcx::dump $out]
+    list [dict get $layout policy] \
+        [llength [dict get $layout findings]] \
+        [dict get [lindex [dict get $layout findings] 0] length] \
+        [regexp -all -line {^    source: \(0 bytes\)$} $dump] \
+        [expr {[string first {<stripped at save time>} $dump] >= 0}] \
+        [tbcx::load $out]
+} -cleanup {
+    catch {rename ::source34_empty {}}
+    removeFile $out
+} -result {2 1 0 1 0 EMPTY-SOURCE}
+
+cleanupTests

@@ -248,6 +248,14 @@ install-doc: doc
 test: binaries libraries
 	$(TCLSH) `@CYGPATH@ $(srcdir)/tests/all.tcl` $(TESTFLAGS)
 
+BENCH_ARGS	= --samples 11
+
+benchmark: binaries libraries
+	$(TCLSH) `@CYGPATH@ $(srcdir)/bench/run.tcl` $(BENCH_ARGS)
+
+benchmark-smoke: binaries libraries
+	$(TCLSH) `@CYGPATH@ $(srcdir)/bench/run.tcl` --quick --samples 3 $(BENCH_ARGS_EXTRA)
+
 shell: binaries libraries
 	@$(TCLSH) $(SCRIPT)
 
@@ -357,11 +365,13 @@ dist: dist-clean $(srcdir)/manifest.uuid
 
 	# Extension files
 	$(DIST_INSTALL_DATA) \
-	    $(srcdir)/ChangeLog \
-	    $(srcdir)/README.sha \
-	    $(srcdir)/license.terms \
-	    $(srcdir)/README \
+	    $(srcdir)/LICENSE \
+	    $(srcdir)/README.md \
+	    $(srcdir)/index.html \
+	    $(srcdir)/manifest.uuid \
 	    $(srcdir)/pkgIndex.tcl.in \
+	    $(srcdir)/tbcx*.c \
+	    $(srcdir)/tbcx*.h \
 	    $(DIST_DIR)/
 
 	list='demos doc generic library macosx tests unix win'; \
@@ -466,7 +476,7 @@ uninstall-binaries:
 	  rm -f "$(DESTDIR)$(bindir)/$$p"; \
 	done
 
-.PHONY: all binaries clean depend distclean doc install libraries test
+.PHONY: all benchmark benchmark-smoke binaries clean depend distclean doc install libraries test
 .PHONY: gdb gdb-test valgrind valgrindshell
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.

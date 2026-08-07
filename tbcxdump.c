@@ -11,6 +11,8 @@
 static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n);
 static void AppendLitPreview(Tcl_Obj *dst, Tcl_Obj *lit, Tcl_Size maxChars);
 static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len);
+static void AppendExecutableSource(Tcl_Obj *out, uint32_t policy,
+                                   const char *src, uint32_t len);
 static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title);
 static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst);
 static void DumpBCDetails(Tcl_Obj *bcObj, Tcl_Obj *dst);
@@ -50,7 +52,7 @@ static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n) {
 /* Append a proc or method body's source text to the dump output, indented
  * consistently and with a trailing newline.  Called from DumpProcsSection
  * and DumpMethodsSection when the srcText LPString is non-empty (i.e.
- * when the artifact was built with -include-source).
+ * when the artifact retains source (include-source or legacy policy).
  *
  * Each source line is prefixed with a fixed six-space indent ("      ")
  * so the text visually nests under the "source: (N bytes)" summary line.
@@ -97,6 +99,25 @@ static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len) {
     if (len == 0 || src[len - 1] != '\n') {
         Tcl_AppendToObj(out, "\n", 1);
     }
+}
+
+/* A zero-length source field has policy-dependent meaning.  Strict artifacts
+ * deliberately strip every executable-source field, whereas include-source
+ * and legacy artifacts can contain an exact, genuinely empty body. */
+static void AppendExecutableSource(
+    Tcl_Obj *out,
+    uint32_t policy,
+    const char *src,
+    uint32_t len)
+{
+    if ((policy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u) {
+        Tcl_AppendToObj(out,
+            "    source: <stripped at save time>\n", -1);
+        return;
+    }
+    Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", len);
+    if (len != 0u)
+        AppendBodySource(out, src, len);
 }
 
 /* Append a short preview of a literal value for inline annotation.
@@ -469,25 +490,18 @@ static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst) {
         if (isJTNum) {
             JumptableNumInfo *info = (JumptableNumInfo *)cd;
             Tcl_AppendToObj(dst, " (jumptable:num)\n", -1);
-            /* Key representation depends on how the table was created.
-               The loader uses TCL_ONE_WORD_KEYS on LP64 and TCL_STRING_KEYS on ILP32. */
+            /* Tcl core and the loader use TCL_ONE_WORD_KEYS on every
+               platform.  The loader rejects serialized values that cannot
+               be represented by the evaluator's pointer-sized key. */
             Tcl_HashSearch s;
             Tcl_HashEntry *e;
             for (e = Tcl_FirstHashEntry(&info->hashTable, &s); e; e = Tcl_NextHashEntry(&s)) {
-                int target = PTR2INT(Tcl_GetHashValue(e));
-                if (info->hashTable.keyType == TCL_ONE_WORD_KEYS) {
-                    Tcl_WideInt key = (Tcl_WideInt)(intptr_t)Tcl_GetHashKey(&info->hashTable, e);
-                    Tcl_AppendPrintfToObj(dst, "      %" TCL_LL_MODIFIER "d -> pc %d\n", (long long)key, target);
-                } else {
-                    /* string-keys case: store as decimal strings in the table */
-                    const char *ks = (const char *)Tcl_GetHashKey(&info->hashTable, e);
-                    if (ks && *ks) {
-                        /* show the key as-is (it was created from a 64-bit value) */
-                        Tcl_AppendPrintfToObj(dst, "      %s -> pc %d\n", ks, target);
-                    } else {
-                        Tcl_AppendPrintfToObj(dst, "      <key?> -> pc %d\n", target);
-                    }
-                }
+                int         target = PTR2INT(Tcl_GetHashValue(e));
+                Tcl_WideInt key = (Tcl_WideInt)(intptr_t)
+                    Tcl_GetHashKey(&info->hashTable, e);
+                Tcl_AppendPrintfToObj(dst,
+                    "      %" TCL_LL_MODIFIER "d -> pc %d\n",
+                    (long long)key, target);
             }
             continue;
         }
@@ -630,6 +644,11 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
     uint32_t numProcs = 0;
     if (!Tbcx_R_U32(r, &numProcs))
         return TCL_ERROR;
+    if (numProcs > TBCX_MAX_PROCS) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+            "tbcx: numProcs %u exceeds limit %u", numProcs, TBCX_MAX_PROCS));
+        return TCL_ERROR;
+    }
     Tcl_AppendPrintfToObj(out, "\nProcs: %u\n", numProcs);
 
     for (uint32_t i = 0; i < numProcs; i++) {
@@ -671,32 +690,27 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendObjToObj(out, argsObj);
         Tcl_AppendToObj(out, "\n", 1);
 
-        /* Body source text.  Empty indicates the artifact was
-         * built without -include-source (the default for tbcx,
-         * matching tclcompiler).  Printed as a separate "source:"
-         * section truncated at a readable width so large bodies
-         * don't blow up dumps. */
+        /* Body source text.  Its policy, rather than its length, determines
+         * whether an empty value means stripped or an exact empty body. */
         char    *bodySrcC   = NULL;
         uint32_t bodySrcL   = 0;
-        if (!Tbcx_R_LPString(r, &bodySrcC, &bodySrcL)) {
+        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_PROC,
+                &bodySrcC, &bodySrcL)) {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(nameFqn);
             return TCL_ERROR;
         }
-        if (bodySrcL == 0) {
-            Tcl_AppendToObj(out, "    source: <stripped at save time>\n", -1);
-        } else {
-            Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", bodySrcL);
-            AppendBodySource(out, bodySrcC, bodySrcL);
-        }
-        Tcl_Free(bodySrcC);
+        AppendExecutableSource(out, r->sourcePolicy, bodySrcC, bodySrcL);
+        if (bodySrcC)
+            Tcl_Free(bodySrcC);
 
         Namespace *nsPtr = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(nsObj), NULL, 0);
         if (!nsPtr)
             nsPtr = (Namespace *)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc   = 0;
-        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, nsPtr, &nLoc, 0, 1);
+        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, nsPtr, &nLoc, 0, 1,
+            NULL);
         if (!bodyBC) {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nsObj);
@@ -717,10 +731,14 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
 }
 
 static int DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
-    (void)interp; /* currently unused — classes section is metadata only */
     uint32_t numClasses = 0;
     if (!Tbcx_R_U32(r, &numClasses))
         return TCL_ERROR;
+    if (numClasses > TBCX_MAX_CLASSES) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+            "tbcx: numClasses %u exceeds limit %u", numClasses, TBCX_MAX_CLASSES));
+        return TCL_ERROR;
+    }
     Tcl_AppendPrintfToObj(out, "\nClasses: %u\n", numClasses);
 
     for (uint32_t c = 0; c < numClasses; c++) {
@@ -741,6 +759,8 @@ static int DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
             return TCL_ERROR;
         }
         if (nSup > 1024u) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "tbcx: nSuperclasses %u exceeds limit 1024", nSup));
             Tcl_DecrRefCount(clsObj);
             return TCL_ERROR;
         }
@@ -762,6 +782,11 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
     uint32_t numMethods = 0;
     if (!Tbcx_R_U32(r, &numMethods))
         return TCL_ERROR;
+    if (numMethods > TBCX_MAX_METHODS) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+            "tbcx: numMethods %u exceeds limit %u", numMethods, TBCX_MAX_METHODS));
+        return TCL_ERROR;
+    }
     Tcl_AppendPrintfToObj(out, "\nMethods: %u\n", numMethods);
 
     for (uint32_t m = 0; m < numMethods; m++) {
@@ -791,6 +816,10 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
+        if (Tbcx_ValidateMethodMetadata(interp, kind, scope, origin) != TCL_OK) {
+            Tcl_DecrRefCount(clsFqn);
+            return TCL_ERROR;
+        }
 
         char    *mname = NULL;
         uint32_t mnL   = 0;
@@ -801,6 +830,13 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_Obj *nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
         Tcl_IncrRefCount(nameObj);
         Tcl_Free(mname);
+        if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && mnL != 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "tbcx: constructor/destructor record has a method name", -1));
+            Tcl_DecrRefCount(nameObj);
+            Tcl_DecrRefCount(clsFqn);
+            return TCL_ERROR;
+        }
 
         char    *args = NULL;
         uint32_t aL   = 0;
@@ -812,6 +848,14 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_Obj *argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
         Tcl_IncrRefCount(argsObj);
         Tcl_Free(args);
+        if (kind == TBCX_METH_DTOR && aL != 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "tbcx: destructor record has arguments", -1));
+            Tcl_DecrRefCount(argsObj);
+            Tcl_DecrRefCount(nameObj);
+            Tcl_DecrRefCount(clsFqn);
+            return TCL_ERROR;
+        }
 
         Tcl_AppendToObj(out, "  - ", -1);
         Tcl_AppendObjToObj(out, clsFqn);
@@ -837,25 +881,23 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         /* Body source text — see proc loop above. */
         char    *bodySrcC = NULL;
         uint32_t bodySrcL = 0;
-        if (!Tbcx_R_LPString(r, &bodySrcC, &bodySrcL)) {
+        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_METHOD,
+                &bodySrcC, &bodySrcL)) {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
-        if (bodySrcL == 0) {
-            Tcl_AppendToObj(out, "    source: <stripped at save time>\n", -1);
-        } else {
-            Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", bodySrcL);
-            AppendBodySource(out, bodySrcC, bodySrcL);
-        }
-        Tcl_Free(bodySrcC);
+        AppendExecutableSource(out, r->sourcePolicy, bodySrcC, bodySrcL);
+        if (bodySrcC)
+            Tcl_Free(bodySrcC);
 
         Namespace *clsNs = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(clsFqn), NULL, 0);
         if (!clsNs)
             clsNs = (Namespace *)Tcl_GetGlobalNamespace(interp);
         uint32_t nLoc   = 0;
-        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, clsNs, &nLoc, 0, 1);
+        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, clsNs, &nLoc, 0, 1,
+            NULL);
         if (!bodyBC) {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
@@ -907,14 +949,26 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         return TCL_ERROR;
     }
 
+    TbcxArtifactImage *image = NULL;
+    if (Tbcx_ReadArtifactImage(interp, in, &image) != TCL_OK) {
+        Tcl_Close(interp, in);
+        return TCL_ERROR;
+    }
+    if (Tbcx_PreflightArtifact(interp, image) != TCL_OK) {
+        Tbcx_ArtifactImageRelease(image);
+        Tcl_Close(interp, in);
+        return TCL_ERROR;
+    }
+
     TbcxIn r;
-    Tbcx_R_Init(&r, interp, in);
+    Tbcx_R_InitImage(&r, interp, image);
     TbcxHeader H;
     memset(&H, 0, sizeof(H));
     if (!Tbcx_ReadHeader(&r, &H) || r.err) {
         if (H.sourcePath) {
             Tcl_DecrRefCount(H.sourcePath);
         }
+        Tbcx_ArtifactImageRelease(image);
         Tcl_Close(interp, in);
         return TCL_ERROR;
     }
@@ -929,7 +983,7 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     Tcl_AppendPrintfToObj(out, "  format = %u\n", H.format);
     Tcl_AppendPrintfToObj(out, "  tcl_version = %u.%u.%u (type %u)\n", (unsigned)((H.tcl_version >> 24) & 0xFFu), (unsigned)((H.tcl_version >> 16) & 0xFFu), (unsigned)((H.tcl_version >> 8) & 0xFFu),
                           (unsigned)(H.tcl_version & 0xFFu));
-    Tcl_AppendPrintfToObj(out, "  top: code=%" PRIu64 ", except=%u, lits=%u, aux=%u, locals=%u, stack=%u\n", (unsigned long long)H.codeLenTop, H.numExceptTop, H.numLitsTop, H.numAuxTop,
+    Tcl_AppendPrintfToObj(out, "  top: code=%" PRIu64 ", except=%u, lits=%u, aux=%u, locals=%u, stack=%u\n", H.codeLenTop, H.numExceptTop, H.numLitsTop, H.numAuxTop,
                           H.numLocalsTop, H.maxStackTop);
     if (H.sourcePath) {
         Tcl_Size pl = 0;
@@ -938,14 +992,43 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     } else {
         Tcl_AppendToObj(out, "  source = <inline or channel>\n", -1);
     }
+    const char *policyName = image->sourcePolicy ==
+            TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY
+        ? "strict-compiled-only"
+        : image->sourcePolicy == TBCX_BLOCK_POLICY_INCLUDE_SOURCE
+        ? "include-source" : "legacy";
+    Tcl_AppendPrintfToObj(out, "  sourcePolicy = %s\n", policyName);
+    Tcl_AppendPrintfToObj(out,
+        "  executableSourceFields = %" TCL_SIZE_MODIFIER "d\n",
+        image->executableSourceFieldCount);
+    Tcl_AppendPrintfToObj(out,
+        "  nonemptyExecutableSourceFields = %" TCL_SIZE_MODIFIER "d\n",
+        image->nonemptyExecutableSourceFieldCount);
+    Tcl_AppendPrintfToObj(out,
+        "  executableSourceBytes = %" PRIu64 "\n",
+        image->executableSourceBytes);
 
     /* Top-level block */
     Namespace *curNs   = (Namespace *)Tcl_GetGlobalNamespace(interp);
     uint32_t   dummyNL = 0;
-    Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, interp, curNs, &dummyNL, 0, 1);
+    uint32_t   topPolicy = TBCX_BLOCK_POLICY_LEGACY;
+    Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, interp, curNs, &dummyNL, 0, 1,
+        &topPolicy);
     if (!topBC)
         goto cleanup_no_topbc;
     Tcl_IncrRefCount(topBC);
+    ByteCode *parsedTop = TbcxGetByteCode(topBC);
+    if (!parsedTop || H.codeLenTop != (uint64_t)parsedTop->numCodeBytes ||
+        H.numExceptTop != (uint32_t)parsedTop->numExceptRanges ||
+        H.numLitsTop != (uint32_t)parsedTop->numLitObjects ||
+        H.numAuxTop != (uint32_t)parsedTop->numAuxDataItems ||
+        H.numLocalsTop != dummyNL ||
+        H.maxStackTop != (uint32_t)parsedTop->maxStackDepth ||
+        topPolicy != image->sourcePolicy) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "tbcx: top-level header/block metadata mismatch", -1));
+        goto cleanup;
+    }
     Tcl_AppendToObj(out, "\nTop-level block:\n", -1);
     DisassembleBCObj(topBC, out, "top-level");
     DumpBCDetails(topBC, out);
@@ -957,6 +1040,20 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         goto cleanup;
     if (DumpMethodsSection(&r, interp, out) != TCL_OK)
         goto cleanup;
+    if (!Tbcx_R_AtEOF(&r))
+        goto cleanup;
+    if (r.executableSourceFieldCount !=
+            image->executableSourceFieldCount ||
+        r.nonemptyExecutableSourceFieldCount !=
+            image->nonemptyExecutableSourceFieldCount ||
+        r.executableSourceBytes != image->executableSourceBytes) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "tbcx: preflight/materialization source accounting mismatch",
+            -1));
+        Tcl_SetErrorCode(interp, "TBCX", "LOAD", "SOURCE", "ACCOUNTING",
+            NULL);
+        goto cleanup;
+    }
 
     rc = TCL_OK;
 
@@ -969,6 +1066,7 @@ cleanup_no_topbc:
     }
     if (Tcl_Close(interp, in) != TCL_OK)
         rc = TCL_ERROR;
+    Tbcx_ArtifactImageRelease(image);
     if (rc == TCL_OK) {
         Tcl_SetObjResult(interp, out);
     }

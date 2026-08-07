@@ -4,7 +4,7 @@
 # Covers empty scripts, whitespace-only scripts, very long strings,
 # special characters, and other degenerate inputs for tbcx save/load.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

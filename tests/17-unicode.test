@@ -4,7 +4,7 @@
 # Verifies that accented Latin, CJK ideographs, emoji, and other
 # multi-byte UTF-8 strings survive tbcx save/load correctly.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

@@ -4,7 +4,7 @@
 # Verifies the complete compile→save→load→eval pipeline, including
 # re-saving loaded bytecode and dump output integrity.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

@@ -5,7 +5,7 @@
 #
 # Optional: Thread package (tests with -constraints haveThread)
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -16,7 +16,7 @@ test thread.1 {thread: load & eval} -constraints haveThread -body {
     set out [makeFile "" thread.1-out.tbcx]
     tbcx::save $in $out
     set tid [thread::create]
-    set res [thread::send $tid {package require tbcx}]
+    set res [thread::send $tid {package require -exact tbcx 1.2.1}]
     set res [thread::send $tid [list tbcx::load $out]]
     thread::release $tid
     set res

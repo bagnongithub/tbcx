@@ -6,7 +6,7 @@
 # concurrent multi-interp usage.  They verify that the checked-multiply
 # guards and Tcl_Size conversions hold under non-trivial workloads.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -186,7 +186,7 @@ test lim.12 {limits: 10 child interps load same file} -body {
     set results {}
     for {set i 0} {$i < 10} {incr i} {
         set ci [interp create]
-        interp eval $ci {package require tbcx}
+        interp eval $ci {package require -exact tbcx 1.2.1}
         lappend results [interp eval $ci [list tbcx::load $out]]
         interp delete $ci
     }
@@ -205,7 +205,7 @@ test lim.13 {limits: different scripts in different interps} -body {
         set val [expr {$i * 100 + 7}]
         tbcx::save "return $val" $out
         set ci [interp create]
-        interp eval $ci {package require tbcx}
+        interp eval $ci {package require -exact tbcx 1.2.1}
         lappend results [interp eval $ci [list tbcx::load $out]]
         interp delete $ci
     }

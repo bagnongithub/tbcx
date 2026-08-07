@@ -4,7 +4,7 @@
 # Exercises bytecode auxiliary data structures: jump tables (string
 # and numeric keys), DictUpdateInfo, and NewForeachInfo.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

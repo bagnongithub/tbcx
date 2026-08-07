@@ -2,7 +2,7 @@
 # 24-security-regression.test
 #
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -405,12 +405,15 @@ test f7.3 {F7: special double values roundtrip} -body {
     expr {[llength $r] == 4}
 } -result 1
 
-test f7.4 {F7: double in dump output} -body {
+test f7.4 {F7: generic expression keeps numeric text as ordinary data} -body {
     set out [makeFile "" f7.4-out.tbcx]
     tbcx::save {return [expr {2.718281828}]} $out
     set d [tbcx::dump $out]
-    # Dump should contain "double" somewhere for this literal
-    expr {[string match "*double*" $d]}
+    # New-policy bytecode deliberately dispatches [expr] generically, so its
+    # argument remains string data and is converted by Tcl at execution time.
+    expr {[string match {*sourcePolicy = strict-compiled-only*} $d] &&
+          [string match {*2.718281828*} $d] &&
+          [tbcx::load $out] == 2.718281828}
 } -result 1
 
 test f7.5 {F7: boolean in dump output} -body {
@@ -478,7 +481,7 @@ test f8.5 {F8: parent can expose commands to safe interp} -body {
 
 test f8.6 {F8: normal (unsafe) interp still has all commands} -body {
     set ci [interp create]
-    interp eval $ci {package require tbcx}
+    interp eval $ci {package require -exact tbcx 1.2.1}
     set has_save [interp eval $ci {expr {[info commands ::tbcx::save] ne ""}}]
     set has_load [interp eval $ci {expr {[info commands ::tbcx::load] ne ""}}]
     set has_dump [interp eval $ci {expr {[info commands ::tbcx::dump] ne ""}}]
@@ -529,7 +532,7 @@ test xc.3 {cross-cutting: load into child interp, verify isolation} -body {
         return [::xcns::secret]
     } $out
     set ci [interp create]
-    interp eval $ci {package require tbcx}
+    interp eval $ci {package require -exact tbcx 1.2.1}
     set r [interp eval $ci [list tbcx::load $out]]
     interp delete $ci
     # Child got correct result

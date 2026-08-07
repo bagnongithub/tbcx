@@ -4,7 +4,7 @@
 # Verifies save/load via open Tcl channels (as opposed to file paths),
 # including binary-mode enforcement and channel error handling.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

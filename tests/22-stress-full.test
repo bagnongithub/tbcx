@@ -11,7 +11,7 @@
 #   - Namespace nesting at scale
 #   - Large bytecode blocks
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -21,7 +21,7 @@ proc stressRoundtrip {tag script} {
     set out [makeFile "" ${tag}-out.tbcx]
     tbcx::save $script $out
     interp create ST_$tag
-    interp eval ST_$tag [list package require tbcx]
+    interp eval ST_$tag [list package require -exact tbcx 1.2.1]
     interp eval ST_$tag {proc exit {args} {error "exit $args"}}
     set rc [interp eval ST_$tag [list catch [list tbcx::load $out] _r _o]]
     set pass 0; set fail 0; set errors {}
@@ -251,7 +251,7 @@ test sf.9 {stress: deterministic re-load} -body {
     set results {}
     foreach tag {A B} {
         interp create SF9$tag
-        interp eval SF9$tag [list package require tbcx]
+        interp eval SF9$tag [list package require -exact tbcx 1.2.1]
         interp eval SF9$tag {proc exit {args} {error "exit $args"}}
         interp eval SF9$tag [list catch [list tbcx::load $out]]
         lappend results [interp eval SF9$tag {list $::_pass $::_fail}]
@@ -273,7 +273,7 @@ test sf.10 {stress: channel-based save and load} -body {
     close $outCh
     set ch [open $tbcxPath r]
     interp create SF10
-    interp eval SF10 [list package require tbcx]
+    interp eval SF10 [list package require -exact tbcx 1.2.1]
     interp eval SF10 {proc exit {args} {error "exit $args"}}
     interp transfer {} $ch SF10
     interp eval SF10 [list catch [list tbcx::load $ch]]
@@ -360,7 +360,7 @@ test sf.14 {stress: dump contains structural sections} -body {
     tbcx::save $script $out
     set dump [tbcx::dump $out]
     set checks 0
-    foreach pat {"*TBCX Header:*" "*magic = 0x58434254*" "*format = 92*"
+    foreach pat {"*TBCX Header:*" "*magic = 0x58434254*" "*format = 93*"
                  "*Top-level block:*" "*Procs:*" "*Classes:*" "*Methods:*"} {
         if {[string match $pat $dump]} { incr checks }
     }

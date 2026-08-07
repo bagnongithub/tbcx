@@ -4,7 +4,7 @@
 # Verifies that tbcx::dump produces readable disassembly output
 # covering headers, sections, proc tables, and bytecode listings.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

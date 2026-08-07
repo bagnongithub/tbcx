@@ -5,7 +5,7 @@
 # to most complex.  The first sub-test that FAILS identifies the
 # mechanism responsible.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -389,7 +389,7 @@ test diag.d5 {D5: load in child interp} -body {
     } $out
     set child [interp create]
     $child eval [list lappend auto_path {*}$auto_path]
-    $child eval { package require tbcx }
+    $child eval { package require -exact tbcx 1.2.1 }
     set r [$child eval [list tbcx::load $out]]
     interp delete $child
     return $r
@@ -406,7 +406,7 @@ test diag.d6 {D6: namespace eval body in child interp} -body {
     } $out
     set child [interp create]
     $child eval [list lappend auto_path {*}$auto_path]
-    $child eval { package require tbcx }
+    $child eval { package require -exact tbcx 1.2.1 }
     set r [$child eval [list tbcx::load $out]]
     interp delete $child
     return $r
@@ -427,7 +427,7 @@ test diag.d7 {D7: proc + namespace eval in child interp} -body {
     } $out
     set child [interp create]
     $child eval [list lappend auto_path {*}$auto_path]
-    $child eval { package require tbcx }
+    $child eval { package require -exact tbcx 1.2.1 }
     set r [$child eval [list tbcx::load $out]]
     interp delete $child
     return $r
@@ -436,7 +436,7 @@ test diag.d7 {D7: proc + namespace eval in child interp} -body {
 test diag.d8 {D8: save+load entirely within child interp} -body {
     set child [interp create]
     $child eval [list lappend auto_path {*}$auto_path]
-    $child eval { package require tbcx }
+    $child eval { package require -exact tbcx 1.2.1 }
     set out [makeFile "" diag.d8-out.tbcx]
     set r [$child eval [list apply {{out} {
         tbcx::save {

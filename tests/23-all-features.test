@@ -4,7 +4,7 @@
 # Every test builds a script using braced {append}, saves/loads it via
 # tbcx, and verifies internal assertions pass. No double-quote escaping.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -12,7 +12,7 @@ proc featureRoundtrip {tag script} {
     set out [makeFile "" ${tag}-out.tbcx]
     tbcx::save $script $out
     interp create FT_$tag
-    interp eval FT_$tag [list package require tbcx]
+    interp eval FT_$tag [list package require -exact tbcx 1.2.1]
     interp eval FT_$tag {proc exit {args} {error "exit $args"}}
     set rc [interp eval FT_$tag [list catch [list tbcx::load $out] _r _o]]
     set pass 0; set fail 0; set errors {}

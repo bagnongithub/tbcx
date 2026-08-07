@@ -27,19 +27,21 @@
 #include "tclTomMath.h"
 
 #define TBCX_MAGIC 0x58434254u
-/* TBCX_FORMAT 92u — current on-wire format for Tcl 9.1.
+/* TBCX_FORMAT 93u — current on-wire format for Tcl 9.1.
  *
- * Each proc record and each method record carries an LPString body-source
- * field immediately before its compiled block.  The loader attaches that
- * text as the body Tcl_Obj's string rep (via Tcl_InitStringRep) without
- * touching the ByteCode internal rep.  By default the body source is
- * STRIPPED from the artifact: bodies are stored as "" on the wire and the
- * loader substitutes the diagnostic sentinel TBCX_STRIPPED_SOURCE_SENTINEL,
- * so `info body` returns a loud string instead of silently returning empty.
- * The save-time flag `-include-source` instead stores the original body
- * text as an LPString, preserving byte-for-byte `info body` round-trip for
- * artifacts where introspection idioms (cloneRule, info class definition,
- * TIP #280 source attribution, etc.) must work.
+ * Format 93 preserves the artifact compiler's final instruction stream
+ * verbatim.
+ * Format 92 artifacts are deliberately rejected: their startCommand
+ * instructions may have been irreversibly replaced at save time, so the
+ * loader cannot restore Tcl's command-limit, cancellation, or epoch-check
+ * semantics.
+ *
+ * The former top-block reserved u32 selects the executable-source policy.
+ * A default strict artifact writes empty proc, method, BYTESRC, and lambda
+ * source LPStrings; -include-source retains their authored bytes for
+ * introspection only. Both new policies execute PRECOMPILED material. The
+ * loader substitutes a diagnostic string representation for stripped proc,
+ * method, and lambda bodies without treating it as executable fallback.
  *
  * Each method record carries a `scope` u8 immediately AFTER `kind` and
  * before `name` (see TBCX_MSCOPE_*); it records the TclOO visibility the
@@ -53,7 +55,17 @@
  * consumes the front record.  Rewritten stub bodies use the recognizable
  * TBCX_METH_STUB_BODY / TBCX_PROC_MARKER_PFX sentinels so a verbatim
  * (non-literal) body is never patched from a stale same-key record. */
-#define TBCX_FORMAT 92u
+#define TBCX_FORMAT 93u
+
+/* Format-93 top-block source policy.  The field was reserved in the r91
+ * layout, so new artifacts remain format 93 while older loaders reject them
+ * loudly.  Nested block policy fields are always zero. */
+#define TBCX_BLOCK_POLICY_LEGACY 0u
+#define TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY (1u << 0)
+#define TBCX_BLOCK_POLICY_INCLUDE_SOURCE (1u << 1)
+#define TBCX_BLOCK_POLICY_MASK                                              \
+    (TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY |                              \
+     TBCX_BLOCK_POLICY_INCLUDE_SOURCE)
 
 /* Method visibility scope (method record `scope` u8).  Mirrors the
  * TclOO SCOPE_FLAGS (PUBLIC_METHOD / unexported / TRUE_PRIVATE_METHOD),
@@ -68,14 +80,10 @@
  * TbcxCtx.saveFlags and consulted where per-site behavior changes.
  * Wire format is unaffected by the flags themselves — they only alter
  * what the save side chooses to emit. */
-#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u /* write original body srcText as
-                                            LPString for every proc/method;
-                                            the opposite of tclcompiler/
-                                            tbcload's source-strip-always
-                                            default.  Without this flag,
-                                            bodies are emitted as "" on the
-                                            wire and the loader installs
-                                            the diagnostic sentinel. */
+#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u /* retain exact proc, method,
+                                            BYTESRC, and lambda source
+                                            LPStrings for introspection;
+                                            execution remains compiled */
 
 /* Diagnostic sentinel installed as body string-rep when the artifact was
  * written without -include-source (the default).  Two-line shape matches
@@ -100,6 +108,14 @@
 #define TBCX_STRIPPED_SOURCE_SENTINEL                                                \
     "# tbcx: body source stripped at save time; info body unavailable\n"             \
     "error \"tbcx: introspection-based cloning is not supported for this artifact\""
+
+/* Diagnostic body used only for the in-memory string representation of a
+ * strict lambda.  It is never serialized as executable source.  A new string
+ * object reconstructed from the diagnostic lambda has no TBCX provenance and
+ * therefore fails with a stable error instead of executing an empty body. */
+#define TBCX_STRIPPED_LAMBDA_SENTINEL                                      \
+    "return -code error -errorcode {TBCX EVAL LAMBDA STRIPPED} "          \
+    "{tbcx: stripped lambda identity was lost}"
 
 /* Thread-ownership assertion.  Verifies that the current thread is the
  * one that created the interpreter, which is the only thread permitted
@@ -216,6 +232,7 @@ uint32_t           Tbcx_PackTclVersion(void);
 #define TBCX_MAX_PROCS (256u * 1024u)
 #define TBCX_MAX_CLASSES (256u * 1024u)
 #define TBCX_MAX_METHODS (256u * 1024u)
+#define TBCX_MAX_IMAGE_BYTES (256u * 1024u * 1024u)
 
 #define TBCX_BUFSIZE (64u * 1024u)
 
@@ -370,7 +387,7 @@ static inline ByteCode   *TbcxGetByteCode(Tcl_Obj *objPtr) {
 
 /* Flags for TbcxFixupByteCode cache handling strategy. */
 #define TBCX_FIXUP_CACHE_KEEP 0 /* Preserve + fix LocalCache (methods, lambdas) */
-#define TBCX_FIXUP_CACHE_DROP 1 /* NULL out LocalCache (procs — Tcl rebuilds) */
+#define TBCX_FIXUP_CACHE_DROP 1 /* NULL cache for a rebuilt-Proc fallback */
 #define TBCX_FIXUP_CACHE_NONE 2 /* Don't touch LocalCache */
 
 extern const Tcl_ObjType *tbcxTyDict;
@@ -393,10 +410,41 @@ typedef struct TbcxIn {
     Tcl_Interp   *interp;
     Tcl_Channel   chan;
     int           err;
+    /* A validated artifact is materialized from this neutral byte image.
+     * When imageBytes is non-NULL, chan is not read. */
+    const unsigned char *imageBytes;
+    Tcl_Size      imageLength;
+    Tcl_Size      imagePos;
+    uint64_t      absoluteOffset;
+    uint32_t      sourcePolicy;
+    Tcl_Size      executableSourceFieldCount;
+    Tcl_Size      nonemptyExecutableSourceFieldCount;
+    uint64_t      executableSourceBytes;
     unsigned char buf[TBCX_BUFSIZE];
     Tcl_Size      bufPos;  /* next byte to consume */
     Tcl_Size      bufFill; /* valid bytes in buf */
 } TbcxIn;
+
+typedef enum TbcxExecSourceKind {
+    TBCX_EXEC_SOURCE_PROC,
+    TBCX_EXEC_SOURCE_METHOD,
+    TBCX_EXEC_SOURCE_BYTESRC,
+    TBCX_EXEC_SOURCE_LAMBDA
+} TbcxExecSourceKind;
+
+/* Interpreter-neutral, same-thread artifact blueprint.  The preflight parser
+ * validates directly over these owned bytes and records policy/accounting;
+ * materialization then starts a fresh TbcxIn over the same immutable image. */
+typedef struct TbcxArtifactImage {
+    Tcl_Size      refCount;
+    Tcl_ThreadId  ownerThread;
+    unsigned char *bytes;
+    Tcl_Size      length;
+    uint32_t      sourcePolicy;
+    Tcl_Size      executableSourceFieldCount;
+    Tcl_Size      nonemptyExecutableSourceFieldCount;
+    uint64_t      executableSourceBytes;
+} TbcxArtifactImage;
 
 typedef struct {
     Tcl_Interp   *interp;
@@ -418,15 +466,27 @@ void              Tbcx_FreeLocals(CompiledLocal *first);
 int               Tbcx_ProbeOpenChannel(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_Channel *chPtr);
 int               Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj);
 void              Tbcx_R_Init(TbcxIn *r, Tcl_Interp *ip, Tcl_Channel ch);
+void              Tbcx_R_InitImage(TbcxIn *r, Tcl_Interp *ip, const TbcxArtifactImage *image);
 int               Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n);
+int               Tbcx_R_AtEOF(TbcxIn *r);
 int               Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
+int               Tbcx_ReadExecutableSource(TbcxIn *r, TbcxExecSourceKind kind, char **sp, uint32_t *lenp);
 int               Tbcx_R_U32(TbcxIn *r, uint32_t *vp);
 int               Tbcx_R_U64(TbcxIn *r, uint64_t *vp);
 int               Tbcx_R_U8(TbcxIn *r, uint8_t *v);
+int               Tbcx_ValidateMethodMetadata(Tcl_Interp *ip, uint8_t kind, uint8_t scope, uint8_t origin);
 void              Tbcx_W_Init(TbcxOut *w, Tcl_Interp *ip, Tcl_Channel ch);
 int               Tbcx_W_Flush(TbcxOut *w);
-Tcl_Obj          *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly);
+Tcl_Obj          *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly, uint32_t *topPolicyOut);
 int               Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
+int               Tbcx_ReadArtifactImage(Tcl_Interp *ip, Tcl_Channel ch, TbcxArtifactImage **imageOut);
+int               Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image);
+void              Tbcx_ArtifactImageRelease(TbcxArtifactImage *image);
+const char        *Tbcx_ExecSourceKindName(TbcxExecSourceKind kind);
+int               Tbcx_ValidateBlockPolicy(Tcl_Interp *ip, uint32_t policy);
+#ifdef TBCX_BENCH_COUNTERS
+void              Tbcx_BenchUnsupportedCrossInterpReject(void);
+#endif
 void              TbcxApplyShimPurgeAll(Tcl_Interp *ip);
 void              TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode);
 int               TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label);

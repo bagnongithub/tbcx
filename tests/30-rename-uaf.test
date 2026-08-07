@@ -12,7 +12,7 @@
 package require tcltest
 namespace import ::tcltest::*
 
-package require tbcx
+package require -exact tbcx 1.2.1
 
 test uaf.1 {rename proc during load, then use renamed command post-load} -setup {
     set in  [makeFile {
@@ -73,6 +73,27 @@ test uaf.3 {rename apply during load does not poison the interp} -setup {
     myapply {{y} { expr {$y + 1} }} 10
 } -result "11" -cleanup {
     if {[info commands myapply] ne ""} { rename myapply apply }
+    removeFile $in
+    removeFile $out
+}
+
+test uaf.4 {rename oo::objdefine during load leaves no dangling trace} -setup {
+    set in  [makeFile {
+        oo::class create UafObjectClass
+        set o [UafObjectClass new]
+        oo::objdefine $o { method before {} { return before } }
+        rename oo::objdefine myobjdef
+    } uaf.4-in.tcl]
+    set out [makeFile "" uaf.4-out.tbcx]
+} -body {
+    tbcx::save $in $out
+    tbcx::load $out
+    set later [UafObjectClass new]
+    myobjdef $later { method after {} { return after } }
+    $later after
+} -result "after" -cleanup {
+    if {[info commands myobjdef] ne ""} { rename myobjdef oo::objdefine }
+    catch { UafObjectClass destroy }
     removeFile $in
     removeFile $out
 }

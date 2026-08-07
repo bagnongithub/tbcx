@@ -8,7 +8,7 @@
 #               tclCompCmdsGR.c (G–R)
 #               tclCompCmdsSZ.c (S–Z)
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -16,7 +16,7 @@ proc bcRoundtrip {tag script} {
     set out [makeFile "" ${tag}-out.tbcx]
     tbcx::save $script $out
     interp create BC_$tag
-    interp eval BC_$tag [list package require tbcx]
+    interp eval BC_$tag [list package require -exact tbcx 1.2.1]
     interp eval BC_$tag {proc exit {args} {error "exit $args"}}
     set rc [interp eval BC_$tag [list catch [list tbcx::load $out] _r _o]]
     set pass 0; set fail 0; set errors {}

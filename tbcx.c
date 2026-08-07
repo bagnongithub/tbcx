@@ -9,7 +9,10 @@
  * ========================================================================== */
 
 #define PKG_TBCX "tbcx"
-#define PKG_TBCX_VER "1.2"
+#ifndef PACKAGE_VERSION
+#error "PACKAGE_VERSION must be supplied by the build system"
+#endif
+#define PKG_TBCX_VER PACKAGE_VERSION
 
 /* Runtime type pointers — initialized once under tbcxTypeMutex, thereafter
  * immutable.  Read-safety on weakly-ordered architectures is guaranteed by
@@ -61,6 +64,9 @@ extern int                Tbcx_SaveObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp
 extern int                Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 extern int                Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
 extern int                Tbcx_GcObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+#ifdef TBCX_BENCH_COUNTERS
+extern int                Tbcx_BenchStatsObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+#endif
 
 /* Internal init helper — called exactly once from TbcxInitTypes() under
  * tbcxTypeMutex.  Not exposed in tbcx.h to prevent unprotected calls. */
@@ -305,6 +311,14 @@ DLLEXPORT int tbcx_Init(Tcl_Interp *interp) {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: failed to register commands"));
         return TCL_ERROR;
     }
+#ifdef TBCX_BENCH_COUNTERS
+    if (!Tcl_CreateObjCommand2(interp, "tbcx::benchstats",
+            Tbcx_BenchStatsObjCmd, NULL, NULL)) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+            "tbcx: failed to register benchmark counters"));
+        return TCL_ERROR;
+    }
+#endif
 
     if (Tcl_PkgProvide(interp, PKG_TBCX, PKG_TBCX_VER) != TCL_OK) {
         return TCL_ERROR;

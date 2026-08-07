@@ -1,7 +1,7 @@
 # -*-Tcl-*-
 # 21-proposals.test
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -545,7 +545,7 @@ test p6.2 {P6: uplevel with literal script} -body {
     tbcx::load $out
 } -result from-uplevel
 
-test p6.3 {P6: interp eval with script (correctness)} -body {
+test p6.3 {P6: interp eval is rejected without approved rematerialization shim} -body {
     set in [makeFile {
         set sub [interp create]
         set r [interp eval $sub {
@@ -556,9 +556,9 @@ test p6.3 {P6: interp eval with script (correctness)} -body {
         return $r
     } p6.3-in.tcl]
     set out [makeFile "" p6.3-out.tbcx]
-    tbcx::save $in $out
-    tbcx::load $out
-} -result 84
+    set code [catch {tbcx::save $in $out} message options]
+    list $code $message [dict get $options -errorcode]
+} -result {1 {tbcx: cross-interpreter compiled script is unsupported} {TBCX EVAL CROSSINTERP UNSUPPORTED}}
 
 # =====================================================================
 # Scrub remaining string literals

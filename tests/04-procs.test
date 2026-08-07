@@ -4,7 +4,7 @@
 # Verifies that proc definitions with compiled bodies survive save/load,
 # including default arguments, variadic args, and recursive calls.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -289,7 +289,7 @@ test proc.v92.1 {-include-source preserves info body round-trip} -body {
     tbcx::save $in $out -include-source
     set ip [interp create]
     $ip eval [list load [info loaded {} tbcx]]
-    $ip eval {package require tbcx}
+    $ip eval {package require -exact tbcx 1.2.1}
     $ip eval [list tbcx::load $out]
     set body [$ip eval {info body hello}]
     set result [$ip eval {hello World}]
@@ -307,7 +307,7 @@ test proc.v92.2 {default save strips source, proc still runs via sentinel} -body
     tbcx::save $in $out
     set ip [interp create]
     $ip eval [list load [info loaded {} tbcx]]
-    $ip eval {package require tbcx}
+    $ip eval {package require -exact tbcx 1.2.1}
     $ip eval [list tbcx::load $out]
     set body [$ip eval {info body hello}]
     set exec [$ip eval {hello World}]
@@ -327,7 +327,7 @@ test proc.v92.3 {default sentinel fails loudly when cloned} -body {
     tbcx::save $in $out
     set ip [interp create]
     $ip eval [list load [info loaded {} tbcx]]
-    $ip eval {package require tbcx}
+    $ip eval {package require -exact tbcx 1.2.1}
     $ip eval [list tbcx::load $out]
     # Clone the stripped body into a new proc and invoke it — must raise
     # the sentinel's error, not silently run as no-op.
@@ -349,7 +349,7 @@ test proc.v92.4 {info script returns authored source path} -body {
     tbcx::save $in $out
     set ip [interp create]
     $ip eval [list load [info loaded {} tbcx]]
-    $ip eval {package require tbcx}
+    $ip eval {package require -exact tbcx 1.2.1}
     $ip eval [list tbcx::load $out]
     set seenPath [$ip eval {set ::captured_info_script}]
     interp delete $ip
@@ -370,7 +370,7 @@ test proc.v92.5 {-include-source preserves info class definition round-trip} -bo
     tbcx::save $in $out -include-source
     set ip [interp create]
     $ip eval [list load [info loaded {} tbcx]]
-    $ip eval {package require tbcx}
+    $ip eval {package require -exact tbcx 1.2.1}
     $ip eval [list tbcx::load $out]
     set def [$ip eval {info class definition Greeter hi}]
     set exec [$ip eval {[Greeter create g] hi World}]

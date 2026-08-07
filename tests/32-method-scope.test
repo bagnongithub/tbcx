@@ -13,7 +13,7 @@
 # Source markers are COMMENT-ONLY (never a returned constant) so a stripped
 # artifact provably lacks them while a literal the method returns may not.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -41,7 +41,7 @@ proc tbcxRun {label script {mode ""}} {
     }
     set i [interp create]
     try {
-        $i eval {package require tbcx}
+        $i eval {package require -exact tbcx 1.2.1}
         return [$i eval [list tbcx::load $out]]
     } finally {
         interp delete $i

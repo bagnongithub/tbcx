@@ -4,7 +4,7 @@
 # Verifies arithmetic, comparison, logical, bitwise, and floating-point
 # expressions survive bytecode serialization with correct results.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 

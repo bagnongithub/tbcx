@@ -4,7 +4,7 @@
 # Verifies that .tbcx files load correctly in child interpreters,
 # including proc execution, OO classes, and inter-interpreter isolation.
 
-package require tbcx
+package require -exact tbcx 1.2.1
 package require tcltest 2.5
 namespace import ::tcltest::*
 
@@ -13,7 +13,7 @@ test interp.1 {multi-interpreter: load & eval in child interp} -body {
     set out [makeFile "" interp.1-out.tbcx]
     tbcx::save $in $out
     interp create I
-    interp eval I [list package require tbcx]
+    interp eval I [list package require -exact tbcx 1.2.1]
     set res [interp eval I [list tbcx::load $out]]
     interp delete I
     set res
@@ -27,8 +27,8 @@ test interp.2 {load in two child interps} -body {
     tbcx::save {return "shared"} $out
     interp create I1
     interp create I2
-    interp eval I1 [list package require tbcx]
-    interp eval I2 [list package require tbcx]
+    interp eval I1 [list package require -exact tbcx 1.2.1]
+    interp eval I2 [list package require -exact tbcx 1.2.1]
     set r1 [interp eval I1 [list tbcx::load $out]]
     set r2 [interp eval I2 [list tbcx::load $out]]
     interp delete I1
@@ -45,7 +45,7 @@ test interp.3 {child interp: proc execution} -body {
     set out [makeFile "" interp.3-out.tbcx]
     tbcx::save $in $out
     interp create C
-    interp eval C [list package require tbcx]
+    interp eval C [list package require -exact tbcx 1.2.1]
     set res [interp eval C [list tbcx::load $out]]
     interp delete C
     set res
@@ -62,7 +62,7 @@ test interp.4 {child interp: OO class} -body {
     set out [makeFile "" interp.4-out.tbcx]
     tbcx::save $in $out
     interp create C
-    interp eval C [list package require tbcx]
+    interp eval C [list package require -exact tbcx 1.2.1]
     set res [interp eval C [list tbcx::load $out]]
     interp delete C
     set res
@@ -72,7 +72,7 @@ test interp.4 {child interp: OO class} -body {
 test interp.5 {child interp: save and load} -body {
     set out [makeFile "" interp.5-out.tbcx]
     interp create C
-    interp eval C [list package require tbcx]
+    interp eval C [list package require -exact tbcx 1.2.1]
     interp eval C [list tbcx::save {return "created-in-child"} $out]
     set res [interp eval C [list tbcx::load $out]]
     interp delete C
@@ -87,8 +87,8 @@ test interp.6 {child interps isolated} -body {
     tbcx::save {return "beta"} $out2
     interp create I1
     interp create I2
-    interp eval I1 [list package require tbcx]
-    interp eval I2 [list package require tbcx]
+    interp eval I1 [list package require -exact tbcx 1.2.1]
+    interp eval I2 [list package require -exact tbcx 1.2.1]
     set r1 [interp eval I1 [list tbcx::load $out1]]
     set r2 [interp eval I2 [list tbcx::load $out2]]
     interp delete I1

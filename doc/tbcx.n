@@ -1,6 +1,6 @@
-.TH tbcx 3 "Jul 9, 2026" "tbcx 1.2" "Tcl Bytecode eXchange"
+.TH tbcx 3 "Aug 7, 2026" "tbcx 1.2.1" "Tcl Bytecode eXchange"
 .SH NAME
-tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.
+tbcx \- serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs, OO methods, and lambdas). Artifacts require an exact Tcl major/minor/patch/release-type match at load time.
 .SH SYNOPSIS
 .nf
 \fBtbcx::save\fR \fIin out\fR ?\fB\-include\-source\fR?
@@ -54,21 +54,21 @@ One of:
 .RE
 .TP
 .B \-include\-source
-Optional flag.  Embeds the authored source text of every \fBproc\fR and TclOO method body
-in the artifact as an LPString.  Required when consumers depend on \fBinfo body\fR,
+Optional flag.  Selects include\-source policy and embeds the exact authored
+bytes in every executable\-source field: \fBproc\fR, TclOO method,
+\fBTBCX_LIT_BYTESRC\fR, and lambda body.  Required when consumers depend on \fBinfo body\fR,
 \fBinfo class definition\fR, TIP #280 line attribution in stack traces, disassembly
 annotations, or introspection\-based clone idioms (e.g.
 \fCproc $new [info args $src] [info body $src]\fR) to return the original
-authored text.  Artifact size grows
-proportional to the aggregate source text of all procs and methods.
+authored text.  The retained text is introspection data only; execution still
+uses precompiled bytecode and never falls back to these fields.
 .PP
-\fBDefault behavior (no \-include\-source):\fR Every proc/method body source field is
-emitted as an empty LPString.  At load time the loader substitutes the diagnostic
-sentinel described in \fBSOURCE PRESERVATION\fR below, so \fBinfo body\fR returns a
-loud string instead of silently returning empty.  This matches the 25\-year
-\fItclcompiler\fR/\fItbcload\fR precedent of stripping body source from compiled deployment output: deployment
-artifacts are typically distributed instead of source, and stripping keeps the
-artifact smaller and preserves the IP\-protection angle.
+\fBDefault behavior (no \-include\-source):\fR The top block selects strict
+compiled\-only policy. Every proc, method, BYTESRC, and lambda executable\-source
+field is an empty LPString. Proc and method introspection receives the diagnostic
+sentinel described in \fBSOURCE PRESERVATION\fR below; stripped lambdas receive a
+separate fixed list\-shaped diagnostic representation. Ordinary Tcl literals remain
+in bytecode, so this policy removes designated complete source fields but is not encryption.
 .PP
 .B Behavior
 .RS
@@ -84,11 +84,10 @@ Each captured method's TclOO visibility is recorded in a per\-record scope byte
 An origin byte distinguishes class\-definition methods (\fBoo::define\fR /
 \fBoo::class create\fR) from per\-object methods (\fBoo::objdefine\fR).
 .IP \(bu 2
-Compiles the top\-level script at true global scope even when \fBtbcx::save\fR is
-invoked from inside a proc: the compile environment's proc pointer is cleared and
-the caller frame's LocalCache is hidden for the duration of the compile, because a
-serialized top level carries no local\-variable table and must never index the
-calling proc's local slots.
+Compiles the top\-level script without borrowing the saver caller's procedure-local
+slot table: the compile environment's proc pointer is cleared and the caller frame's
+LocalCache is hidden for the duration of compilation.  At load time the block still
+executes in the load caller's current namespace and frame.
 .IP \(bu 2
 Rejects, with a diagnostic, a \fBself method\fR (or a method inside a
 \fBself { ... }\fR block) written in an \fBoo::objdefine\fR builder \(em
@@ -97,13 +96,23 @@ reconstructed and would otherwise load as a silent no\-op.
 .IP \(bu 2
 Pre\-compiles namespace eval body literals and other script\-body patterns (\fBtry\fR/\fBon\fR/\fBtrap\fR/\fBfinally\fR, \fBforeach\fR, \fBlmap\fR, \fBwhile\fR, \fBfor\fR, \fBcatch\fR, \fBif\fR/\fBelseif\fR/\fBelse\fR, \fBeval\fR, \fBuplevel\fR, \fBtime\fR, \fBtimerate\fR, \fBdict for\fR/\fBmap\fR/\fBupdate\fR/\fBwith\fR, \fBlsort \-command\fR, and \fBself method\fR bodies inside \fBoo::define\fR).
 .IP \(bu 2
-Performs two\-phase instruction\-level body detection: Phase 1 analyzes \fBinvokeStk\fR operand stack patterns to find body arguments; Phase 2 identifies unpushed literals from inline\-compiled \fBforeach\fR/\fBlmap\fR loops. Uses an O(1) opcode dispatch table covering all 120 Tcl 9.1 instruction types.
+Builds an occurrence\-level executable literal plan from the generic
+\fBinvokeStk\fR stream.  The stack model identifies exact \fBpush\fR
+instructions rather than globally classifying a literal object or its bytes.
+Repeated equal script bodies therefore remain separate compiled records, while
+an equal occurrence used as data remains an ordinary literal.
 .IP \(bu 2
-Strips \fBstartCommand\fR debugging instructions from all compiled blocks, replacing them with \fBnop\fR bytes for ~15% leaner bytecode execution.
+Compiles every new\-policy top\-level, proc, method, lambda, and nested script
+block with \fBDONT_COMPILE_CMDS_INLINE\fR and materializes it as
+\fBTCL_BYTECODE_PRECOMPILED\fR. Command implementation changes are handled by
+generic dispatch, without source recompilation.
 .IP \(bu 2
 Detects bytearray literals (bytes \[>=] 0x80) and emits them as \fBTBCX_LIT_BYTEARR\fR to prevent UTF\-8 corruption.
 .IP \(bu 2
-Body literals are emitted as \fBTBCX_LIT_BYTESRC\fR (source text + compiled bytecode) enabling cross\-interpreter recompilation.
+Body literals are emitted as \fBTBCX_LIT_BYTESRC\fR containing namespace-bound
+compiled bytecode and a policy-controlled source field. Known literal crossings
+through \fBinterp eval\fR are currently rejected with
+\fBTBCX EVAL CROSSINTERP UNSUPPORTED\fR; no source fallback is used.
 .IP \(bu 2
 When the input is a readable file path, the normalized path is recorded in the header via \fBTcl_FSGetNormalizedPath\fR so the loader can restore \fBinfo script\fR to the authored value.
 .IP \(bu 2
@@ -123,7 +132,9 @@ The output object: either the normalized path written, or the writable channel h
 .RS
 Typical errors include: read error from the input channel or opened file; unwritable output; unknown/unsupported AuxData;
 size limit exceeded (code, literals, AuxData, exception ranges, strings); runaway serialization
-(too many literals, blocks, excessive recursion depth, or output too large); short read/write.
+(too many literals, blocks, excessive recursion depth, or output too large);
+an unsupported statically recognized cross-interpreter script occurrence;
+or short read/write.
 The interpreter result contains a descriptive message.
 .RE
 .PP
@@ -132,7 +143,7 @@ The interpreter result contains a descriptive message.
 .IP \(bu 2
 Input channels retain their encoding settings; output channels are set to binary mode.
 .IP \(bu 2
-The produced artifact targets Tcl 9.1 (format version 92); other versions are rejected at load time.
+The produced artifact targets Tcl 9.1 (format version 93); other versions are rejected at load time.
 .RE
 .PP
 .B Examples
@@ -179,14 +190,26 @@ One of:
 .B Behavior
 .RS
 .IP \(bu 2
-Validates header and producer version (exact major.minor match required); deserializes sections.
+Reads the bounded artifact into an owned, interpreter-neutral byte image and
+validates the header and exact packed producer version (major, minor, patch, and
+alpha/beta/final release type).
+.IP \(bu 2
+Completes a preflight pass over every section before constructing any namespace,
+Tcl object, ByteCode, Proc, method, or persistent shim. The pass validates source
+policy and all executable-source fields, opcodes and instruction boundaries,
+operands, literal/local/AuxData indices, jump targets, exception metadata,
+supported AuxData payloads, nested policy words, and exact end-of-file.
 .IP \(bu 2
 If the header carries a recorded authored source path, reads it into a Tcl_Obj for \fBinfo script\fR restoration.
 .IP \(bu 2
-Installs a temporary \fBProcShim\fR that intercepts the \fBproc\fR command to substitute
-precompiled bodies when the name and argument signature match.  The body's string
-representation is set to either the preserved source text (artifacts built with
-\fB\-include\-source\fR) or the diagnostic sentinel (default stripped mode).
+Installs a temporary \fBProcShim\fR that intercepts the \fBproc\fR command at the
+authored definition marker.  When the name and argument signature match, it passes
+the already-deserialized procbody to Tcl's original \fBproc\fR handler.  Tcl therefore
+performs normal marker-time creation, replacement traces, namespace/export/import
+handling, and argument validation while reusing the serialized Proc and compiled-local
+chain.  The body's string representation is set to either the preserved source text
+(artifacts built with \fB\-include\-source\fR) or the diagnostic sentinel (default
+stripped mode).
 .IP \(bu 2
 Installs a temporary \fBOOShim\fR that intercepts \fBoo::define\fR and \fBoo::objdefine\fR
 by patching the commands' handler pointers in place (the commands are \fInot\fR renamed)
@@ -209,7 +232,8 @@ is active, the trace restores the original handlers in place immediately, so a r
 command never remains wired to freed shim state.
 .IP \(bu 2
 Registers precompiled lambdas in a persistent per\-interpreter \fBApplyShim\fR that
-recovers the compiled representation if type shimmer evicts it.
+recovers the compiled representation if type shimmer evicts it.  A later load
+reactivates the shim if \fBapply\fR was renamed, deleted, and restored or recreated.
 .IP \(bu 2
 Executes the precompiled top\-level block via \fBTcl_EvalObjEx\fR with flags \fB0\fR
 (no \fBTCL_EVAL_GLOBAL\fR), evaluating in the caller's current namespace.
@@ -218,9 +242,10 @@ artifact path as a fallback when loading from a file), and restored after
 evaluation \(em matching \fBTcl_FSEvalFileEx\fR's handling in
 \fBtclIOUtil.c\fR.  When loading from an already\-open channel and the header
 carries no recorded path, \fBinfo script\fR is left untouched.
-Compiled locals for the top\-level frame are installed on the caller's active
-variable frame by linking named variables to existing same\-name variables in
-the caller's scope.  A top\-level \fBreturn\fR is handled identically to \fBsource\fR.
+The normal zero-local top-level leaves every field of the caller's active frame
+untouched.  If a block carries named local slots, an overlay is resolved against
+the original caller frame before installation and the exact frame state is restored
+after every return code.  A top\-level \fBreturn\fR is handled identically to \fBsource\fR.
 .IP \(bu 2
 Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter's lifetime.
 .RE
@@ -291,12 +316,16 @@ A readable path to a \fB.tbcx\fR file.
 .PP
 .B Behavior
 .RS
-Reads the artifact and prints: header fields (including the authored source path
-when recorded); section summaries; literals and AuxData; exception ranges;
+Validates the artifact through the same complete preflight path as
+\fBtbcx::load\fR and prints: header fields (including the authored source path
+and \fBsourcePolicy\fR); executable-source field, nonempty-field, and byte totals;
+section summaries; literals and AuxData; exception ranges;
 disassembly of the top\-level, proc, method, and lambda bodies; and the
 preserved body source text (indented inline, no truncation) for each proc and
 method when the artifact was built with \fB\-include\-source\fR.  For stripped
 artifacts (the default), each body record shows \fBsource: <stripped at save time>\fR.
+An exact empty body retained by \fB\-include\-source\fR is shown as
+\fBsource: (0 bytes)\fR, not as stripped.
 Each method record also shows its visibility \fBscope\fR and \fBorigin\fR
 (class\-definition vs object\-definition).  Literal operands in the disassembly
 are annotated using the instruction table's operand types rather than
@@ -320,7 +349,7 @@ Unreadable file; bad header; malformed section; short read.
 % puts [tbcx::dump hello.tbcx]
 TBCX Header:
   magic = 0x58434254 ('T''B''C''X')
-  format = 92
+  format = 93
   tcl_version = 9.1.0 (type 0)
   top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
   source = /path/to/hello.tcl
@@ -369,9 +398,10 @@ Empty string.
 
 .SH SOURCE PRESERVATION
 .PP
-Without \fB\-include\-source\fR, every proc and method body is emitted with an
-empty source\-text field on the wire, and the loader installs a two\-line
-diagnostic sentinel as the body's string representation:
+Without \fB\-include\-source\fR, every designated executable\-source field
+(proc, method/constructor/destructor, BYTESRC, and lambda body) is empty on
+the wire. Ordinary Tcl literals remain in bytecode, so this is not encryption.
+For proc and method bodies the loader installs this two\-line diagnostic sentinel:
 .PP
 .nf
     # tbcx: body source stripped at save time; info body unavailable
@@ -388,26 +418,32 @@ An \fBerror\fR call \(em so that if downstream code does
 \fCproc new [info args orig] [info body orig]\fR and invokes \fCnew\fR,
 the clone fails loudly rather than silently running as a no\-op.
 .PP
-With \fB\-include\-source\fR, the authored source text is preserved in the
-artifact and attached as the body Tcl_Obj's string representation via
-\fBTcl_InvalidateStringRep\fR + \fBTcl_InitStringRep\fR.  The ByteCode
-internal representation is untouched; execution still uses the precompiled
-bytecode.  \fBinfo body\fR, \fBinfo class definition\fR,
-\fBinfo class constructor\fR, and TIP #280 source attribution round\-trip
-byte\-for\-byte.
+Stripped lambda records use a separate fixed list\-shaped diagnostic string.
+Their registered \fBlambdaExpr\fR representation still holds the materialized
+Proc. A newly constructed object containing only the diagnostic has lost TBCX
+identity and fails instead of compiling an apparent authored body.
+.PP
+With \fB\-include\-source\fR, exact authored bytes are preserved in all four
+executable\-source field kinds and attached for introspection as appropriate.
+The ByteCode internal representation is untouched and PRECOMPILED; execution
+still uses compiled material even if retained bytes are changed. \fBinfo body\fR,
+\fBinfo class definition\fR, \fBinfo class constructor\fR, and TIP #280 source
+attribution round\-trip byte\-for\-byte.
 
 .SH FILE FORMAT (OVERVIEW)
 .PP
-This section summarizes the on\-disk structure. Format version is 92 (Tcl 9.1).
+This section summarizes the on\-disk structure. Format version remains 93 (Tcl 9.1).
 All integers are little\-endian.
 .TP
 .B Header
-Magic (0x58434254) + format version (92) + producing Tcl version; size/count metadata for the top\-level block
+Magic (0x58434254) + format version (93) + producing Tcl version; size/count metadata for the top\-level block
 (code length, exception ranges, literal count, AuxData count, locals, max stack); authored source path LPString
 (empty for inline/channel inputs).
 .TP
 .B Sections (order)
-(1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue);
+(1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue,
+including source policy in the formerly reserved u32; every nested block keeps
+that field zero);
 (2) Procs (FQN, ns, arg spec, body\-source LPString, compiled block);
 (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top\-level script);
 (4) Methods, in definition order (class FQN; kind u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self; scope u8: 0=default, 1=public, 2=unexported, 3=TIP #500 true\-private \(em ctor/dtor always 0; origin u8: 0=class definition, 1=object definition; name \(em empty for ctor/dtor; args; body\-source LPString; compiled block).  Records are keyed at load by \fI(class FQN, kind, name, origin)\fR, so a class\-instance method and a per\-object method sharing a name coexist.
@@ -419,31 +455,47 @@ magnitude bytes), 1 boolean (one byte), 2 bytearray (length + raw bytes),
 4 double (IEEE\-754 bits as u64), 5 list (element count, then nested
 literals), 6 string (LPString), 7 wideint (signed 64\-bit as u64),
 8 wideuint (unsigned 64\-bit), 9 lambda\-bytecode (namespace FQN, arguments,
-compiled block, body source text) for use with \fBapply\fR, and 10 bytesrc
-(source text, namespace FQN, compiled block) enabling cross\-interpreter
-recompilation.
+compiled block, policy\-controlled body source text) for use with \fBapply\fR,
+and 10 bytesrc (policy\-controlled source text, namespace FQN, compiled block).
+.TP
+.B Source policy
+Top policy 0 denotes a legacy format\-93 artifact, 1 strict compiled\-only,
+and 2 include\-source. New saves write 1 by default or 2 with
+\fB\-include\-source\fR. Both nonzero policies execute PRECOMPILED material.
+Legacy policy\-zero artifacts remain readable. Older r91 loaders reject new
+artifacts because they require the formerly reserved word to be zero; no package,
+format, compatibility, or literal tag number changed.
 .TP
 .B AuxData families
 jump tables (string or numeric), dictupdate, and NewForeachInfo.
 
 .SH LAMBDA SUPPORT
 .PP
-Literals in the script that represent \fIlambdas\fR for \fBapply\fR (lists of the form
+Literal arguments in statically recognized \fBapply\fR occurrences (lists of the form
 \fC{args body ?ns?}\fR) are compiled and serialized as lambda\-bytecode literals at save time.
-A candidate is accepted only when its list value round\-trips faithfully as a Tcl lambda \(em
-rebuilt the way the loader rebuilds it, including validation that the optional namespace
-element is absolute \(em so data lists that merely resemble lambdas remain ordinary data.
+Classification belongs to that exact bytecode occurrence, not to equal bytes or a shared
+Tcl_Obj, so an equal list used as ordinary data remains an ordinary literal.
 On load, the compiled body, argument list, and optional namespace element are rehydrated
 into a \fBProc\fR and registered in the \fBApplyShim\fR so that the first call to
 \fBapply\fR does not trigger compilation. If type shimmer later evicts the lambdaExpr
 internal representation, the ApplyShim transparently re\-installs it on the next
-\fBapply\fR call.
+\fBapply\fR call.  Shim installation is idempotent and is retried by subsequent
+loads after \fBapply\fR is renamed or recreated. Strict lambda source fields are empty;
+include\-source retains exact body bytes for introspection without changing execution.
 
 .SH SEMANTICS AND PERFORMANCE
 .PP
 Artifacts are portable across little\- and big\-endian hosts. The loader detects host byte order
-once and applies a tight in\-place swap over bulk sections that require conversion, avoiding
-per\-field branching so cross\-endian loads remain close to native performance.
+once and decodes the little\-endian wire fields explicitly. Numeric jump tables use Tcl's
+one\-word key representation on every host; a serialized numeric key that is not representable
+by a 32\-bit evaluator is rejected instead of being truncated or treated as a string key.
+.PP
+The loader requires an exact major, minor, patch, and release\-type Tcl producer match. A complete
+neutral-image preflight validates the policy, source fields, all section totals and tags,
+instruction widths, literal/local/AuxData indices, direct and jump\-table targets, exception
+boundaries, nested policy words, and trailing bytes before any interpreter-owned artifact
+material is constructed. Reconstruction then uses one final packed ByteCode allocation and one
+copy of each instruction stream, without compile\-environment staging arrays.
 .PP
 Loading evaluates the precompiled top\-level in the caller's current namespace with
 \fBiPtr->scriptFile\fR set to the authored source path (if recorded), then installs
@@ -503,8 +555,12 @@ thread returns
 .B TCL_ERROR
 with a diagnostic message.
 .PP
-Artifacts are designed to load into interpreters other than the
-originating one.  Interpreter\-specific state (ApplyShim lambda registry,
+The same artifact may be loaded independently into interpreters other than the
+originating one. Moving an already-materialized embedded script object between
+interpreters is not currently supported: pending owner approval for the proposed
+private interp shim, a statically recognized literal \fBinterp eval\fR crossing
+fails at save with \fBTBCX EVAL CROSSINTERP UNSUPPORTED\fR. Strict and
+include\-source artifacts never recompile retained text. Interpreter\-specific state (ApplyShim lambda registry,
 load depth, OO shim state) is consolidated in a single per\-interpreter
 record and cleaned up automatically when the interpreter is deleted.
 Shared process\-wide state \(em the save\-side opcode dispatch table \(em is
@@ -518,7 +574,8 @@ additionally assert interpreter\-thread ownership inside internal helpers.
 Sanity caps exist for code size (64 MiB), literal/AuxData/exception counts (1M each),
 string lengths (4 MiB), total serialized output (256 MB), serialization recursion depth (64),
 total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
-Exceeding any limit produces an error.
+Every raw instruction and metadata reference is validated before ByteCode construction,
+and unexplained trailing bytes are rejected.  Exceeding any limit produces an error.
 .PP
 Nested or reentrant \fBtbcx::load\fR calls are capped at depth 8 per
 interpreter to prevent runaway recursive loading.

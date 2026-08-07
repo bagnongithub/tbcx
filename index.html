@@ -2,8 +2,8 @@
 <meta charset='utf-8'>
   <title>tbcx</title>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <meta name='date' content='Jul 9, 2026'>
-  <meta name='generator' content='tbcx 1.2'>
+  <meta name='date' content='Aug 6, 2026'>
+  <meta name='generator' content='tbcx 1.2.1'>
   <style>
     :root{
         --bg: #ffffff;
@@ -58,7 +58,7 @@
     <div class='container'>
       <header class='header'>
         <h1 id='top'>TBCX</h1>
-        <div class='meta'>Tcl Bytecode eXchange tbcx 1.2 Jul 9, 2026</div>
+        <div class='meta'>Tcl Bytecode eXchange tbcx 1.2.1 Aug 6, 2026</div>
       </header>
       <section class='toc-index-wrap'>
         <nav class='toc-top'>
@@ -95,7 +95,7 @@
 
       <h2 id='name'>NAME</h2>
       <p>tbcx &mdash; serialize, load, and inspect precompiled Tcl 9.1 bytecode (procs,
-        OO methods, and lambdas). Artifacts require an exact Tcl major/minor match at load time.</p>
+        OO methods, and lambdas). Artifacts require an exact Tcl major/minor/patch/release-type match at load time.</p>
 
       <h2 id='synopsis'>SYNOPSIS</h2>
       <pre><code>tbcx::save in out ?-include-source?
@@ -157,11 +157,10 @@ tbcx::gc</code></pre>
                 <b>export</b>/<b>unexport</b>/<b>self export</b>/<b>self unexport</b> commands. An origin
                 byte distinguishes class-definition methods (<b>oo::define</b> / <b>oo::class create</b>)
                 from per-object methods (<b>oo::objdefine</b>).</li>
-            <li>Compiles the top-level script at true global scope even when <b>tbcx::save</b> is
-                invoked from inside a proc: the compile environment&rsquo;s proc pointer is cleared
-                and the caller frame&rsquo;s LocalCache is hidden for the duration of the compile,
-                because a serialized top level carries no local-variable table and must never index
-                the calling proc&rsquo;s local slots.</li>
+            <li>Compiles the top-level script without borrowing the saver caller&rsquo;s procedure-local
+                slot table: the compile environment&rsquo;s proc pointer is cleared and the caller frame&rsquo;s
+                LocalCache is hidden during compilation. At load time the block still executes in the
+                load caller&rsquo;s current namespace and frame.</li>
             <li>Rejects, with a diagnostic, a <b>self method</b> (or a method inside a
                 <b>self { &hellip; }</b> block) written in an <b>oo::objdefine</b> builder &mdash;
                 <b>oo::objdefine</b> has no <b>self method</b> form, so such a definition cannot be
@@ -175,7 +174,9 @@ tbcx::gc</code></pre>
             <li>Performs two-phase instruction-level body detection: Phase 1 analyzes <b>invokeStk</b>
                 operand stack patterns; Phase 2 identifies unpushed literals from inline-compiled
                 <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all Tcl 9.1 instructions.</li>
-            <li>Strips <b>startCommand</b> debugging instructions from all compiled blocks, replacing them with <b>nop</b> bytes for ~15% leaner bytecode execution.</li>
+            <li>Preserves compiler-produced <b>startCommand</b> instructions. Compilation forces readiness
+                checks into self-contained optimized blocks; mixed epoch-sensitive blocks use generic
+                command dispatch so immutable bytecode remains correct after command redefinition.</li>
             <li>Detects bytearray literals (bytes &ge; 0x80) and emits them as <b>TBCX_LIT_BYTEARR</b>
                 to prevent UTF-8 encoding corruption.</li>
             <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
@@ -201,7 +202,7 @@ tbcx::gc</code></pre>
         <dd>
           <ul>
             <li>Input channels retain their encoding settings; output channels are set to binary mode (and not restored).</li>
-            <li>The produced artifact targets Tcl 9.1 (format version 92); other versions are rejected at load time.</li>
+            <li>The produced artifact targets Tcl 9.1 (format version 93); other versions are rejected at load time.</li>
           </ul>
         </dd>
       </dl>
@@ -242,12 +243,19 @@ try {
         <dt>Behavior</dt>
         <dd>
           <ul>
-            <li>Validates header and producer version (exact major.minor match required); deserializes sections.</li>
+            <li>Validates the header and exact packed producer version (major, minor, patch, and alpha/beta/final release type); deserializes sections.</li>
+            <li>Validates instruction and opcode boundaries, operands, literal/local/AuxData indices,
+                jump targets, exception metadata, and supported AuxData payloads before constructing
+                each Tcl ByteCode, then requires exact end-of-file before top-level execution.</li>
             <li>If the header carries a recorded authored source path, reads it into a Tcl_Obj for <b>info script</b> restoration.</li>
-            <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command to substitute
-                precompiled bodies when the name and argument signature match. The body&rsquo;s string
-                representation is set to either the preserved source text (artifacts built with
-                <b>-include-source</b>) or the diagnostic sentinel (default stripped mode).</li>
+            <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command at the
+                authored definition marker. When the name and argument signature match, it passes
+                the already-deserialized procbody to Tcl&rsquo;s original <b>proc</b> handler. Tcl therefore
+                performs normal marker-time creation, replacement traces, namespace/export/import
+                handling, and argument validation while reusing the serialized Proc and compiled-local
+                chain. The body&rsquo;s string representation is set to either the preserved source text
+                (artifacts built with <b>-include-source</b>) or the diagnostic sentinel (default
+                stripped mode).</li>
             <li>Installs a temporary <b>OOShim</b> that intercepts <b>oo::define</b> and <b>oo::objdefine</b>
                 by patching the commands&rsquo; handler pointers in place (the commands are <i>not</i>
                 renamed) to substitute precompiled method/constructor/destructor bodies. Method records
@@ -267,7 +275,8 @@ try {
                 shim is active, the trace restores the original handlers in place immediately, so a
                 renamed command never remains wired to freed shim state.</li>
             <li>Registers precompiled lambdas in a persistent per-interpreter <b>ApplyShim</b> that
-                recovers the compiled representation if type shimmer evicts it.</li>
+                recovers the compiled representation if type shimmer evicts it. A subsequent load
+                reactivates the shim after <b>apply</b> is renamed, deleted, restored, or recreated.</li>
             <li>Executes the precompiled top-level block via <b>Tcl_EvalObjEx</b> with flags <b>0</b>
                 (no <b>TCL_EVAL_GLOBAL</b>), evaluating in the caller&rsquo;s current namespace.
                 <b>iPtr-&gt;scriptFile</b> is saved, set to the header&rsquo;s source path (or the tbcx
@@ -275,9 +284,10 @@ try {
                 &mdash; matching <b>Tcl_FSEvalFileEx</b>&rsquo;s handling in <b>tclIOUtil.c</b>.
                 When loading from an already-open channel and the header carries no recorded path,
                 <b>info script</b> is left untouched.
-                Compiled locals for the top-level frame are installed on the caller&rsquo;s active
-                variable frame by linking named variables to existing same-name variables in
-                the caller&rsquo;s scope. A top-level <b>return</b> is handled identically to <b>source</b>.</li>
+                A normal zero-local top-level leaves every field of the caller&rsquo;s active frame untouched;
+                a nonzero local overlay is resolved against the original caller frame before installation
+                and that exact frame state is restored afterward. A top-level <b>return</b> is handled
+                identically to <b>source</b>.</li>
             <li>Removes the ProcShim and OOShim after execution; the ApplyShim persists for the interpreter&rsquo;s lifetime.</li>
           </ul>
         </dd>
@@ -339,7 +349,7 @@ proc moduleLoad {path} {
 % puts [tbcx::dump hello.tbcx]
 TBCX Header:
   magic = 0x58434254 ('T''B''C''X')
-  format = 92
+  format = 93
   tcl_version = 9.1.0 (type 0)
   top: code=12, except=0, lits=2, aux=0, locals=1, stack=2
   source = /path/to/hello.tcl
@@ -400,11 +410,12 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         byte-for-byte.</p>
 
       <h2 id='file-format-overview'>FILE FORMAT (OVERVIEW)</h2>
-      <p>This section summarizes the on-disk structure. Format version is <b>92</b> (Tcl 9.1).
+      <p>This section summarizes the on-disk structure. Format version is <b>93</b> (Tcl 9.1).
+         Legacy format 92 is rejected because its removed command-boundary instructions cannot be reconstructed.
          All integers are little-endian.</p>
       <dl class='deflist'>
         <dt>Header</dt>
-        <dd>Magic (<code>0x58434254</code>) + format version (92) + producing Tcl version;
+        <dd>Magic (<code>0x58434254</code>) + format version (93) + producing Tcl version;
             size/count metadata for the top-level block (code length, exception ranges,
             literal count, AuxData count, locals, max stack); authored source path LPString
             (empty for inline/channel inputs).</dd>
@@ -446,8 +457,16 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
       <h2 id='semantics-and-performance'>SEMANTICS AND PERFORMANCE</h2>
       <p>
         Artifacts are portable across little- and big-endian hosts. The loader detects host byte
-        order once and applies a tight in-place swap over bulk sections that require conversion,
-        avoiding per-field branching so cross-endian loads remain close to native performance.</p>
+        order once and decodes the little-endian wire fields explicitly. Numeric jump tables use
+        Tcl&rsquo;s one-word key representation on every host; a serialized numeric key that is
+        not representable by a 32-bit evaluator is rejected instead of being truncated or treated
+        as a string key.</p>
+      <p>
+        The loader requires an exact major, minor, patch, and release-type Tcl producer match.
+        Before constructing ByteCode it validates instruction widths, literal/local/AuxData
+        indices, direct and jump-table targets, and exception boundaries. Reconstruction uses one
+        final packed ByteCode allocation and one copy of the instruction bytes, without
+        compile-environment staging arrays.</p>
       <p>
         Loading evaluates the precompiled top-level in the caller&rsquo;s current namespace with
         <b>iPtr-&gt;scriptFile</b> set to the authored source path (if recorded), then installs
@@ -513,7 +532,8 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         Sanity caps exist for code size (64 MiB), literal/AuxData/exception counts (1M each),
         string lengths (4 MiB), total serialized output (256 MB), serialization recursion depth (64),
         total WriteLiteral calls (2M), and total WriteCompiledBlock calls (256K).
-        Exceeding any limit produces an error.</p>
+        Every raw instruction and metadata reference is validated before ByteCode construction,
+        and unexplained trailing bytes are rejected. Exceeding any limit produces an error.</p>
       <p>
         Nested or reentrant <b>tbcx::load</b> calls are capped at depth 8 per interpreter
         to prevent runaway recursive loading.</p>
@@ -541,7 +561,7 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
       <p>&copy; 2025&ndash;2026 Miguel Banon</p>
       <p>MIT License.</p>
 
-      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.2 (format v92)</div>
+      <div class='footer'>Generated from tbcx.n &mdash; tbcx 1.2.1 (format v93)</div>
     </div>
     <a href='#top' class='back-to-top'>&uarr; Top</a>
   </body>

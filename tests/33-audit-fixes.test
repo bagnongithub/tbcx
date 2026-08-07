@@ -1,0 +1,1186 @@
+# -*-Tcl-*-
+# 33-audit-fixes.test — regressions for the independent release audit.
+
+package require -exact tbcx 1.2.1
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+testConstraint auditPtr64 [expr {$::tcl_platform(pointerSize) >= 8}]
+testConstraint auditPtr32 [expr {$::tcl_platform(pointerSize) < 8}]
+
+namespace eval ::audit33 {
+    variable traceLog {}
+    variable linkedTarget OLD
+}
+
+proc ::audit33::readBinary {path} {
+    set ch [open $path rb]
+    try {
+        read $ch
+    } finally {
+        close $ch
+    }
+}
+
+proc ::audit33::writeBinary {path data} {
+    set ch [open $path wb]
+    try {
+        puts -nonewline $ch $data
+    } finally {
+        close $ch
+    }
+}
+
+proc ::audit33::getU32LE {data offset} {
+    binary scan [string range $data $offset [expr {$offset + 3}]] c* octets
+    if {[llength $octets] != 4} {
+        error "short u32 at $offset"
+    }
+    expr {([lindex $octets 0] & 255) |
+          (([lindex $octets 1] & 255) << 8) |
+          (([lindex $octets 2] & 255) << 16) |
+          (([lindex $octets 3] & 255) << 24)}
+}
+
+proc ::audit33::setByte {data offset value} {
+    binary scan $data c* octets
+    lset octets $offset [expr {$value & 255}]
+    binary format c* $octets
+}
+
+proc ::audit33::putU32LE {data offset value} {
+    for {set i 0} {$i < 4} {incr i} {
+        set data [setByte $data [expr {$offset + $i}] \
+            [expr {($value >> (8 * $i)) & 255}]]
+    }
+    return $data
+}
+
+proc ::audit33::putU32BE {data offset value} {
+    for {set i 0} {$i < 4} {incr i} {
+        set data [setByte $data [expr {$offset + $i}] \
+            [expr {($value >> (8 * (3 - $i))) & 255}]]
+    }
+    return $data
+}
+
+proc ::audit33::putU64LE {data offset value} {
+    for {set i 0} {$i < 8} {incr i} {
+        set data [setByte $data [expr {$offset + $i}] \
+            [expr {($value >> (8 * $i)) & 255}]]
+    }
+    return $data
+}
+
+proc ::audit33::packU32LE {value} {
+    putU32LE [binary format c* {0 0 0 0}] 0 $value
+}
+
+proc ::audit33::packU64LE {value} {
+    putU64LE [binary format c* {0 0 0 0 0 0 0 0}] 0 $value
+}
+
+proc ::audit33::skipLPString {data offset} {
+    set length [getU32LE $data $offset]
+    expr {$offset + 4 + $length}
+}
+
+proc ::audit33::skipLiteral {data offset} {
+    set tag [getU32LE $data $offset]
+    incr offset 4
+    switch -- $tag {
+        0 {
+            # sign u8, magnitude length u32, magnitude bytes
+            set length [getU32LE $data [expr {$offset + 1}]]
+            return [expr {$offset + 5 + $length}]
+        }
+        1 {return [expr {$offset + 1}]}
+        2 - 6 {return [skipLPString $data $offset]}
+        3 {
+            set count [getU32LE $data $offset]
+            incr offset 4
+            for {set i 0} {$i < 2 * $count} {incr i} {
+                set offset [skipLiteral $data $offset]
+            }
+            return $offset
+        }
+        4 - 7 - 8 {return [expr {$offset + 8}]}
+        5 {
+            set count [getU32LE $data $offset]
+            incr offset 4
+            for {set i 0} {$i < $count} {incr i} {
+                set offset [skipLiteral $data $offset]
+            }
+            return $offset
+        }
+        9 {
+            # namespace, arguments (name/default), body block, body source
+            set offset [skipLPString $data $offset]
+            set count [getU32LE $data $offset]
+            incr offset 4
+            for {set i 0} {$i < $count} {incr i} {
+                set offset [skipLPString $data $offset]
+                binary scan [string index $data $offset] c hasDefault
+                incr offset
+                if {$hasDefault} {
+                    set offset [skipLiteral $data $offset]
+                }
+            }
+            set offset [skipBlock $data $offset]
+            return [skipLPString $data $offset]
+        }
+        10 {
+            # executable source, namespace, nested compiled block
+            set offset [skipLPString $data $offset]
+            set offset [skipLPString $data $offset]
+            return [skipBlock $data $offset]
+        }
+        default {
+            error "unsupported literal tag $tag in audit mutator"
+        }
+    }
+}
+
+proc ::audit33::skipBlock {data offset} {
+    set codeLen [getU32LE $data $offset]
+    incr offset [expr {4 + $codeLen}]
+    set numLits [getU32LE $data $offset]
+    incr offset 4
+    for {set i 0} {$i < $numLits} {incr i} {
+        set offset [skipLiteral $data $offset]
+    }
+    set numAux [getU32LE $data $offset]
+    incr offset 4
+    for {set i 0} {$i < $numAux} {incr i} {
+        set tag [getU32LE $data $offset]
+        incr offset 4
+        switch -- $tag {
+            0 {
+                set count [getU32LE $data $offset]
+                incr offset 4
+                for {set k 0} {$k < $count} {incr k} {
+                    set offset [skipLPString $data $offset]
+                    incr offset 4
+                }
+            }
+            1 {
+                set count [getU32LE $data $offset]
+                incr offset [expr {4 + 12 * $count}]
+            }
+            2 {
+                set count [getU32LE $data $offset]
+                incr offset [expr {4 + 4 * $count}]
+            }
+            3 {
+                set numLists [getU32LE $data $offset]
+                incr offset 16
+                for {set k 0} {$k < $numLists} {incr k} {
+                    set count [getU32LE $data $offset]
+                    incr offset [expr {4 + 4 * $count}]
+                }
+            }
+            default {error "unsupported aux tag $tag in audit mutator"}
+        }
+    }
+    set numExceptions [getU32LE $data $offset]
+    incr offset [expr {4 + 25 * $numExceptions}]
+    incr offset 8                    ;# max stack and nested policy/reserved
+    set numLocals [getU32LE $data $offset]
+    incr offset 4
+    for {set i 0} {$i < $numLocals} {incr i} {
+        set offset [skipLPString $data $offset]
+    }
+    return $offset
+}
+
+proc ::audit33::topSections {data} {
+    lassign [topLayout $data] codeStart codeLen literalCountAt
+    set offset $literalCountAt
+    set numLits [getU32LE $data $offset]
+    incr offset 4
+    set literalRecords {}
+    for {set i 0} {$i < $numLits} {incr i} {
+        set recordAt $offset
+        set offset [skipLiteral $data $offset]
+        lappend literalRecords [dict create at $recordAt end $offset \
+            tag [getU32LE $data $recordAt]]
+    }
+
+    set auxCountAt $offset
+    set numAux [getU32LE $data $offset]
+    incr offset 4
+    set auxTags {}
+    set jumpOffsets {}
+    for {set i 0} {$i < $numAux} {incr i} {
+        set tag [getU32LE $data $offset]
+        lappend auxTags $tag
+        incr offset 4
+        switch -- $tag {
+            0 {
+                set count [getU32LE $data $offset]
+                incr offset 4
+                for {set k 0} {$k < $count} {incr k} {
+                    set offset [skipLPString $data $offset]
+                    lappend jumpOffsets $offset
+                    incr offset 4
+                }
+            }
+            1 {
+                set count [getU32LE $data $offset]
+                incr offset 4
+                for {set k 0} {$k < $count} {incr k} {
+                    incr offset 8
+                    lappend jumpOffsets $offset
+                    incr offset 4
+                }
+            }
+            2 {
+                set count [getU32LE $data $offset]
+                incr offset 4
+                incr offset [expr {4 * $count}]
+            }
+            3 {
+                set numLists [getU32LE $data $offset]
+                incr offset 16
+                for {set k 0} {$k < $numLists} {incr k} {
+                    set count [getU32LE $data $offset]
+                    incr offset 4
+                    incr offset [expr {4 * $count}]
+                }
+            }
+            default {error "unsupported aux tag $tag in audit mutator"}
+        }
+    }
+
+    set exceptionCountAt $offset
+    set numExceptions [getU32LE $data $offset]
+    incr offset 4
+    set exceptionRecords {}
+    for {set i 0} {$i < $numExceptions} {incr i} {
+        lappend exceptionRecords $offset
+        incr offset 25
+    }
+    set maxStackAt $offset
+    set numLocalsAt [expr {$offset + 8}]
+    set afterLocals [expr {$numLocalsAt + 4}]
+    set numLocals [getU32LE $data $numLocalsAt]
+    for {set i 0} {$i < $numLocals} {incr i} {
+        set afterLocals [skipLPString $data $afterLocals]
+    }
+    dict create codeStart $codeStart codeLen $codeLen \
+        literalCountAt $literalCountAt numLits $numLits \
+        literalRecords $literalRecords \
+        auxCountAt $auxCountAt numAux $numAux auxTags $auxTags \
+        jumpOffsets $jumpOffsets exceptionCountAt $exceptionCountAt \
+        numExceptions $numExceptions exceptionRecords $exceptionRecords \
+        maxStackAt $maxStackAt numLocalsAt $numLocalsAt \
+        afterLocals $afterLocals
+}
+
+proc ::audit33::instructionPcs {path instruction} {
+    set result {}
+    foreach line [split [tbcx::dump $path] \n] {
+        if {[regexp {^\s*\(\s*([0-9]+)\)\s+([^[:space:]]+)} \
+                $line -> pc name] && $name eq $instruction} {
+            lappend result $pc
+        }
+    }
+    return $result
+}
+
+proc ::audit33::topLayout {data} {
+    # Fixed header fields occupy bytes 0..39. These mutation fixtures use an
+    # inline source, so the source-path LPString at 40 has length zero; the
+    # block code length is at 44 and its instruction bytes begin at 48.
+    if {[getU32LE $data 40] != 0} {
+        error "fixture unexpectedly has a source path"
+    }
+    set codeLen [getU32LE $data 44]
+    if {$codeLen != [getU32LE $data 12]} {
+        error "header/block code lengths differ before mutation"
+    }
+    set codeStart 48
+    set literalCountAt [expr {$codeStart + $codeLen}]
+    list $codeStart $codeLen $literalCountAt
+}
+
+proc ::audit33::replaceAsciiOnce {data from to} {
+    if {[string length $from] != [string length $to]} {
+        error "replacement must preserve artifact length"
+    }
+    set at [string first $from $data]
+    if {$at < 0 || [string first $from $data [expr {$at + 1}]] >= 0} {
+        error "expected exactly one source-text occurrence"
+    }
+    binary scan $data c* octets
+    binary scan $to c* replacement
+    for {set i 0} {$i < [llength $replacement]} {incr i} {
+        lset octets [expr {$at + $i}] [lindex $replacement $i]
+    }
+    binary format c* $octets
+}
+
+proc ::audit33::replaceBytes {data first last replacement} {
+    binary scan $data c* octets
+    binary scan $replacement c* replacementOctets
+    set octets [lreplace $octets $first $last {*}$replacementOctets]
+    binary format c* $octets
+}
+
+proc ::audit33::freshEval {script} {
+    set i [interp create]
+    try {
+        return [$i eval $script]
+    } finally {
+        interp delete $i
+    }
+}
+
+proc ::audit33::freshLoad {path} {
+    set i [interp create]
+    try {
+        $i eval [list set auto_path $::auto_path]
+        $i eval {package require -exact tbcx 1.2.1}
+        return [$i eval [list tbcx::load $path]]
+    } finally {
+        interp delete $i
+    }
+}
+
+proc ::audit33::freshSave {script path} {
+    set i [interp create]
+    try {
+        $i eval [list set auto_path $::auto_path]
+        $i eval {package require -exact tbcx 1.2.1}
+        return [$i eval [list tbcx::save $script $path]]
+    } finally {
+        interp delete $i
+    }
+}
+
+proc ::audit33::limitRun {mode payload delta} {
+    set i [interp create]
+    try {
+        $i eval [list set auto_path $::auto_path]
+        $i eval {package require -exact tbcx 1.2.1}
+        set base [$i eval {info cmdcount}]
+        interp limit $i command -value [expr {$base + $delta}]
+        set code [catch {$i eval [list $mode $payload]} result opts]
+        # A limit error is deliberately uncatchable inside the limited child;
+        # raise its ceiling from the parent before inspecting side effects.
+        interp limit $i command -value [expr {$base + 1000000}]
+        set progress [$i eval {
+            expr {[info exists ::auditLimitProgress]
+                ? $::auditLimitProgress : -1}
+        }]
+        return [list $code $progress [dict get $opts -errorcode]]
+    } finally {
+        interp delete $i
+    }
+}
+
+proc ::audit33::traceVar {name1 name2 op} {
+    variable traceLog
+    lappend traceLog $op
+}
+
+proc ::audit33::frameRun {mode payload} {
+    variable traceLog
+    variable linkedTarget
+    set traceLog {}
+    set linkedTarget OLD
+    set x 10
+    set keep KEEP
+    array set arr {k 4}
+    upvar #0 ::audit33::linkedTarget linked
+    trace add variable x {read write unset} ::audit33::traceVar
+    try {
+        if {$mode eq "eval"} {
+            set inner [eval $payload]
+        } else {
+            set inner [tbcx::load $payload]
+        }
+        list $inner $x [info exists keep] $arr(k) $linked $traceLog
+    } finally {
+        trace remove variable x {read write unset} ::audit33::traceVar
+    }
+}
+
+test audit.a01.epoch.top {command redefinition changes later top-level commands} -setup {
+    set script {
+        set before [expr {1 + 1}]
+        rename expr audit_original_expr
+        proc expr args {return OVERRIDDEN}
+        set after [expr {2 + 2}]
+        list $before $after
+    }
+    set out [makeFile "" audit-a01-top.tbcx]
+} -body {
+    ::audit33::freshSave $script $out
+    set sourceCode [catch {::audit33::freshEval $script} sourceResult]
+    set loadCode [catch {::audit33::freshLoad $out} loadResult]
+    list $sourceCode $sourceResult $loadCode $loadResult
+} -cleanup {
+    removeFile $out
+} -result {0 {2 OVERRIDDEN} 0 {2 OVERRIDDEN}}
+
+test audit.a01.epoch.proc {command redefinition changes later proc commands} -setup {
+    set script {
+        proc audit_epoch_proc {} {
+            set before [expr {3 + 4}]
+            rename expr audit_original_expr
+            proc expr args {return PROC-OVERRIDDEN}
+            set after [expr {5 + 6}]
+            list $before $after
+        }
+        audit_epoch_proc
+    }
+    set out [makeFile "" audit-a01-proc.tbcx]
+} -body {
+    ::audit33::freshSave $script $out
+    set sourceCode [catch {::audit33::freshEval $script} sourceResult]
+    set loadCode [catch {::audit33::freshLoad $out} loadResult]
+    list $sourceCode $sourceResult $loadCode $loadResult
+} -cleanup {
+    removeFile $out
+} -result {0 {7 PROC-OVERRIDDEN} 0 {7 PROC-OVERRIDDEN}}
+
+test audit.a01.epoch.incr {another compiled command follows Tcl epoch changes} -setup {
+    set script {
+        set value 10
+        rename incr audit_original_incr
+        proc incr args {return INCR-OVERRIDDEN}
+        set result [incr value]
+        list $value $result
+    }
+    set out [makeFile "" audit-a01-incr.tbcx]
+} -body {
+    ::audit33::freshSave $script $out
+    set sourceCode [catch {::audit33::freshEval $script} sourceResult]
+    set loadCode [catch {::audit33::freshLoad $out} loadResult]
+    list $sourceCode $sourceResult $loadCode $loadResult
+} -cleanup {
+    removeFile $out
+} -result {0 {10 INCR-OVERRIDDEN} 0 {10 INCR-OVERRIDDEN}}
+
+test audit.a01.command-limit {generic artifacts retain command-limit readiness} -setup {
+    set script {
+        set ::auditLimitProgress 0
+        while {$::auditLimitProgress < 500} {
+            incr ::auditLimitProgress
+        }
+        set ::auditLimitProgress
+    }
+    set out [makeFile "" audit-a01-limit.tbcx]
+    ::audit33::freshSave $script $out
+} -body {
+    set direct [::audit33::limitRun eval $script 150]
+    set loaded [::audit33::limitRun tbcx::load $out 150]
+    set directProgress [lindex $direct 1]
+    set loadedProgress [lindex $loaded 1]
+    # Tcl's optimized bytecode checks limits on its readiness ticker, while
+    # generic invokeStk dispatch checks at each command boundary.  Both must
+    # stop promptly with the same Tcl limit error; the exact progress value is
+    # consequently allowed to differ by at most one ticker interval.
+    list [lindex $direct 0] [lindex $loaded 0] \
+         [expr {$directProgress >= 0 && $directProgress < 500}] \
+         [expr {$loadedProgress >= 0 && $loadedProgress < 500}] \
+         [expr {abs($directProgress - $loadedProgress) <= 32}] \
+         [lindex $direct 2] [lindex $loaded 2]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1 1 1 {TCL LIMIT COMMANDS} {TCL LIMIT COMMANDS}}
+
+test audit.a01.start-command {strict blocks use generic readiness dispatch} -setup {
+    set out [makeFile "" audit-a01-start.tbcx]
+} -body {
+    tbcx::save {set x 1; incr x; return $x} $out
+    set dump [tbcx::dump $out]
+    list [string match {*sourcePolicy = strict-compiled-only*} $dump] \
+         [string match {*invokeStk*} $dump] \
+         [expr {![string match {*incrScalar*} $dump]}]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1}
+
+test audit.a02.caller-frame {load matches eval for caller locals and links} -setup {
+    set script {
+        incr x
+        unset keep
+        set created NEW
+        incr arr(k)
+        set linked CHANGED
+        set caught [catch {error boom} err opts]
+        list $x [info exists keep] $created $arr(k) $linked \
+             $caught $err [dict get $opts -code]
+    }
+    set out [makeFile "" audit-a02-frame.tbcx]
+} -body {
+    tbcx::save $script $out
+    set direct [::audit33::frameRun eval $script]
+    set loaded [::audit33::frameRun load $out]
+    list [expr {$direct eq $loaded}] $loaded
+} -cleanup {
+    removeFile $out
+} -result {1 {{11 0 NEW 5 CHANGED 1 boom 1} 11 0 5 CHANGED {read write read read}}}
+
+test audit.a02.error-restore {caller locals survive an artifact error path} -setup {
+    set script {incr x; error ARTIFACT-ERROR}
+    set out [makeFile "" audit-a02-error.tbcx]
+    tbcx::save $script $out
+} -body {
+    proc ::audit33::errorFrameRun {mode payload} {
+        set x 10
+        set code [catch {
+            if {$mode eq "eval"} {eval $payload} else {tbcx::load $payload}
+        } message]
+        list $code $message $x
+    }
+    set direct [::audit33::errorFrameRun eval $script]
+    set loaded [::audit33::errorFrameRun load $out]
+    list [expr {$direct eq $loaded}] $loaded
+} -cleanup {
+    catch {rename ::audit33::errorFrameRun {}}
+    removeFile $out
+} -result {1 {1 ARTIFACT-ERROR 11}}
+
+test audit.a02.nonzero-local {serialized local slot links to caller variable} -setup {
+    set out [makeFile "" audit-a02-local-slot.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set codeStart [dict get $layout codeStart]
+    # Keep the leading `return` command and replace its second five-byte push
+    # with Tcl 9.1's loadScalar4 (opcode 11), targeting local slot zero.
+    set valuePc [expr {$codeStart + 5}]
+    set data [::audit33::setByte $data $valuePc 11]
+    set data [::audit33::putU32BE $data [expr {$valuePc + 1}] 0]
+    set data [::audit33::putU32LE $data 32 1]
+    set numLocalsAt [dict get $layout numLocalsAt]
+    set data [::audit33::putU32LE $data $numLocalsAt 1]
+    set insertAt [dict get $layout afterLocals]
+    set localRecord [binary format c* {1 0 0 0 120}]
+    set data [::audit33::replaceBytes $data $insertAt \
+        [expr {$insertAt - 1}] $localRecord]
+    ::audit33::writeBinary $out $data
+
+    proc ::audit33::localSlotCaller {path} {
+        set x CALLER-VALUE
+        list [tbcx::load $path] $x
+    }
+    ::audit33::localSlotCaller $out
+} -cleanup {
+    catch {rename ::audit33::localSlotCaller {}}
+    removeFile $out
+} -result {CALLER-VALUE CALLER-VALUE}
+
+test audit.a02.uplevel-namespace {documented uplevel wrapper matches eval} -setup {
+    set script {
+        incr x
+        variable nsValue
+        append nsValue :loaded
+        list $x $nsValue [namespace current]
+    }
+    set out [makeFile "" audit-a02-uplevel.tbcx]
+    tbcx::save $script $out
+    namespace eval ::audit33::callerScope {
+        variable nsValue BASE
+        proc dispatch {mode payload} {
+            uplevel 1 [list $mode $payload]
+        }
+        proc run {mode payload} {
+            variable nsValue
+            set nsValue BASE
+            set x 40
+            if {$mode eq "eval"} {
+                set value [dispatch eval $payload]
+            } else {
+                set value [dispatch tbcx::load $payload]
+            }
+            list $value $x $nsValue
+        }
+    }
+} -body {
+    set direct [::audit33::callerScope::run eval $script]
+    set loaded [::audit33::callerScope::run load $out]
+    list [expr {$direct eq $loaded}] $loaded
+} -cleanup {
+    catch {namespace delete ::audit33::callerScope}
+    removeFile $out
+} -result {1 {{41 BASE:loaded ::audit33::callerScope} 41 BASE:loaded}}
+
+test audit.a03.invalid-opcode {invalid opcode is rejected before evaluation} -setup {
+    set out [makeFile "" audit-a03-opcode.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    lassign [::audit33::topLayout $data] codeStart codeLen literalAt
+    set data [::audit33::setByte $data $codeStart 255]
+    ::audit33::writeBinary $out $data
+    set loadRc [catch {tbcx::load $out} loadMsg]
+    set dumpRc [catch {tbcx::dump $out} dumpMsg]
+    list $loadRc [string match {*invalid opcode*} $loadMsg] \
+         $dumpRc [string match {*invalid opcode*} $dumpMsg]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1 1}
+
+test audit.a03.literal-index {out-of-range literal operand is rejected} -setup {
+    set out [makeFile "" audit-a03-literal.tbcx]
+    tbcx::save {return SAFE-LITERAL} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    lassign [::audit33::topLayout $data] codeStart codeLen literalAt
+    set numLits [::audit33::getU32LE $data $literalAt]
+    # This fixture starts with push4: opcode byte followed by a u32 literal.
+    set data [::audit33::putU32LE $data [expr {$codeStart + 1}] $numLits]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*literal index*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.truncated-instruction {truncated multi-byte opcode is rejected} -setup {
+    set out [makeFile "" audit-a03-truncated.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    lassign [::audit33::topLayout $data] codeStart codeLen literalAt
+    binary scan [string index $data $codeStart] c firstOpcode
+    set data [::audit33::setByte $data \
+        [expr {$codeStart + $codeLen - 1}] $firstOpcode]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*truncated instruction*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.local-index {out-of-range local operand is rejected} -setup {
+    set out [makeFile "" audit-a03-local.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    lassign [::audit33::topLayout $data] codeStart codeLen literalAt
+    # Replace leading push4 with loadScalar4 (same width); top has zero locals.
+    set data [::audit33::setByte $data $codeStart 11]
+    set data [::audit33::putU32BE $data [expr {$codeStart + 1}] 0]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*local index*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.aux-index {out-of-range AuxData operand is rejected} -setup {
+    set out [makeFile "" audit-a03-aux.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    # jumpTable is opcode 114 in the exact Tcl 9.1 producer pinned by the
+    # artifact header and has the same five-byte shape as push4.
+    set codeStart [dict get $layout codeStart]
+    set data [::audit33::setByte $data $codeStart 114]
+    set data [::audit33::putU32BE $data [expr {$codeStart + 1}] 0]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*aux index*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.jump-targets {jumps outside and inside instructions are rejected} -setup {
+    set out [makeFile "" audit-a03-jump.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set original [::audit33::readBinary $out]
+    set layout [::audit33::topSections $original]
+    set codeStart [dict get $layout codeStart]
+    # jump4 is opcode 35 and, like the leading push4, is five bytes.
+    set original [::audit33::setByte $original $codeStart 35]
+    set operandAt [expr {$codeStart + 1}]
+    set checks {}
+    foreach encoded {1 2147483647 2147483648} {
+        set data [::audit33::putU32BE $original $operandAt $encoded]
+        ::audit33::writeBinary $out $data
+        set rc [catch {tbcx::load $out} msg]
+        lappend checks [expr {$rc && [string match {*off-boundary*} $msg]}]
+    }
+    set checks
+} -cleanup {
+    removeFile $out
+} -result {1 1 1}
+
+test audit.a03.string-jumptable-target {bad string jump-table target is rejected} -setup {
+    set out [makeFile "" audit-a03-jt-string.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set codeStart [dict get $layout codeStart]
+    set data [::audit33::setByte $data $codeStart 114]
+    set data [::audit33::putU32BE $data [expr {$codeStart + 1}] 0]
+    set record [::audit33::packU32LE 1]
+    append record [::audit33::packU32LE 0] \
+        [::audit33::packU32LE 1] [::audit33::packU32LE 1] x \
+        [::audit33::packU32LE 1]
+    set auxAt [dict get $layout auxCountAt]
+    set data [::audit33::replaceBytes $data $auxAt [expr {$auxAt + 3}] \
+        $record]
+    set data [::audit33::putU32LE $data 28 1]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*jump-table*off-boundary*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.numeric-jumptable-target {bad numeric jump-table target is rejected} -setup {
+    set out [makeFile "" audit-a03-jt-number.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set codeStart [dict get $layout codeStart]
+    # Tcl 9.1's jumpTableNum opcode is 204, also with one AUX4 operand.
+    set data [::audit33::setByte $data $codeStart 204]
+    set data [::audit33::putU32BE $data [expr {$codeStart + 1}] 0]
+    set record [::audit33::packU32LE 1]
+    append record [::audit33::packU32LE 1] \
+        [::audit33::packU32LE 1] [::audit33::packU64LE 5] \
+        [::audit33::packU32LE 1]
+    set auxAt [dict get $layout auxCountAt]
+    set data [::audit33::replaceBytes $data $auxAt [expr {$auxAt + 3}] \
+        $record]
+    set data [::audit33::putU32LE $data 28 1]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*jump-table*off-boundary*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a03.exception-boundary {malformed exception boundary is rejected} -setup {
+    set out [makeFile "" audit-a03-exception.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    # Insert one LOOP range whose protected span starts in the middle of the
+    # leading push4 instruction.  All scalar bounds are otherwise valid.
+    set record [binary format c 0]
+    append record [::audit33::packU32LE 0] \
+        [::audit33::packU32LE 1] [::audit33::packU32LE 1] \
+        [::audit33::packU32LE 4294967295] \
+        [::audit33::packU32LE 4294967295] \
+        [::audit33::packU32LE 4294967295]
+    set countAt [dict get $layout exceptionCountAt]
+    set section [::audit33::packU32LE 1]
+    append section $record
+    set data [::audit33::replaceBytes $data $countAt [expr {$countAt + 3}] \
+        $section]
+    set data [::audit33::putU32LE $data 20 1]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*exception range*boundary*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a04.legacy-format {irrecoverable format-92 artifacts are rejected} -setup {
+    set out [makeFile "" audit-a04-format.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::putU32LE [::audit33::readBinary $out] 4 92]
+    ::audit33::writeBinary $out $data
+    set loadRc [catch {tbcx::load $out} loadMsg]
+    set dumpRc [catch {tbcx::dump $out} dumpMsg]
+    list $loadRc [string match {*bad header*} $loadMsg] \
+         $dumpRc [string match {*bad header*} $dumpMsg]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1 1}
+
+test audit.a05.concurrent-save {processes never share or leave staging files} -setup {
+    set out [makeFile "" audit-a05-shared.tbcx]
+    set workers {}
+    set channels {}
+} -body {
+    for {set i 0} {$i < 4} {incr i} {
+        set worker "package require -exact tbcx 1.2.1\n"
+        append worker [list set target $out] "\n"
+        append worker [list set source "return WRITER-$i"] "\n"
+        append worker {for {set n 0} {$n < 20} {incr n} {
+            tbcx::save $source $target
+        }} "\n"
+        set path [makeFile $worker audit-a05-worker-$i.tcl]
+        lappend workers $path
+        lappend channels [open |[list [info nameofexecutable] $path] r]
+    }
+    foreach ch $channels {
+        read $ch
+        close $ch
+    }
+    set result [tbcx::load $out]
+    list [expr {$result in {WRITER-0 WRITER-1 WRITER-2 WRITER-3}}] \
+         [llength [glob -nocomplain -- ${out}.tbcx.*.tmp]]
+} -cleanup {
+    foreach ch $channels {catch {close $ch}}
+    foreach path $workers {removeFile $path}
+    removeFile $out
+} -result {1 0}
+
+test audit.a05.failed-save {failed serialization preserves output and removes staging file} -setup {
+    set out [makeFile ORIGINAL audit-a05-failed.tbcx]
+} -body {
+    set invalid {
+        oo::object create ::AuditUnrepresentableObject
+        oo::objdefine ::AuditUnrepresentableObject {
+            self method impossible {} {return NEVER}
+        }
+    }
+    set rc [catch {tbcx::save $invalid $out} msg]
+    list $rc [expr {[::audit33::readBinary $out] eq "ORIGINAL\n"}] \
+         [llength [glob -nocomplain -- ${out}.tbcx.*.tmp]]
+} -cleanup {
+    removeFile $out
+} -result {1 1 0}
+
+test audit.a06.exact-tcl-version {patch/release producer mismatch is rejected} -setup {
+    set out [makeFile "" audit-a06-version.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set original [::audit33::readBinary $out]
+    set checks {}
+    # Bytes 8 and 9 are release type and patch in little-endian mmjjppTT.
+    foreach offset {8 9} {
+        binary scan [string index $original $offset] c old
+        set data [::audit33::setByte $original $offset \
+            [expr {($old + 1) & 255}]]
+        ::audit33::writeBinary $out $data
+        set rc [catch {tbcx::load $out} msg]
+        lappend checks [expr {$rc == 1 &&
+            [string match {*incompatible Tcl version*} $msg]}]
+    }
+    set checks
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a07.numeric-jumptable-portable {portable signed numeric keys round-trip} -setup {
+    set out [makeFile "" audit-a07-switch-portable.tbcx]
+} -body {
+    tbcx::save {
+        proc classify {x} {
+            switch -integer -- $x {
+                -2147483648 {return min32}
+                -1          {return negative}
+                0           {return zero}
+                2147483647  {return max32}
+                default     {return other}
+            }
+        }
+        list [classify -2147483648] [classify -1] [classify 0] \
+             [classify 2147483647] [classify 12]
+    } $out
+    tbcx::load $out
+} -cleanup {
+    removeFile $out
+} -result {min32 negative zero max32 other}
+
+test audit.a07.numeric-jumptable-wide {64-bit signed numeric keys round-trip} \
+        -constraints auditPtr64 -setup {
+    set out [makeFile "" audit-a07-switch.tbcx]
+} -body {
+    tbcx::save {
+        proc classify {x} {
+            switch -integer -- $x {
+                -9223372036854775808 {return min}
+                -1                   {return negative}
+                0                    {return zero}
+                9223372036854775807  {return max}
+                default              {return other}
+            }
+        }
+        list [classify -9223372036854775808] [classify -1] \
+             [classify 0] [classify 9223372036854775807] [classify 12]
+    } $out
+    tbcx::load $out
+} -cleanup {
+    removeFile $out
+} -result {min negative zero max other}
+
+test audit.a07.numeric-jumptable-32-reject {32-bit rejects unrepresentable key} \
+        -constraints auditPtr32 -setup {
+    set out [makeFile "" audit-a07-switch-reject.tbcx]
+    tbcx::save {
+        set x 1
+        switch -integer -- $x {
+            -2 {return M2} -1 {return M1} 0 {return Z}
+             1 {return P1}  2 {return P2} default {return D}
+        }
+    } $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set keyAt [expr {[lindex [dict get $layout jumpOffsets] 0] - 8}]
+    set data [::audit33::putU64LE $data $keyAt 9223372036854775807]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*not representable on this platform*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.wp5.procbody-install {prebuilt Proc retains Tcl marker-time semantics} -setup {
+    set out [makeFile "" audit-wp5-procbody.tbcx]
+    tbcx::save {
+        namespace eval ::AuditProcNs {
+            namespace export p
+            proc p {x {suffix S} args} {
+                return "$x:$suffix:[join $args ,]"
+            }
+        }
+        return READY
+    } $out
+} -body {
+    set i [interp create]
+    try {
+        $i eval [list set auto_path $::auto_path]
+        $i eval {package require -exact tbcx 1.2.1}
+        $i eval [list set artifact $out]
+        $i eval {
+            set ::commandTrace {}
+            proc ::recordCommandTrace {old new op} {
+                lappend ::commandTrace $op
+            }
+            namespace eval ::AuditProcNs {
+                namespace export p
+                proc p args {return OLD}
+            }
+            trace add command ::AuditProcNs::p delete ::recordCommandTrace
+            set loaded [tbcx::load $artifact]
+            namespace eval ::AuditConsumer {
+                namespace import ::AuditProcNs::p
+                set called [p 5 S a b]
+            }
+            list $loaded $::AuditConsumer::called \
+                [expr {$::commandTrace eq {delete}}] \
+                [info args ::AuditProcNs::p] \
+                [info default ::AuditProcNs::p suffix default] $default
+        }
+    } finally {
+        interp delete $i
+    }
+} -cleanup {
+    removeFile $out
+} -result {READY 5:S:a,b 1 {x suffix args} 1 S}
+
+test audit.a08.apply-reactivation {lambda shim returns after rename and recreation} -setup {
+    set out [makeFile "" audit-a08-lambda.tbcx]
+    # The lambda is an exact executable occurrence, so the saver elects a
+    # tag-9 compiled lambda instead of guessing from list shape alone.
+    tbcx::save {return [apply {x {set marker $x; return ORIGINAL}} 1]} $out
+} -body {
+    set i [interp create]
+    try {
+        $i eval [list set auto_path $::auto_path]
+        $i eval {package require -exact tbcx 1.2.1}
+        $i eval [list set artifact $out]
+        $i eval {
+            set r1 [tbcx::load $artifact]
+
+            rename apply savedApply
+            rename savedApply apply
+            set r2 [tbcx::load $artifact]
+
+            rename apply baseApply
+            interp alias {} apply {} baseApply
+            set r3 [tbcx::load $artifact]
+
+            rename apply {}
+            interp alias {} apply {} baseApply
+            set r4 [tbcx::load $artifact]
+            list $r1 $r2 $r3 $r4
+        }
+    } finally {
+        interp delete $i
+    }
+} -cleanup {
+    removeFile $out
+} -result {ORIGINAL ORIGINAL ORIGINAL ORIGINAL}
+
+test audit.a09.boolean-encoding {noncanonical boolean is rejected} -setup {
+    set out [makeFile "" audit-a09-bool.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set record [lindex [dict get $layout literalRecords] 1]
+    set recordAt [dict get $record at]
+    set recordEnd [dict get $record end]
+    # Replace the complete string record with BOOLEAN(2), shrinking the
+    # variable-length stream so the following record remains aligned.
+    set badBoolean [::audit33::putU32LE \
+        [binary format c* {0 0 0 0 2}] 0 1]
+    set data [::audit33::replaceBytes $data $recordAt \
+        [expr {$recordEnd - 1}] $badBoolean]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*invalid boolean*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a09.bignum-encoding {zero sign with magnitude is rejected} -setup {
+    set out [makeFile "" audit-a09-bignum.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set record [lindex [dict get $layout literalRecords] 1]
+    set recordAt [dict get $record at]
+    set recordEnd [dict get $record end]
+    # BIGNUM tag 0, sign 0, nonzero magnitude length 1, magnitude byte 1.
+    set badBignum [binary format c* {0 0 0 0 0 1 0 0 0 1}]
+    set data [::audit33::replaceBytes $data $recordAt \
+        [expr {$recordEnd - 1}] $badBignum]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    list $rc [string match {*invalid bignum*} $msg]
+} -cleanup {
+    removeFile $out
+} -result {1 1}
+
+test audit.a09.bignum-signs {nonzero signs require magnitude and sign is bounded} -setup {
+    set out [makeFile "" audit-a09-bignum-signs.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set original [::audit33::readBinary $out]
+    set layout [::audit33::topSections $original]
+    set record [lindex [dict get $layout literalRecords] 1]
+    set recordAt [dict get $record at]
+    set recordEnd [dict get $record end]
+    set checks {}
+    foreach replacement {
+        {0 0 0 0 1 0 0 0 0}
+        {0 0 0 0 2 0 0 0 0}
+        {0 0 0 0 3 1 0 0 0 1}
+    } {
+        set data [::audit33::replaceBytes $original $recordAt \
+            [expr {$recordEnd - 1}] [binary format c* $replacement]]
+        ::audit33::writeBinary $out $data
+        set rc [catch {tbcx::load $out} msg]
+        lappend checks [expr {$rc && [string match {*invalid bignum*} $msg]}]
+    }
+    set checks
+} -cleanup {
+    removeFile $out
+} -result {1 1 1}
+
+test audit.a09.wideuint {unsigned values above INT64_MAX become bignums} -setup {
+    set out [makeFile "" audit-a09-wideuint.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set layout [::audit33::topSections $data]
+    set record [lindex [dict get $layout literalRecords] 1]
+    set recordAt [dict get $record at]
+    set recordEnd [dict get $record end]
+    # WIDEUINT tag 8 followed by UINT64_MAX in little-endian wire order.
+    set replacement [binary format c* {
+        8 0 0 0 255 255 255 255 255 255 255 255
+    }]
+    set data [::audit33::replaceBytes $data $recordAt \
+        [expr {$recordEnd - 1}] $replacement]
+    ::audit33::writeBinary $out $data
+    tbcx::load $out
+} -cleanup {
+    removeFile $out
+} -result 18446744073709551615
+
+test audit.a09.method-kind {invalid method metadata is rejected by load and dump} -setup {
+    set out [makeFile "" audit-a09-method.tbcx]
+    tbcx::save {
+        oo::class create ::AuditMalformedClass {
+            method valid {} {return VALID}
+        }
+    } $out
+} -body {
+    set data [::audit33::readBinary $out]
+    set className ::AuditMalformedClass
+    set at [string last $className $data]
+    if {$at < 0} {error "method record class name not found"}
+    set kindAt [expr {$at + [string length $className]}]
+    set data [::audit33::setByte $data $kindAt 255]
+    ::audit33::writeBinary $out $data
+    set loadRc [catch {tbcx::load $out} loadMsg]
+    set dumpRc [catch {tbcx::dump $out} dumpMsg]
+    list $loadRc [string match {*invalid method kind*} $loadMsg] \
+         $dumpRc [string match {*invalid method kind*} $dumpMsg]
+} -cleanup {
+    catch {::AuditMalformedClass destroy}
+    removeFile $out
+} -result {1 1 1 1}
+
+test audit.a09.method-metadata-combinations {scope/origin/kind combinations are validated} -setup {
+    set out [makeFile "" audit-a09-method-combinations.tbcx]
+    tbcx::save {
+        oo::class create ::AuditMetadataClass {
+            method valid {} {return VALID}
+        }
+    } $out
+} -body {
+    set original [::audit33::readBinary $out]
+    set className ::AuditMetadataClass
+    set at [string last $className $original]
+    if {$at < 0} {error "method record class name not found"}
+    set kindAt [expr {$at + [string length $className]}]
+    set checks {}
+    foreach mutation {
+        {1 255 invalid\ method\ scope}
+        {2 255 invalid\ method\ origin}
+    } {
+        lassign $mutation delta value pattern
+        set data [::audit33::setByte $original [expr {$kindAt + $delta}] $value]
+        ::audit33::writeBinary $out $data
+        set rc [catch {tbcx::load $out} msg]
+        lappend checks [expr {$rc && [string match "*$pattern*" $msg]}]
+    }
+    # A classmethod record cannot claim object-definition origin.
+    set data [::audit33::setByte $original $kindAt 1]
+    set data [::audit33::setByte $data [expr {$kindAt + 2}] 1]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    lappend checks [expr {$rc && [string match {*invalid object-origin class method*} $msg]}]
+
+    # Constructors/destructors must not carry a method name.
+    set data [::audit33::setByte $original $kindAt 2]
+    ::audit33::writeBinary $out $data
+    set rc [catch {tbcx::load $out} msg]
+    lappend checks [expr {$rc && [string match {*has a method name*} $msg]}]
+    set checks
+} -cleanup {
+    catch {::AuditMetadataClass destroy}
+    removeFile $out
+} -result {1 1 1 1}
+
+test audit.a09.trailing-data {unexplained trailing bytes are rejected} -setup {
+    set out [makeFile "" audit-a09-trailing.tbcx]
+    tbcx::save {return SAFE} $out
+} -body {
+    set data [::audit33::readBinary $out]
+    append data [binary format c 88]
+    ::audit33::writeBinary $out $data
+    set loadRc [catch {tbcx::load $out} loadMsg]
+    set dumpRc [catch {tbcx::dump $out} dumpMsg]
+    list $loadRc [string match {*trailing data*} $loadMsg] \
+         $dumpRc [string match {*trailing data*} $dumpMsg]
+} -cleanup {
+    removeFile $out
+} -result {1 1 1 1}
+
+cleanupTests

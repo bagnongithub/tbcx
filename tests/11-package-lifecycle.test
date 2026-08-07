@@ -8,11 +8,22 @@ package require tcltest 2.5
 namespace import ::tcltest::*
 
 test pkg.1 {package lifecycle: require -> forget -> require} -body {
-    set v1 [package require tbcx]
+    set v1 [package require -exact tbcx 1.2.1]
     package forget tbcx
     # Require again after forgetting; should succeed (commands may already exist)
-    set v2 [package require tbcx]
+    set v2 [package require -exact tbcx 1.2.1]
     expr {$v1 eq $v2}
 } -result 1
+
+test pkg.2 {package version is exactly 1.2.1} -body {
+    package require -exact tbcx 1.2.1
+} -result 1.2.1
+
+test pkg.3 {the loaded library is the 1.2.1 binary} -body {
+    package require -exact tbcx 1.2.1
+    set hit [lsearch -inline -index 1 [info loaded] tbcx]
+    list [expr {[llength $hit] == 2}] \
+         [string match {*1.2.1*} [lindex $hit 0]]
+} -result {1 1}
 
 cleanupTests
