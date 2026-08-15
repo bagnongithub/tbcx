@@ -141,8 +141,8 @@ tbcx::gc</code></pre>
             <li><i>Writable channel</i> &mdash; an open channel; binary mode (<code>-translation binary -eofchar {}</code>) is enforced. The caller&rsquo;s channel settings are mutated and <i>not</i> restored. The channel is <i>not</i> closed.</li>
             <li><i>Writable path</i> &mdash; TBCX writes a temporary file in the target directory and renames it into place only after serialization succeeds, so a failed save never leaves a truncated artifact at the final path.</li>
           </ul>
-          <p><b>-include-source</b> &mdash; Optional flag. Embeds the authored source text of every <b>proc</b> and TclOO method body in the artifact as an LPString. Required when consumers depend on <b>info body</b>, <b>info class definition</b>, TIP #280 line attribution in stack traces, disassembly annotations, or introspection-based clone idioms (e.g. <code>proc $new [info args $src] [info body $src]</code>) to return the original authored text. Artifact size grows proportional to the aggregate source text of all procs and methods.</p>
-          <p><b>Default behavior (no -include-source):</b> Every proc/method body source field is emitted as an empty LPString. At load time the loader substitutes the diagnostic sentinel described in <a href='#source-preservation'>SOURCE PRESERVATION</a> below, so <b>info body</b> returns a loud string instead of silently returning empty. This matches the <i>tclcompiler</i>/<i>tbcload</i> precedent of stripping body source from compiled deployment output: deployment artifacts are typically distributed instead of source, and stripping keeps the artifact smaller and preserves the IP-protection angle.</p>
+          <p><b>-include-source</b> &mdash; Optional flag. Selects include-source policy and embeds the exact authored bytes in every executable-source field: <b>proc</b>, TclOO method, <b>TBCX_LIT_BYTESRC</b>, and lambda body. Use it when consumers depend on <b>info body</b>, <b>info class definition</b>, TIP #280 line attribution, disassembly annotations, or introspection-based clone idioms. Retained text is introspection data; execution still uses precompiled bytecode.</p>
+          <p><b>Default behavior (no -include-source):</b> Selects strict compiled-only policy. Every proc, method, BYTESRC, and lambda executable-source field is empty. Proc and method introspection receives the diagnostic sentinel described in <a href='#source-preservation'>SOURCE PRESERVATION</a>; stripped lambdas receive a separate list-shaped diagnostic representation. Ordinary Tcl literals remain in bytecode, so source stripping is not encryption.</p>
         </dd>
         <dt>Behavior</dt>
         <dd>
@@ -171,16 +171,11 @@ tbcx::gc</code></pre>
                 <b>eval</b>, <b>uplevel</b>, <b>time</b>, <b>timerate</b>,
                 <b>dict for</b>/<b>map</b>/<b>update</b>/<b>with</b>,
                 <b>lsort -command</b>, and <b>self method</b> bodies inside <b>oo::define</b>).</li>
-            <li>Performs two-phase instruction-level body detection: Phase 1 analyzes <b>invokeStk</b>
-                operand stack patterns; Phase 2 identifies unpushed literals from inline-compiled
-                <b>foreach</b>/<b>lmap</b> loops. Uses an O(1) opcode dispatch table covering all Tcl 9.1 instructions.</li>
-            <li>Preserves compiler-produced <b>startCommand</b> instructions. Compilation forces readiness
-                checks into self-contained optimized blocks; mixed epoch-sensitive blocks use generic
-                command dispatch so immutable bytecode remains correct after command redefinition.</li>
+            <li>Builds an occurrence-level executable-literal plan from generic <b>invokeStk</b> streams. The stack model identifies exact <b>push</b> instructions, so repeated equal scripts receive separate compiled records while equal data occurrences remain ordinary literals. Opcode handling uses an O(1) dispatch table covering Tcl 9.1 instructions.</li>
+            <li>Compiles nonzero-policy top-level, proc, method, lambda, and nested script blocks with generic command dispatch and marks them <b>TCL_BYTECODE_PRECOMPILED</b>.</li>
             <li>Detects bytearray literals (bytes &ge; 0x80) and emits them as <b>TBCX_LIT_BYTEARR</b>
                 to prevent UTF-8 encoding corruption.</li>
-            <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> (source text + compiled bytecode)
-                enabling cross-interpreter recompilation.</li>
+            <li>Body literals are emitted as <b>TBCX_LIT_BYTESRC</b> with namespace-bound compiled bytecode and a policy-controlled source field. Statically recognized <b>interp eval</b> literal crossings are rejected with <b>TBCX EVAL CROSSINTERP UNSUPPORTED</b>; no source fallback is used.</li>
             <li>When the input is a readable file path, the normalized path is recorded in the header via <b>Tcl_FSGetNormalizedPath</b> so the loader can restore <b>info script</b> to the authored value.</li>
             <li>Serializes the header, top-level block, Procs table (with per-proc source-text LPString),
                 Classes catalog (advisory, alphabetically sorted for deterministic output), and Methods
@@ -197,7 +192,7 @@ tbcx::gc</code></pre>
         <dd>Typical errors include: read error from the input channel or opened file; unwritable output;
             unknown/unsupported AuxData; size limit exceeded; runaway serialization
             (too many literals, blocks, excessive recursion depth, or output too large);
-            short read/write.</dd>
+            an unsupported statically recognized cross-interpreter script occurrence; or short read/write.</dd>
         <dt>Notes</dt>
         <dd>
           <ul>
@@ -243,10 +238,8 @@ try {
         <dt>Behavior</dt>
         <dd>
           <ul>
-            <li>Validates the header and exact packed producer version (major, minor, patch, and alpha/beta/final release type); deserializes sections.</li>
-            <li>Validates instruction and opcode boundaries, operands, literal/local/AuxData indices,
-                jump targets, exception metadata, and supported AuxData payloads before constructing
-                each Tcl ByteCode, then requires exact end-of-file before top-level execution.</li>
+            <li>Reads the bounded artifact into an owned, interpreter-neutral byte image and validates the header and exact packed producer version (major, minor, patch, and alpha/beta/final release type).</li>
+            <li>Completes a preflight pass over every section before constructing namespaces, Tcl objects, ByteCode, Proc, methods, or persistent shims. Preflight validates source policy and executable-source fields, opcodes and instruction boundaries, operands, literal/local/AuxData indices, jump targets, exception metadata, supported AuxData payloads, nested policy words, and exact end-of-file.</li>
             <li>If the header carries a recorded authored source path, reads it into a Tcl_Obj for <b>info script</b> restoration.</li>
             <li>Installs a temporary <b>ProcShim</b> that intercepts the <b>proc</b> command at the
                 authored definition marker. When the name and argument signature match, it passes
@@ -335,8 +328,7 @@ proc moduleLoad {path} {
         <dt>Parameters</dt>
         <dd><i>filename</i> &mdash; A readable path to a <code>.tbcx</code> file.</dd>
         <dt>Behavior</dt>
-        <dd>Reads the artifact and prints: header fields (including the authored source path when recorded); section summaries; literals and AuxData; exception ranges;
-            disassembly of the top-level, proc, method, and lambda bodies; and the
+        <dd>Validates through the same complete preflight path as <b>tbcx::load</b> and prints: header fields (including the authored source path and <b>sourcePolicy</b>); executable-source field, nonempty-field, and byte totals; section summaries; literals and AuxData; exception ranges; disassembly of the top-level, proc, method, and lambda bodies; and the
             preserved body source text (indented inline, no truncation) for each proc and method when the artifact was built with <b>-include-source</b>. For stripped artifacts (the default), each body record shows <code>source: &lt;stripped at save time&gt;</code>. Each method record also shows its visibility <b>scope</b> and <b>origin</b> (class-definition vs object-definition). Literal operands in the disassembly are annotated using the instruction table&rsquo;s operand types rather than instruction-name heuristics.</dd>
         <dt>Returns</dt>
         <dd>A string containing the formatted dump.</dd>
@@ -385,34 +377,28 @@ Procs: 1
 
       <h2 id='source-preservation'>SOURCE PRESERVATION</h2>
       <p>
-        Without <b>-include-source</b>, every proc and method body is emitted with an
-        empty source-text field on the wire, and the loader installs a two-line
-        diagnostic sentinel as the body&rsquo;s string representation:</p>
+        Without <b>-include-source</b>, every designated executable-source field
+        (proc, method/constructor/destructor, BYTESRC, and lambda body) is empty on
+        the wire. Ordinary Tcl literals remain in bytecode, so this is not encryption.
+        For proc and method bodies the loader installs this two-line diagnostic sentinel:</p>
       <pre><code># tbcx: body source stripped at save time; info body unavailable
 error "tbcx: introspection-based cloning is not supported for this artifact"</code></pre>
+      <p>The first line is a Tcl comment visible to introspection and traces. The second line raises an error if code copies and evaluates the diagnostic body.</p>
       <p>
-        The shape matches the canonical <i>tclcompiler</i> pattern (Compiler8.html,
-        &ldquo;Example 1: Cloning Procedures&rdquo;):</p>
-      <ul>
-        <li>A <b>#</b> comment line &mdash; shows up at the top of any error traceback,
-            making the cause visible at a glance.</li>
-        <li>An <b>error</b> call &mdash; so that if downstream code does
-            <code>proc new [info args orig] [info body orig]</code> and invokes <code>new</code>,
-            the clone fails loudly rather than silently running as a no-op.</li>
-      </ul>
+        Stripped lambda records use a separate fixed list-shaped diagnostic string.
+        Their registered <b>lambdaExpr</b> representation still holds the materialized
+        Proc. A newly constructed object containing only the diagnostic has lost TBCX
+        identity and fails instead of compiling an apparent authored body.</p>
       <p>
-        With <b>-include-source</b>, the authored source text is preserved in the
-        artifact and attached as the body Tcl_Obj&rsquo;s string representation via
-        <b>Tcl_InvalidateStringRep</b> + <b>Tcl_InitStringRep</b>. The ByteCode
-        internal representation is untouched; execution still uses the precompiled
-        bytecode. <b>info body</b>, <b>info class definition</b>,
+        With <b>-include-source</b>, exact authored bytes are preserved in all four
+        executable-source field kinds and attached for introspection as appropriate.
+        The ByteCode internal representation is untouched and PRECOMPILED; execution
+        still uses compiled material. <b>info body</b>, <b>info class definition</b>,
         <b>info class constructor</b>, and TIP #280 source attribution round-trip
         byte-for-byte.</p>
 
       <h2 id='file-format-overview'>FILE FORMAT (OVERVIEW)</h2>
-      <p>This section summarizes the on-disk structure. Format version is <b>93</b> (Tcl 9.1).
-         Legacy format 92 is rejected because its removed command-boundary instructions cannot be reconstructed.
-         All integers are little-endian.</p>
+      <p>This section summarizes the on-disk structure. Format version is <b>93</b> (Tcl 9.1). All integers are little-endian.</p>
       <dl class='deflist'>
         <dt>Header</dt>
         <dd>Magic (<code>0x58434254</code>) + format version (93) + producing Tcl version;
@@ -420,7 +406,7 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
             literal count, AuxData count, locals, max stack); authored source path LPString
             (empty for inline/channel inputs).</dd>
         <dt>Sections (order)</dt>
-        <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue);
+        <dd>(1) Top-level block (code, literals, AuxData, exceptions, locals epilogue including the source-policy u32; nested blocks keep that field zero);
             (2) Procs (FQN, ns, arg spec, body-source LPString, compiled block);
             (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top-level script);
             (4) Methods, in definition order (class FQN; kind u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self;
@@ -435,8 +421,10 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
             literal pairs; insertion order preserved), 4 double (IEEE-754 bits as u64), 5 list (element
             count, then nested literals), 6 string (LPString), 7 wideint (signed 64-bit as u64),
             8 wideuint (unsigned 64-bit), 9 <b>lambda-bytecode</b> (namespace FQN, arguments, compiled
-            block, body source text) for use with <b>apply</b>, and 10 bytesrc (source text, namespace
-            FQN, compiled block) enabling cross-interpreter recompilation.</dd>
+            block, policy-controlled body source text) for use with <b>apply</b>, and 10 bytesrc
+            (policy-controlled source text, namespace FQN, compiled block).</dd>
+        <dt>Source policy</dt>
+        <dd>Top policy 0 permits source-backed execution, 1 is strict compiled-only, and 2 is include-source. Saves write 1 by default or 2 with <b>-include-source</b>. Both nonzero policies execute PRECOMPILED material, and policy-zero format-93 artifacts remain readable.</dd>
         <dt>AuxData families</dt>
         <dd>jump tables (string or numeric), dictupdate, and NewForeachInfo.</dd>
       </dl>
@@ -463,9 +451,11 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         as a string key.</p>
       <p>
         The loader requires an exact major, minor, patch, and release-type Tcl producer match.
-        Before constructing ByteCode it validates instruction widths, literal/local/AuxData
-        indices, direct and jump-table targets, and exception boundaries. Reconstruction uses one
-        final packed ByteCode allocation and one copy of the instruction bytes, without
+        An interpreter-neutral image preflight validates source policy, source fields, section
+        totals and tags, opcode and instruction boundaries, literal/local/AuxData indices, direct
+        and jump-table targets, exception boundaries, nested policy words, and trailing bytes
+        before any interpreter-owned artifact material is constructed. Reconstruction uses one
+        final packed ByteCode allocation and one copy of each instruction stream, without
         compile-environment staging arrays.</p>
       <p>
         Loading evaluates the precompiled top-level in the caller&rsquo;s current namespace with
@@ -519,6 +509,8 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
         returns <b>TCL_ERROR</b> with a diagnostic message.</p>
       <p>
         Artifacts are designed to load into interpreters other than the originating one.
+        Statically recognized <b>interp eval</b> literal crossings are rejected with
+        <b>TBCX EVAL CROSSINTERP UNSUPPORTED</b>; retained source is not compiled as a fallback.
         Interpreter-specific state (ApplyShim lambda registry, load depth, OO shim state) is
         consolidated in a single per-interpreter record and cleaned up automatically when the
         interpreter is deleted. Shared process-wide state &mdash; the save-side opcode dispatch
@@ -555,7 +547,7 @@ error "tbcx: introspection-based cloning is not supported for this artifact"</co
          grant selective access.</p>
 
       <h2 id='see-also'>SEE ALSO</h2>
-      <p>source(n), TclOO(n), info(n), apply(n), interp(n), tclcompiler and tbcload (historical Tcl 8.x bytecode compiler and loader)</p>
+      <p>source(n), TclOO(n), info(n), apply(n), interp(n), tclcompiler and tbcload (Tcl 8.x bytecode tools)</p>
 
       <h2 id='copyright'>COPYRIGHT</h2>
       <p>&copy; 2025&ndash;2026 Miguel Banon</p>

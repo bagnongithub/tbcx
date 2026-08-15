@@ -826,7 +826,7 @@ foreach {pol_label pol_marker pol_script} {
 }
 
 # ===========================================================================
-# 16. Interleaved same-key redefinition (P3).  A method record is matched
+# 16. Interleaved same-key redefinition. A method record is matched
 # positionally — methodsByKey is a per-key FIFO consumed in definition order —
 # so an observation taken BETWEEN two definitions of the same method sees the
 # body in effect at that point, not the final body.  Affects class-instance,
@@ -911,7 +911,7 @@ test scope.redef.classobject.coexist {class-instance and class-object same-name 
 } -result {inst2 obj2}
 
 # ===========================================================================
-# 17. Narrow-edge verbatim (P4): a STANDALONE `oo::define CLS self method …`,
+# 17. Narrow-edge verbatim: a standalone `oo::define CLS self method …`,
 # `self { … }`, `private { … }`, or `private method …` whose method body / name /
 # args is non-literal cannot be precompiled.  The whole standalone command is
 # left VERBATIM (bodies run at load), matching `source`, instead of being

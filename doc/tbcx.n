@@ -408,15 +408,8 @@ For proc and method bodies the loader installs this two\-line diagnostic sentine
     error "tbcx: introspection-based cloning is not supported for this artifact"
 .fi
 .PP
-The shape matches the canonical \fItclcompiler\fR pattern (Compiler8.html,
-\"Example 1: Cloning Procedures\"):
-.IP \(bu 2
-A \fB#\fR comment line \(em shows up at the top of any error traceback,
-making the cause visible at a glance.
-.IP \(bu 2
-An \fBerror\fR call \(em so that if downstream code does
-\fCproc new [info args orig] [info body orig]\fR and invokes \fCnew\fR,
-the clone fails loudly rather than silently running as a no\-op.
+The first line is a Tcl comment visible to introspection and traces. The second
+line raises an error if code copies and evaluates the diagnostic body.
 .PP
 Stripped lambda records use a separate fixed list\-shaped diagnostic string.
 Their registered \fBlambdaExpr\fR representation still holds the materialized
@@ -442,8 +435,7 @@ Magic (0x58434254) + format version (93) + producing Tcl version; size/count met
 .TP
 .B Sections (order)
 (1) Top\-level block (code, literals, AuxData, exceptions, locals epilogue,
-including source policy in the formerly reserved u32; every nested block keeps
-that field zero);
+including the source\-policy u32; every nested block keeps that field zero);
 (2) Procs (FQN, ns, arg spec, body\-source LPString, compiled block);
 (3) Classes (advisory catalog of discovered class names; actual creation occurs at load time via the top\-level script);
 (4) Methods, in definition order (class FQN; kind u8: 0=inst, 1=class, 2=ctor, 3=dtor, 4=self; scope u8: 0=default, 1=public, 2=unexported, 3=TIP #500 true\-private \(em ctor/dtor always 0; origin u8: 0=class definition, 1=object definition; name \(em empty for ctor/dtor; args; body\-source LPString; compiled block).  Records are keyed at load by \fI(class FQN, kind, name, origin)\fR, so a class\-instance method and a per\-object method sharing a name coexist.
@@ -459,12 +451,10 @@ compiled block, policy\-controlled body source text) for use with \fBapply\fR,
 and 10 bytesrc (policy\-controlled source text, namespace FQN, compiled block).
 .TP
 .B Source policy
-Top policy 0 denotes a legacy format\-93 artifact, 1 strict compiled\-only,
-and 2 include\-source. New saves write 1 by default or 2 with
-\fB\-include\-source\fR. Both nonzero policies execute PRECOMPILED material.
-Legacy policy\-zero artifacts remain readable. Older r91 loaders reject new
-artifacts because they require the formerly reserved word to be zero; no package,
-format, compatibility, or literal tag number changed.
+Top policy 0 permits source\-backed execution, 1 is strict compiled\-only,
+and 2 is include\-source. Saves write 1 by default or 2 with
+\fB\-include\-source\fR. Both nonzero policies execute PRECOMPILED material,
+and policy\-zero format\-93 artifacts remain readable.
 .TP
 .B AuxData families
 jump tables (string or numeric), dictupdate, and NewForeachInfo.
@@ -557,9 +547,9 @@ with a diagnostic message.
 .PP
 The same artifact may be loaded independently into interpreters other than the
 originating one. Moving an already-materialized embedded script object between
-interpreters is not currently supported: pending owner approval for the proposed
-private interp shim, a statically recognized literal \fBinterp eval\fR crossing
-fails at save with \fBTBCX EVAL CROSSINTERP UNSUPPORTED\fR. Strict and
+interpreters is not supported. A statically recognized literal
+\fBinterp eval\fR crossing fails at save with
+\fBTBCX EVAL CROSSINTERP UNSUPPORTED\fR. Strict and
 include\-source artifacts never recompile retained text. Interpreter\-specific state (ApplyShim lambda registry,
 load depth, OO shim state) is consolidated in a single per\-interpreter
 record and cleaned up automatically when the interpreter is deleted.
@@ -597,7 +587,7 @@ Safe interpreters receive no \fBtbcx::*\fR commands by default; use
 grant selective access.
 
 .SH SEE ALSO
-source(n), TclOO(n), info(n), apply(n), interp(n), tclcompiler and tbcload (historical Tcl 8.x bytecode compiler and loader)
+source(n), TclOO(n), info(n), apply(n), interp(n), tclcompiler and tbcload (Tcl 8.x bytecode tools)
 
 .SH COPYRIGHT
 \[co] 2025\-2026 Miguel Banon

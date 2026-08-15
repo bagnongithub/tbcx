@@ -453,7 +453,7 @@ test af.19 {info: commands, procs, args, exists} -body {
     featureRoundtrip af19 $script
 } -result 6
 
-# === 20. OO advanced interaction — split into sub-tests for crash isolation ===
+# === 20. OO advanced interactions run in separate sub-tests ===
 test af.20a {OO: basic class with variable + constructor + method} -body {
     set script $H
     append script {

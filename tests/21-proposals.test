@@ -472,7 +472,7 @@ test p4.3 {P4: constructor with default args} -body {
 } -result {42 99}
 
 # =====================================================================
-# Precompile OO builder stubs (subsumed by P1/P6)
+# Precompile TclOO builder stubs.
 #
 # Classes using the builder form should still load correctly.
 # =====================================================================
@@ -592,14 +592,8 @@ test p8.1 {P8: proc body source statements not in dump} -body {
 } -result {0 333}
 
 test p8.2 {P8: proc body source stripped by default, preserved with -include-source} -body {
-    # Proc body source is stripped by default — matching the 25-year
-    # TclPro/tbcload precedent for Tcl AOT compile output.  The loader
-    # substitutes a diagnostic sentinel so `info body` returns a loud
-    # string rather than silently returning empty.  The `-include-source`
-    # flag opts in to preserving source, required for introspection
-    # idioms (cloneRule, info class definition, TIP #280 attribution).
-    # This test validates both modes: default (source absent, sentinel
-    # installed) and -include-source (source present).
+    # Default artifacts expose a diagnostic sentinel. Include-source
+    # artifacts expose the authored proc body.
     set in [makeFile {
         proc p8secret2 {} {
             set P8Y_A "alpha"

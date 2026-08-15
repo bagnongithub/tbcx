@@ -273,7 +273,7 @@ test f4.4 {F4: script with many top-level commands} -body {
 # =====================================================================
 # Checked-multiply for allocations
 #
-# Verify that large but valid jump tables and class tables don't crash.
+# Large valid jump tables and class tables are accepted.
 # =====================================================================
 
 test f5.1 {F5: large jump table (string)} -body {

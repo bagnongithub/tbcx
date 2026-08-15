@@ -1,5 +1,5 @@
 # -*-Tcl-*-
-# 33-audit-fixes.test — regressions for the independent release audit.
+# Artifact safety and runtime behavior checks.
 
 package require -exact tbcx 1.2.1
 package require tcltest 2.5

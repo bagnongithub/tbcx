@@ -10,8 +10,7 @@
  *
  *   Per-interpreter state (ApplyShim, load depth, OO shim hidden-ID
  *   counter) is consolidated in TbcxInterpState, attached via
- *   Tcl_SetAssocData.  No mutex is needed for this state because
- *   each interpreter is used by exactly one thread.
+ *   Tcl_SetAssocData, and accessed by the interpreter-owning thread.
  *
  *   Proc structs created by TBCX (in ReadProc, ReadMethod, ReadLit_LambdaBC,
  *   and the top-level evaluation helper)
@@ -19,9 +18,8 @@
  *   refCount fields are therefore safe to manipulate without a mutex.
  *
  *   FixLiteralPoolProcPtr propagates procPtr as a non-owning backpointer
- *   to nested bytecode literals in the same literal pool.  No refCount
- *   manipulation is needed because ByteCode.procPtr is a non-owning
- *   backpointer — TclReleaseByteCode does not decrement it.
+ *   to nested bytecode literals in the same literal pool.
+ *   TclReleaseByteCode does not decrement ByteCode.procPtr.
  *
  *   Global state (tbcxTyBytecode, opcode cache, etc.) is initialized
  *   under tbcxTypeMutex with acquire/release fencing on tbcxTypesLoaded.
@@ -40,9 +38,9 @@
  * warning level /W3 it does not flag an unreferenced static function
  * (C4505 is a level-4 warning), so an empty expansion is safe there. */
 #if defined(__GNUC__) || defined(__clang__)
-#  define TBCX_MAYBE_UNUSED __attribute__((unused))
+#define TBCX_MAYBE_UNUSED __attribute__((unused))
 #else
-#  define TBCX_MAYBE_UNUSED
+#define TBCX_MAYBE_UNUSED
 #endif
 
 /* ==========================================================================
@@ -57,7 +55,8 @@
  * deterministic loader work; release builds contain neither storage nor
  * counter updates and do not expose the tbcx::benchstats command. */
 #ifdef TBCX_BENCH_COUNTERS
-typedef struct {
+typedef struct
+{
     _Atomic uint64_t bytecodeBlocks;
     _Atomic uint64_t codeCopyOps;
     _Atomic uint64_t codeBytesCopied;
@@ -81,9 +80,8 @@ typedef struct {
 
 static TbcxBenchCounters tbcxBench;
 
-#define TBCX_BENCH_ADD(field_, value_) \
-    ((void)atomic_fetch_add_explicit(&tbcxBench.field_, \
-        (uint64_t)(value_), memory_order_relaxed))
+#define TBCX_BENCH_ADD(field_, value_)                                                                                           \
+    ((void)atomic_fetch_add_explicit(&tbcxBench.field_, (uint64_t)(value_), memory_order_relaxed))
 #define TBCX_BENCH_INC(field_) TBCX_BENCH_ADD(field_, 1u)
 #else
 #define TBCX_BENCH_ADD(field_, value_) ((void)0)
@@ -91,8 +89,7 @@ static TbcxBenchCounters tbcxBench;
 #endif
 
 #ifdef TBCX_BENCH_COUNTERS
-void
-Tbcx_BenchUnsupportedCrossInterpReject(void)
+void Tbcx_BenchUnsupportedCrossInterpReject(void)
 {
     TBCX_BENCH_INC(unsupportedCrossInterpRejects);
 }
@@ -102,39 +99,41 @@ Tbcx_BenchUnsupportedCrossInterpReject(void)
  * Type definitions
  * ========================================================================== */
 
-typedef struct {
-    Tcl_HashTable      procsByFqn;       /* key: FQN const char* (TCL_STRING_KEYS), val: Tcl_Obj* pair {args, procbody} */
-    Tcl_Obj          **procsByIdx;       /* indexed array [0..numProcsIdx-1] for marker lookup */
-    uint32_t           numProcsIdx;      /* size of procsByIdx array */
-    Command           *procCmdPtr;       /* the "proc" Command struct (NULL if invalidated) */
-    Tcl_Interp        *interp;           /* owning interpreter (for trace removal) */
-    int                traceInstalled;   /* 1 if command trace is active on "proc" */
-    Tcl_ObjCmdProc2   *savedObjProc2;    /* saved objProc2 handler */
-    Tcl_ObjCmdProc2   *savedNreProc2;    /* saved nreProc2 handler (may be NULL) */
-    void              *savedClientData2; /* saved objClientData2 */
+typedef struct
+{
+    Tcl_HashTable procsByFqn;       /* key: FQN const char* (TCL_STRING_KEYS), val: Tcl_Obj* pair {args, procbody} */
+    Tcl_Obj** procsByIdx;           /* indexed array [0..numProcsIdx-1] for marker lookup */
+    uint32_t numProcsIdx;           /* size of procsByIdx array */
+    Command* procCmdPtr;            /* the "proc" Command struct (NULL if invalidated) */
+    Tcl_Interp* interp;             /* owning interpreter (for trace removal) */
+    int traceInstalled;             /* 1 if command trace is active on "proc" */
+    Tcl_ObjCmdProc2* savedObjProc2; /* saved objProc2 handler */
+    Tcl_ObjCmdProc2* savedNreProc2; /* saved nreProc2 handler (may be NULL) */
+    void* savedClientData2;         /* saved objClientData2 */
 } ProcShim;
 
-typedef struct {
-    Tcl_HashTable    methodsByKey;         /* key: STRING "class\x1Fkind\x1Forigin\x1Fname",
-                                              val: Tcl_Obj* FIFO list of {args, procbody, scope}
-                                              triples in definition (serialization) order.  A
-                                              definition site consumes the front element via
-                                              OOShim_TakeRecord, so interleaved same-key
-                                              redefinitions install the correct body at each site. */
-    Tcl_Obj         *retired;              /* list owning every triple already consumed from a
-                                              methodsByKey FIFO; keeps each precompiled body (and
-                                              its Proc) alive until DelOOShim. */
-    Command         *defineCmdPtr;         /* cached oo::define Command (NULL if invalidated by rename/delete) */
-    Command         *objdefCmdPtr;         /* cached oo::objdefine Command (NULL if invalidated) */
-    int              defineTraceInstalled; /* 1 if command trace is active on oo::define */
-    int              objdefTraceInstalled; /* 1 if command trace is active on oo::objdefine */
-    Tcl_ObjCmdProc2 *savedDefineProc;
-    Tcl_ObjCmdProc2 *savedDefineNre;
-    void            *savedDefineCD;
-    Tcl_ObjCmdProc2 *savedObjdefProc;
-    Tcl_ObjCmdProc2 *savedObjdefNre;
-    void            *savedObjdefCD;
-    int              hasObjDefine; /* 1 if oo::objdefine was successfully shimmed */
+typedef struct
+{
+    Tcl_HashTable methodsByKey; /* key: STRING "class\x1Fkind\x1Forigin\x1Fname",
+                                   val: Tcl_Obj* FIFO list of {args, procbody, scope}
+                                   triples in definition (serialization) order.  A
+                                   definition site consumes the front element via
+                                   OOShim_TakeRecord, so interleaved same-key
+                                   redefinitions install the correct body at each site. */
+    Tcl_Obj* retired;           /* list owning every triple already consumed from a
+                                   methodsByKey FIFO; keeps each precompiled body (and
+                                   its Proc) alive until DelOOShim. */
+    Command* defineCmdPtr;      /* cached oo::define Command (NULL if invalidated by rename/delete) */
+    Command* objdefCmdPtr;      /* cached oo::objdefine Command (NULL if invalidated) */
+    int defineTraceInstalled;   /* 1 if command trace is active on oo::define */
+    int objdefTraceInstalled;   /* 1 if command trace is active on oo::objdefine */
+    Tcl_ObjCmdProc2* savedDefineProc;
+    Tcl_ObjCmdProc2* savedDefineNre;
+    void* savedDefineCD;
+    Tcl_ObjCmdProc2* savedObjdefProc;
+    Tcl_ObjCmdProc2* savedObjdefNre;
+    void* savedObjdefCD;
+    int hasObjDefine; /* 1 if oo::objdefine was successfully shimmed */
 } OOShim;
 
 /* ApplyShim — persistent interceptor on the [apply] command.
@@ -149,48 +148,52 @@ typedef struct {
  * in .tbcx files. */
 #define TBCX_INTERP_STATE_KEY "tbcx::interpState"
 
-typedef struct {
-    Proc    *procPtr; /* precompiled Proc (we hold a refcount) */
-    Tcl_Obj *nsObj;   /* namespace for lambdaExpr internal rep */
+typedef struct
+{
+    Proc* procPtr;  /* precompiled Proc (we hold a refcount) */
+    Tcl_Obj* nsObj; /* namespace for lambdaExpr internal rep */
 } ApplyLambdaEntry;
 
-typedef struct {
-    Command         *applyCmdPtr;    /* cached "apply" Command (NULL if invalidated) */
-    Tcl_Interp      *interp;         /* owning interpreter (for trace removal) */
-    int              traceInstalled; /* 1 if command trace is active on "apply" */
-    Tcl_ObjCmdProc2 *savedApplyProc;
-    Tcl_ObjCmdProc2 *savedApplyNre; /* saved nreProc2 handler (may be NULL) */
-    void            *savedApplyCD;
-    Tcl_HashTable    lambdaRegistry; /* key: ONE_WORD (Tcl_Obj *), val: ApplyLambdaEntry* */
-    Tcl_Size         numRegistered;  /* Count of registered lambdas.
-                                        When 0, CmdApplyShim bypasses hash lookup
-                                        and forwards directly to savedApplyProc. */
+typedef struct
+{
+    Command* applyCmdPtr; /* cached "apply" Command (NULL if invalidated) */
+    Tcl_Interp* interp;   /* owning interpreter (for trace removal) */
+    int traceInstalled;   /* 1 if command trace is active on "apply" */
+    Tcl_ObjCmdProc2* savedApplyProc;
+    Tcl_ObjCmdProc2* savedApplyNre; /* saved nreProc2 handler (may be NULL) */
+    void* savedApplyCD;
+    Tcl_HashTable lambdaRegistry; /* key: ONE_WORD (Tcl_Obj *), val: ApplyLambdaEntry* */
+    Tcl_Size numRegistered;       /* Count of registered lambdas.
+                                     When 0, CmdApplyShim bypasses hash lookup
+                                     and forwards directly to savedApplyProc. */
 } ApplyShim;
 
 /* TbcxInterpState — consolidated per-interpreter state.
  * Attached via Tcl_SetAssocData under TBCX_INTERP_STATE_KEY.
  * Created lazily on first tbcx::load; destroyed when the interpreter
  * is deleted. */
-typedef struct {
-    Tcl_Interp *interp;
-    ApplyShim   apply;        /* embedded — no separate heap allocation */
-    int         applyActive;  /* 1 once lambda recovery state is active */
-    Tcl_Size    loadDepth;    /* reentrancy depth for tbcx::load */
-    uint64_t    nextHiddenId; /* per-interp OO shim rename counter */
+typedef struct
+{
+    Tcl_Interp* interp;
+    ApplyShim apply;       /* embedded — no separate heap allocation */
+    int applyActive;       /* 1 once lambda recovery state is active */
+    Tcl_Size loadDepth;    /* reentrancy depth for tbcx::load */
+    uint64_t nextHiddenId; /* per-interp OO shim rename counter */
 } TbcxInterpState;
 
-typedef struct {
-    Var        *oldLocals;
-    Tcl_Size    oldNum;
-    LocalCache *oldCache;
-    Var        *allocated;
+typedef struct
+{
+    Var* oldLocals;
+    Tcl_Size oldNum;
+    LocalCache* oldCache;
+    Var* allocated;
     /* Frame pointer captured at TopLocals_Begin so TopLocals_End can
      * restore the exact same frame.  Begin chooses varFramePtr (the
      * active frame at eval time), but between Begin and End the interp
      * may push/pop frames.  Recording the pointer here avoids using
      * whichever frame is active at End time. */
-    CallFrame  *frame;
-    int         installed; /* frame fields were replaced by an overlay */
+    CallFrame* frame;
+    int installed; /* frame fields were replaced by an overlay */
 } TbcxTopFrameSave;
 
 /* Runaway detection limits */
@@ -202,118 +205,155 @@ typedef struct {
  * Forward Declarations
  * ========================================================================== */
 
-static int         AddOOShim(Tcl_Interp *ip, OOShim *os);
-static int         AddProcShim(Tcl_Interp *ip, ProcShim *ps);
-static void        ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
-static void        ApplyShimTeardown(ApplyShim *as, Tcl_Interp *ip);
-static void        ApplyShimPurgeStale(ApplyShim *as);
-static Tcl_Obj    *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned char *code, uint32_t codeLen, Tcl_Obj **lits, uint32_t numLits, AuxData *auxArr, uint32_t numAux, ExceptionRange *exArr,
-                               uint32_t numEx, int maxStackDepth, int setPrecompiled);
-static int         CmdApplyShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static int         CmdApplyShimNre(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static int         CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static int         CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static int         CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]);
-static void        CompiledLocals(Proc *procPtr, Tcl_Size neededCount);
-static int         DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt, int scope);
-static int         TbcxApplyExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *name, int makePublic);
-static int         PairScope(Tcl_Interp *ip, Tcl_Obj *pair);
-static void        DelOOShim(Tcl_Interp *ip, OOShim *os);
-static void        DelProcShim(Tcl_Interp *ip, ProcShim *ps);
-static ApplyShim  *EnsureApplyShim(Tcl_Interp *ip);
-static void        FixCompiledLocalNames(Proc *procPtr, LocalCache *lc);
-static int         LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePath);
-static int         MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj *name);
-static void        OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
-static void        OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
-static void        OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *const objv[], Tcl_Obj *clsFqn, Tcl_DString *keyDs, uint8_t *kindOut, Tcl_Size *bodyIdxOut, Tcl_Obj **runtimeArgsOut,
-                                         Tcl_Obj **nameOOut, Tcl_Obj **tmpEmptyArgsOut, int *hasKeyOut);
-static Tcl_Obj    *OOShim_TakeRecord(OOShim *os, const char *key);
-static int         PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *builderBody);
-static int         PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *builderBody);
-static Tcl_Obj    *ReconstructBuilderMetadata(Tcl_Interp *ip, Tcl_Obj *body, int depth);
-static int         ObjBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *builderBody, Tcl_HashTable *namesOut, int *sawUnsupportedBodyFormOut, int *anyVerbatimOut);
-static void        ClassBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *builderBody, Tcl_HashTable *keysOut);
-static int         DefOOObj(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody);
-static void        ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags);
-static inline void R_Error(TbcxIn *r, const char *msg);
-int                Tbcx_ReadExecutableSource(TbcxIn *r,
-                                             TbcxExecSourceKind kind,
-                                             char **sp, uint32_t *lenp);
-static int         ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut);
-static int         ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut);
-static void        FreeAuxArrayOwned(AuxData *arr, uint32_t n);
-static int         ValidateBlockOperands(Tcl_Interp *ip,
-                        const unsigned char *code, uint32_t codeLen,
-                        uint32_t numLits, uint32_t numAux,
-                        uint32_t numLocals, AuxData *auxArr,
-                        ExceptionRange *exArr, uint32_t numEx);
-static Tcl_Obj    *ReadLit_Bignum(TbcxIn *r);
-static Tcl_Obj    *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly);
-static Tcl_Obj    *ReadLiteral(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly);
-static int         ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os);
-static int         ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx);
-static inline void RefreshBC(ByteCode *bcPtr, Tcl_Interp *ip, Namespace *nsPtr);
-static void        FixLiteralPoolProcPtr(ByteCode *bcPtr);
-static void        NullLiteralPoolProcPtr(ByteCode *bcPtr, Proc *target);
-static void        RegisterPrecompiledLambda(Tcl_Interp *ip, Tcl_Obj *lambda, Proc *procPtr, Tcl_Obj *nsObj);
-Tcl_Namespace     *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn);
-int                Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
-inline int         Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n);
-void               Tbcx_R_Init(TbcxIn *r, Tcl_Interp *ip, Tcl_Channel ch);
-inline int         Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
-inline int         Tbcx_R_U32(TbcxIn *r, uint32_t *vp);
-inline int         Tbcx_R_U64(TbcxIn *r, uint64_t *vp);
-inline int         Tbcx_R_U8(TbcxIn *r, uint8_t *v);
-Tcl_Obj           *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly, uint32_t *topPolicyOut);
-int                Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
-void               TbcxApplyShimPurgeAll(Tcl_Interp *ip);
-static ByteCode   *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
-                               Namespace *nsPtr, const unsigned char *code,
-                               uint32_t codeLen, Tcl_Obj *const *lits,
-                               uint32_t numLits, const AuxData *auxArr,
-                               uint32_t numAux,
-                               const ExceptionRange *exArr, uint32_t numEx,
-                               Tcl_Size maxStackDepth, int setPrecompiled);
-static void        TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr);
-static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip);
-static void             TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip);
-static int              TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv);
-static void             TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv);
+static int AddOOShim(Tcl_Interp* ip, OOShim* os);
+static int AddProcShim(Tcl_Interp* ip, ProcShim* ps);
+static void ApplyCmdDeleteTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags);
+static void ApplyShimTeardown(ApplyShim* as, Tcl_Interp* ip);
+static void ApplyShimPurgeStale(ApplyShim* as);
+static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
+                            Namespace* nsPtr,
+                            const unsigned char* code,
+                            uint32_t codeLen,
+                            Tcl_Obj** lits,
+                            uint32_t numLits,
+                            AuxData* auxArr,
+                            uint32_t numAux,
+                            ExceptionRange* exArr,
+                            uint32_t numEx,
+                            int maxStackDepth,
+                            int setPrecompiled);
+static int CmdApplyShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[]);
+static int CmdApplyShimNre(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[]);
+static int CmdOOShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[]);
+static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[]);
+static int CmdProcShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[]);
+static void CompiledLocals(Proc* procPtr, Tcl_Size neededCount);
+static int
+DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* nameOpt, Tcl_Obj* argsOpt, Tcl_Obj* bodyOpt, int scope);
+static int TbcxApplyExportVisibility(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, Tcl_Obj* name, int makePublic);
+static int PairScope(Tcl_Interp* ip, Tcl_Obj* pair);
+static void DelOOShim(Tcl_Interp* ip, OOShim* os);
+static void DelProcShim(Tcl_Interp* ip, ProcShim* ps);
+static ApplyShim* EnsureApplyShim(Tcl_Interp* ip);
+static void FixCompiledLocalNames(Proc* procPtr, LocalCache* lc);
+static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch, Tcl_Obj* scriptFilePath);
+static int MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj* name);
+static void OOShimDefineCmdTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags);
+static void OOShimObjdefCmdTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags);
+static void OOShim_IdentifyMethod(const char* subc,
+                                  Tcl_Size objc,
+                                  Tcl_Obj* const objv[],
+                                  Tcl_Obj* clsFqn,
+                                  Tcl_DString* keyDs,
+                                  uint8_t* kindOut,
+                                  Tcl_Size* bodyIdxOut,
+                                  Tcl_Obj** runtimeArgsOut,
+                                  Tcl_Obj** nameOOut,
+                                  Tcl_Obj** tmpEmptyArgsOut,
+                                  int* hasKeyOut);
+static Tcl_Obj* OOShim_TakeRecord(OOShim* os, const char* key);
+static int PrecompClass(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, Tcl_Obj* builderBody);
+static int PrecompObject(Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* builderBody);
+static Tcl_Obj* ReconstructBuilderMetadata(Tcl_Interp* ip, Tcl_Obj* body, int depth);
+static int ObjBuilderCollectMethods(
+    Tcl_Interp* ip, Tcl_Obj* builderBody, Tcl_HashTable* namesOut, int* sawUnsupportedBodyFormOut, int* anyVerbatimOut);
+static void ClassBuilderCollectMethods(Tcl_Interp* ip, Tcl_Obj* clsFqn, Tcl_Obj* builderBody, Tcl_HashTable* keysOut);
+static int DefOOObj(Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* name, Tcl_Obj* args, Tcl_Obj* preBody);
+static void ProcCmdDeleteTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags);
+static inline void R_Error(TbcxIn* r, const char* msg);
+int Tbcx_ReadExecutableSource(TbcxIn* r, TbcxExecSourceKind kind, char** sp, uint32_t* lenp);
+static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut);
+static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut);
+static void FreeAuxArrayOwned(AuxData* arr, uint32_t n);
+static int ValidateBlockOperands(Tcl_Interp* ip,
+                                 const unsigned char* code,
+                                 uint32_t codeLen,
+                                 uint32_t numLits,
+                                 uint32_t numAux,
+                                 uint32_t numLocals,
+                                 AuxData* auxArr,
+                                 ExceptionRange* exArr,
+                                 uint32_t numEx);
+static Tcl_Obj* ReadLit_Bignum(TbcxIn* r);
+static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly);
+static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly);
+static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os);
+static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx);
+static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr);
+static void FixLiteralPoolProcPtr(ByteCode* bcPtr);
+static void NullLiteralPoolProcPtr(ByteCode* bcPtr, Proc* target);
+static void RegisterPrecompiledLambda(Tcl_Interp* ip, Tcl_Obj* lambda, Proc* procPtr, Tcl_Obj* nsObj);
+Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
+int Tbcx_LoadObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
+inline int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n);
+void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
+inline int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
+inline int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
+inline int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
+inline int Tbcx_R_U8(TbcxIn* r, uint8_t* v);
+Tcl_Obj* Tbcx_ReadBlock(TbcxIn* r,
+                        Tcl_Interp* ip,
+                        Namespace* nsForDefault,
+                        uint32_t* numLocalsOut,
+                        int setPrecompiled,
+                        int dumpOnly,
+                        uint32_t* topPolicyOut);
+int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
+void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
+static ByteCode* TbcxByteCode(Tcl_Obj* objPtr,
+                              Tcl_Interp* ip,
+                              Namespace* nsPtr,
+                              const unsigned char* code,
+                              uint32_t codeLen,
+                              Tcl_Obj* const* lits,
+                              uint32_t numLits,
+                              const AuxData* auxArr,
+                              uint32_t numAux,
+                              const ExceptionRange* exArr,
+                              uint32_t numEx,
+                              Tcl_Size maxStackDepth,
+                              int setPrecompiled);
+static void TbcxFixLocalCacheExtras(ByteCode* bcPtr, Proc* procPtr);
+static TbcxInterpState* TbcxGetInterpState(Tcl_Interp* ip);
+static void TbcxInterpStateCleanup(void* cd, Tcl_Interp* ip);
+static int TopLocals_Begin(Tcl_Interp* ip, ByteCode* bcPtr, TbcxTopFrameSave* sv);
+static void TopLocals_End(Tcl_Interp* ip, TbcxTopFrameSave* sv);
 
 /* ==========================================================================
  * Buffered Read I/O & Utilities
  * ========================================================================== */
 
-const char *Tbcx_ExecSourceKindName(TbcxExecSourceKind kind) {
-    switch (kind) {
-    case TBCX_EXEC_SOURCE_PROC:
-        return "proc";
-    case TBCX_EXEC_SOURCE_METHOD:
-        return "method";
-    case TBCX_EXEC_SOURCE_BYTESRC:
-        return "bytesrc";
-    case TBCX_EXEC_SOURCE_LAMBDA:
-        return "lambda";
+const char* Tbcx_ExecSourceKindName(TbcxExecSourceKind kind)
+{
+    switch (kind)
+    {
+        case TBCX_EXEC_SOURCE_PROC:
+            return "proc";
+        case TBCX_EXEC_SOURCE_METHOD:
+            return "method";
+        case TBCX_EXEC_SOURCE_BYTESRC:
+            return "bytesrc";
+        case TBCX_EXEC_SOURCE_LAMBDA:
+            return "lambda";
     }
     return "unknown";
 }
 
-int Tbcx_ValidateBlockPolicy(Tcl_Interp *ip, uint32_t policy) {
+int Tbcx_ValidateBlockPolicy(Tcl_Interp* ip, uint32_t policy)
+{
     uint32_t selected = policy & TBCX_BLOCK_POLICY_MASK;
 
-    if ((policy & ~TBCX_BLOCK_POLICY_MASK) != 0u ||
-        selected == TBCX_BLOCK_POLICY_MASK) {
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-            "tbcx: invalid artifact source policy 0x%08x",
-            (unsigned)policy));
+    if ((policy & ~TBCX_BLOCK_POLICY_MASK) != 0u || selected == TBCX_BLOCK_POLICY_MASK)
+    {
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid artifact source policy 0x%08x", (unsigned)policy));
         Tcl_SetErrorCode(ip, "TBCX", "LOAD", "POLICY", NULL);
         return TCL_ERROR;
     }
     return TCL_OK;
 }
 
-void Tbcx_ArtifactImageRelease(TbcxArtifactImage *image) {
+void Tbcx_ArtifactImageRelease(TbcxArtifactImage* image)
+{
     if (!image)
         return;
     assert(image->ownerThread == Tcl_GetCurrentThread());
@@ -328,37 +368,40 @@ void Tbcx_ArtifactImageRelease(TbcxArtifactImage *image) {
 /* Read one complete artifact into a bounded neutral image.  This is the only
  * allocation proportional to the whole input and is recoverable; the cap is
  * the same 256 MiB practical ceiling enforced by the writer. */
-int Tbcx_ReadArtifactImage(
-    Tcl_Interp *ip,
-    Tcl_Channel ch,
-    TbcxArtifactImage **imageOut)
+int Tbcx_ReadArtifactImage(Tcl_Interp* ip, Tcl_Channel ch, TbcxArtifactImage** imageOut)
 {
-    unsigned char *bytes = NULL;
+    unsigned char* bytes = NULL;
     size_t length = 0;
     size_t capacity = TBCX_BUFSIZE;
 
     *imageOut = NULL;
-    bytes = (unsigned char *)Tcl_AttemptAlloc(capacity);
-    if (!bytes) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: image allocation failed", -1));
+    bytes = (unsigned char*)Tcl_AttemptAlloc(capacity);
+    if (!bytes)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: image allocation failed", -1));
         Tcl_SetErrorCode(ip, "TBCX", "LOAD", "RESOURCE", NULL);
         return TCL_ERROR;
     }
 
-    for (;;) {
-        if (length == capacity) {
-            if (capacity == (size_t)TBCX_MAX_IMAGE_BYTES) {
+    for (;;)
+    {
+        if (length == capacity)
+        {
+            if (capacity == (size_t)TBCX_MAX_IMAGE_BYTES)
+            {
                 unsigned char extra;
-                Tcl_Size got = Tcl_ReadRaw(ch, (char *)&extra, 1);
-                if (got < 0) {
-                    Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                        "tbcx: I/O error during artifact read", -1));
-                } else if (got > 0) {
-                    Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                        "tbcx: artifact image exceeds limit", -1));
+                Tcl_Size got = Tcl_ReadRaw(ch, (char*)&extra, 1);
+                if (got < 0)
+                {
+                    Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: I/O error during artifact read", -1));
+                }
+                else if (got > 0)
+                {
+                    Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: artifact image exceeds limit", -1));
                     Tcl_SetErrorCode(ip, "TBCX", "LOAD", "RESOURCE", NULL);
-                } else {
+                }
+                else
+                {
                     break;
                 }
                 Tcl_Free(bytes);
@@ -367,12 +410,11 @@ int Tbcx_ReadArtifactImage(
             size_t next = capacity * 2u;
             if (next < capacity || next > (size_t)TBCX_MAX_IMAGE_BYTES)
                 next = (size_t)TBCX_MAX_IMAGE_BYTES;
-            unsigned char *grown = (unsigned char *)Tcl_AttemptRealloc(
-                bytes, next);
-            if (!grown) {
+            unsigned char* grown = (unsigned char*)Tcl_AttemptRealloc(bytes, next);
+            if (!grown)
+            {
                 Tcl_Free(bytes);
-                Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                    "tbcx: image allocation failed", -1));
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: image allocation failed", -1));
                 Tcl_SetErrorCode(ip, "TBCX", "LOAD", "RESOURCE", NULL);
                 return TCL_ERROR;
             }
@@ -381,13 +423,12 @@ int Tbcx_ReadArtifactImage(
         }
 
         size_t available = capacity - length;
-        Tcl_Size request = available > (size_t)TCL_SIZE_MAX
-            ? TCL_SIZE_MAX : (Tcl_Size)available;
-        Tcl_Size got = Tcl_ReadRaw(ch, (char *)bytes + length, request);
-        if (got < 0) {
+        Tcl_Size request = available > (size_t)TCL_SIZE_MAX ? TCL_SIZE_MAX : (Tcl_Size)available;
+        Tcl_Size got = Tcl_ReadRaw(ch, (char*)bytes + length, request);
+        if (got < 0)
+        {
             Tcl_Free(bytes);
-            Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                "tbcx: I/O error during artifact read", -1));
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: I/O error during artifact read", -1));
             return TCL_ERROR;
         }
         if (got == 0)
@@ -395,12 +436,11 @@ int Tbcx_ReadArtifactImage(
         length += (size_t)got;
     }
 
-    TbcxArtifactImage *image =
-        (TbcxArtifactImage *)Tcl_AttemptAlloc(sizeof(*image));
-    if (!image) {
+    TbcxArtifactImage* image = (TbcxArtifactImage*)Tcl_AttemptAlloc(sizeof(*image));
+    if (!image)
+    {
         Tcl_Free(bytes);
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: image allocation failed", -1));
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: image allocation failed", -1));
         Tcl_SetErrorCode(ip, "TBCX", "LOAD", "RESOURCE", NULL);
         return TCL_ERROR;
     }
@@ -413,24 +453,24 @@ int Tbcx_ReadArtifactImage(
     return TCL_OK;
 }
 
-static inline void      R_Error(TbcxIn *r, const char *msg) {
-    if (r->err == TCL_OK) {
+static inline void R_Error(TbcxIn* r, const char* msg)
+{
+    if (r->err == TCL_OK)
+    {
         Tcl_SetObjResult(r->interp, Tcl_NewStringObj(msg, -1));
         r->err = TCL_ERROR;
     }
 }
 
-void Tbcx_R_Init(TbcxIn *r, Tcl_Interp *ip, Tcl_Channel ch) {
+void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch)
+{
     memset(r, 0, sizeof(*r));
-    r->interp  = ip;
-    r->chan    = ch;
-    r->err     = TCL_OK;
+    r->interp = ip;
+    r->chan = ch;
+    r->err = TCL_OK;
 }
 
-void Tbcx_R_InitImage(
-    TbcxIn *r,
-    Tcl_Interp *ip,
-    const TbcxArtifactImage *image)
+void Tbcx_R_InitImage(TbcxIn* r, Tcl_Interp* ip, const TbcxArtifactImage* image)
 {
     memset(r, 0, sizeof(*r));
     r->interp = ip;
@@ -440,18 +480,21 @@ void Tbcx_R_InitImage(
     r->sourcePolicy = image->sourcePolicy;
 }
 
-inline int Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n) {
+inline int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n)
+{
     if (r->err)
         return 0;
     if (n == 0)
         return 1;
-    if (n < 0) {
+    if (n < 0)
+    {
         R_Error(r, "tbcx: invalid negative read length");
         return 0;
     }
-    if (r->imageBytes) {
-        if (r->imagePos > r->imageLength ||
-            n > r->imageLength - r->imagePos) {
+    if (r->imageBytes)
+    {
+        if (r->imagePos > r->imageLength || n > r->imageLength - r->imagePos)
+        {
             R_Error(r, "tbcx: unexpected EOF (short read)");
             return 0;
         }
@@ -460,12 +503,14 @@ inline int Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n) {
         r->absoluteOffset += (uint64_t)n;
         return 1;
     }
-    unsigned char *dst = (unsigned char *)p;
-    Tcl_Size       rem = n;
-    while (rem > 0) {
+    unsigned char* dst = (unsigned char*)p;
+    Tcl_Size rem = n;
+    while (rem > 0)
+    {
         /* Serve from buffer first */
         Tcl_Size avail = r->bufFill - r->bufPos;
-        if (avail > 0) {
+        if (avail > 0)
+        {
             Tcl_Size chunk = (rem < avail) ? rem : avail;
             memcpy(dst, r->buf + r->bufPos, (size_t)chunk);
             r->bufPos += chunk;
@@ -475,16 +520,18 @@ inline int Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n) {
             continue;
         }
         /* Buffer empty — refill */
-        Tcl_Size got = Tcl_ReadRaw(r->chan, (char *)r->buf, (Tcl_Size)TBCX_BUFSIZE);
-        if (got < 0) {
+        Tcl_Size got = Tcl_ReadRaw(r->chan, (char*)r->buf, (Tcl_Size)TBCX_BUFSIZE);
+        if (got < 0)
+        {
             R_Error(r, "tbcx: I/O error during read");
             return 0;
         }
-        if (got == 0) {
+        if (got == 0)
+        {
             R_Error(r, "tbcx: unexpected EOF (short read)");
             return 0;
         }
-        r->bufPos  = 0;
+        r->bufPos = 0;
         r->bufFill = got;
     }
     return 1;
@@ -493,86 +540,103 @@ inline int Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n) {
 /* Require that a complete artifact consumes the channel exactly.  Counted
  * sections provide no extension area in format 93, so any buffered or newly
  * readable byte is malformed trailing data rather than a future section. */
-int Tbcx_R_AtEOF(TbcxIn *r) {
+int Tbcx_R_AtEOF(TbcxIn* r)
+{
     unsigned char extra;
 
     if (r->err)
         return 0;
-    if (r->imageBytes) {
-        if (r->imagePos != r->imageLength) {
+    if (r->imageBytes)
+    {
+        if (r->imagePos != r->imageLength)
+        {
             R_Error(r, "tbcx: trailing data after artifact");
             return 0;
         }
         return 1;
     }
-    if (r->bufPos < r->bufFill) {
+    if (r->bufPos < r->bufFill)
+    {
         R_Error(r, "tbcx: trailing data after artifact");
         return 0;
     }
 
-    Tcl_Size got = Tcl_ReadRaw(r->chan, (char *)&extra, 1);
-    if (got < 0) {
+    Tcl_Size got = Tcl_ReadRaw(r->chan, (char*)&extra, 1);
+    if (got < 0)
+    {
         R_Error(r, "tbcx: I/O error while checking artifact end");
         return 0;
     }
-    if (got > 0) {
+    if (got > 0)
+    {
         R_Error(r, "tbcx: trailing data after artifact");
         return 0;
     }
-    if (!Tcl_Eof(r->chan)) {
+    if (!Tcl_Eof(r->chan))
+    {
         R_Error(r, "tbcx: artifact channel did not reach EOF");
         return 0;
     }
     return 1;
 }
 
-inline int Tbcx_R_U8(TbcxIn *r, uint8_t *v) {
+inline int Tbcx_R_U8(TbcxIn* r, uint8_t* v)
+{
     return Tbcx_R_Bytes(r, v, 1);
 }
 
-inline int Tbcx_R_U32(TbcxIn *r, uint32_t *vp) {
+inline int Tbcx_R_U32(TbcxIn* r, uint32_t* vp)
+{
     uint32_t v = 0;
     if (!Tbcx_R_Bytes(r, &v, 4))
         return 0;
-    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
+    {
         v = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24);
     }
     *vp = v;
     return 1;
 }
 
-inline int Tbcx_R_U64(TbcxIn *r, uint64_t *vp) {
+inline int Tbcx_R_U64(TbcxIn* r, uint64_t* vp)
+{
     uint64_t v = 0;
     if (!Tbcx_R_Bytes(r, &v, 8))
         return 0;
-    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed)) {
-        v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) | ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8) | ((v & 0x000000FF00000000ull) >> 8) |
-            ((v & 0x0000FF0000000000ull) >> 24) | ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56);
+    if (!atomic_load_explicit(&tbcxHostIsLE, memory_order_relaxed))
+    {
+        v = ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40) | ((v & 0x0000000000FF0000ull) << 24) |
+            ((v & 0x00000000FF000000ull) << 8) | ((v & 0x000000FF00000000ull) >> 8) | ((v & 0x0000FF0000000000ull) >> 24) |
+            ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56);
     }
     *vp = v;
     return 1;
 }
 
-inline int Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp) {
+inline int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp)
+{
     uint32_t n = 0;
     if (!Tbcx_R_U32(r, &n))
         return 0;
-    if (n > TBCX_MAX_STR) {
+    if (n > TBCX_MAX_STR)
+    {
         R_Error(r, "tbcx: LPString too large");
         return 0;
     }
-    char *buf = (char *)Tcl_AttemptAlloc(n + 1u);
-    if (!buf) {
+    char* buf = (char*)Tcl_AttemptAlloc(n + 1u);
+    if (!buf)
+    {
         R_Error(r, "tbcx: allocation failed (LPString)");
         return 0;
     }
-    if (n && !Tbcx_R_Bytes(r, buf, n)) {
+    if (n && !Tbcx_R_Bytes(r, buf, n))
+    {
         Tcl_Free(buf);
         return 0;
     }
     buf[n] = '\0';
-    *sp    = buf;
-    *lenp  = n;
+    *sp = buf;
+    *lenp = n;
     return 1;
 }
 
@@ -580,11 +644,7 @@ inline int Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp) {
  * length performs no allocation.  The preflight parser already enforces the
  * policy transactionally; this second check keeps direct materialization
  * callers safe and makes load/dump behavior identical. */
-int Tbcx_ReadExecutableSource(
-    TbcxIn *r,
-    TbcxExecSourceKind kind,
-    char **sp,
-    uint32_t *lenp)
+int Tbcx_ReadExecutableSource(TbcxIn* r, TbcxExecSourceKind kind, char** sp, uint32_t* lenp)
 {
     uint32_t n = 0;
     uint64_t lengthOffset = r->absoluteOffset;
@@ -593,43 +653,48 @@ int Tbcx_ReadExecutableSource(
     *lenp = 0;
     if (!Tbcx_R_U32(r, &n))
         return 0;
-    if (n > TBCX_MAX_STR) {
+    if (n > TBCX_MAX_STR)
+    {
         R_Error(r, "tbcx: executable source too large");
         return 0;
     }
-    if (r->executableSourceFieldCount == TCL_SIZE_MAX) {
+    if (r->executableSourceFieldCount == TCL_SIZE_MAX)
+    {
         R_Error(r, "tbcx: executable-source field count overflow");
         return 0;
     }
     r->executableSourceFieldCount++;
-    if (n > 0) {
-        if (UINT64_MAX - r->executableSourceBytes < n) {
+    if (n > 0)
+    {
+        if (UINT64_MAX - r->executableSourceBytes < n)
+        {
             R_Error(r, "tbcx: executable-source byte count overflow");
             return 0;
         }
         r->nonemptyExecutableSourceFieldCount++;
         r->executableSourceBytes += n;
     }
-    if ((r->sourcePolicy &
-            TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u && n != 0u) {
-        const char *kindName = Tbcx_ExecSourceKindName(kind);
-        Tcl_SetObjResult(r->interp, Tcl_ObjPrintf(
-            "tbcx: strict artifact contains %s source at byte %llu",
-            kindName, (unsigned long long)lengthOffset));
-        Tcl_SetErrorCode(r->interp, "TBCX", "LOAD", "SOURCE",
-            kindName, NULL);
+    if ((r->sourcePolicy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u && n != 0u)
+    {
+        const char* kindName = Tbcx_ExecSourceKindName(kind);
+        Tcl_SetObjResult(
+            r->interp,
+            Tcl_ObjPrintf("tbcx: strict artifact contains %s source at byte %llu", kindName, (unsigned long long)lengthOffset));
+        Tcl_SetErrorCode(r->interp, "TBCX", "LOAD", "SOURCE", kindName, NULL);
         r->err = TCL_ERROR;
         return 0;
     }
     if (n == 0)
         return 1;
 
-    char *buf = (char *)Tcl_AttemptAlloc((size_t)n + 1u);
-    if (!buf) {
+    char* buf = (char*)Tcl_AttemptAlloc((size_t)n + 1u);
+    if (!buf)
+    {
         R_Error(r, "tbcx: allocation failed (executable source)");
         return 0;
     }
-    if (!Tbcx_R_Bytes(r, buf, n)) {
+    if (!Tbcx_R_Bytes(r, buf, n))
+    {
         Tcl_Free(buf);
         return 0;
     }
@@ -647,9 +712,10 @@ int Tbcx_ReadExecutableSource(
  * policy before the materializer is allowed to mutate interpreter state.
  * ========================================================================== */
 
-typedef struct TbcxPreflight {
+typedef struct TbcxPreflight
+{
     TbcxIn r;
-    TbcxArtifactImage *image;
+    TbcxArtifactImage* image;
     uint64_t totalBlocks;
     uint64_t totalLiterals;
     int blockDepth;
@@ -659,7 +725,8 @@ typedef struct TbcxPreflight {
     uint64_t firstNonemptyOffset;
 } TbcxPreflight;
 
-typedef struct TbcxPreflightBlock {
+typedef struct TbcxPreflightBlock
+{
     uint32_t codeLen;
     uint32_t numLiterals;
     uint32_t numAux;
@@ -669,17 +736,16 @@ typedef struct TbcxPreflightBlock {
     uint32_t policy;
 } TbcxPreflightBlock;
 
-static int PreflightLiteral(TbcxPreflight *pf, int depth);
-static int PreflightBlock(TbcxPreflight *pf, int isTop,
-                          TbcxPreflightBlock *result);
+static int PreflightLiteral(TbcxPreflight* pf, int depth);
+static int PreflightBlock(TbcxPreflight* pf, int isTop, TbcxPreflightBlock* result);
 
-static int PreflightSkip(TbcxPreflight *pf, uint64_t count) {
-    TbcxIn *r = &pf->r;
+static int PreflightSkip(TbcxPreflight* pf, uint64_t count)
+{
+    TbcxIn* r = &pf->r;
     if (r->err)
         return 0;
-    if (count > (uint64_t)TCL_SIZE_MAX ||
-        r->imagePos > r->imageLength ||
-        count > (uint64_t)(r->imageLength - r->imagePos)) {
+    if (count > (uint64_t)TCL_SIZE_MAX || r->imagePos > r->imageLength || count > (uint64_t)(r->imageLength - r->imagePos))
+    {
         R_Error(r, "tbcx: unexpected EOF (short read)");
         return 0;
     }
@@ -688,18 +754,15 @@ static int PreflightSkip(TbcxPreflight *pf, uint64_t count) {
     return 1;
 }
 
-static int PreflightLPString(
-    TbcxPreflight *pf,
-    const unsigned char **bytesOut,
-    uint32_t *lengthOut,
-    uint64_t *lengthOffsetOut)
+static int PreflightLPString(TbcxPreflight* pf, const unsigned char** bytesOut, uint32_t* lengthOut, uint64_t* lengthOffsetOut)
 {
     uint32_t length = 0;
     uint64_t offset = pf->r.absoluteOffset;
 
     if (!Tbcx_R_U32(&pf->r, &length))
         return 0;
-    if (length > TBCX_MAX_STR) {
+    if (length > TBCX_MAX_STR)
+    {
         R_Error(&pf->r, "tbcx: LPString too large");
         return 0;
     }
@@ -712,61 +775,50 @@ static int PreflightLPString(
     return PreflightSkip(pf, length);
 }
 
-static int PreflightAbsoluteName(
-    TbcxPreflight *pf,
-    const unsigned char *bytes,
-    uint32_t length,
-    const char *what)
+static int PreflightAbsoluteName(TbcxPreflight* pf, const unsigned char* bytes, uint32_t length, const char* what)
 {
-    if (length > 0 && memchr(bytes, '\0', length) != NULL) {
-        Tcl_SetObjResult(pf->r.interp,
-            Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
+    if (length > 0 && memchr(bytes, '\0', length) != NULL)
+    {
+        Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
         pf->r.err = TCL_ERROR;
         return 0;
     }
-    if (length < 2 || bytes[0] != ':' || bytes[1] != ':') {
-        Tcl_SetObjResult(pf->r.interp,
-            Tcl_ObjPrintf("tbcx: %s must be absolute", what));
+    if (length < 2 || bytes[0] != ':' || bytes[1] != ':')
+    {
+        Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
         pf->r.err = TCL_ERROR;
         return 0;
     }
     return 1;
 }
 
-static int PreflightKeyName(
-    TbcxPreflight *pf,
-    const unsigned char *bytes,
-    Tcl_Size length,
-    const char *what)
+static int PreflightKeyName(TbcxPreflight* pf, const unsigned char* bytes, Tcl_Size length, const char* what)
 {
-    if (length > 0 && memchr(bytes, '\0', (size_t)length) != NULL) {
-        Tcl_SetObjResult(pf->r.interp,
-            Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
+    if (length > 0 && memchr(bytes, '\0', (size_t)length) != NULL)
+    {
+        Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
         pf->r.err = TCL_ERROR;
         return 0;
     }
     return 1;
 }
 
-typedef struct TbcxPreflightListElement {
-    const unsigned char *bytes;
+typedef struct TbcxPreflightListElement
+{
+    const unsigned char* bytes;
     Tcl_Size length;
-    char *owned;
+    char* owned;
 } TbcxPreflightListElement;
 
 /* Parse one list element without creating a Tcl_Obj.  TclFindElement works
  * over a bounded slice; only a backslash-collapsed value needs temporary
  * storage, obtained through the non-panicking allocator. */
 static int PreflightNextListElement(
-    TbcxPreflight *pf,
-    const char **cursorPtr,
-    const char *end,
-    TbcxPreflightListElement *result,
-    int *foundOut)
+    TbcxPreflight* pf, const char** cursorPtr, const char* end, TbcxPreflightListElement* result, int* foundOut)
 {
-    const char *cursor = *cursorPtr;
-    const char *element = NULL;
-    const char *next = NULL;
+    const char* cursor = *cursorPtr;
+    const char* element = NULL;
+    const char* next = NULL;
     Tcl_Size elementLength = 0;
     int literal = 0;
 
@@ -774,8 +826,8 @@ static int PreflightNextListElement(
     *foundOut = 0;
     if (cursor >= end)
         return 1;
-    if (TclFindElement(pf->r.interp, cursor, end - cursor,
-            &element, &next, &elementLength, &literal) != TCL_OK) {
+    if (TclFindElement(pf->r.interp, cursor, end - cursor, &element, &next, &elementLength, &literal) != TCL_OK)
+    {
         pf->r.err = TCL_ERROR;
         return 0;
     }
@@ -784,77 +836,74 @@ static int PreflightNextListElement(
         return 1;
 
     *foundOut = 1;
-    if (literal) {
-        result->bytes = (const unsigned char *)element;
+    if (literal)
+    {
+        result->bytes = (const unsigned char*)element;
         result->length = elementLength;
         return 1;
     }
 
-    if (elementLength == TCL_SIZE_MAX) {
+    if (elementLength == TCL_SIZE_MAX)
+    {
         R_Error(&pf->r, "tbcx: argument list element is too large");
         return 0;
     }
-    result->owned = (char *)Tcl_AttemptAlloc((size_t)elementLength + 1u);
-    if (!result->owned) {
-        R_Error(&pf->r,
-            "tbcx: allocation failed (argument list validation)");
+    result->owned = (char*)Tcl_AttemptAlloc((size_t)elementLength + 1u);
+    if (!result->owned)
+    {
+        R_Error(&pf->r, "tbcx: allocation failed (argument list validation)");
         return 0;
     }
-    result->length = TclCopyAndCollapse(elementLength, element,
-        result->owned);
+    result->length = TclCopyAndCollapse(elementLength, element, result->owned);
     result->owned[result->length] = '\0';
-    result->bytes = (const unsigned char *)result->owned;
+    result->bytes = (const unsigned char*)result->owned;
     return 1;
 }
 
-static int PreflightArgumentName(
-    TbcxPreflight *pf,
-    const unsigned char *bytes,
-    Tcl_Size length)
+static int PreflightArgumentName(TbcxPreflight* pf, const unsigned char* bytes, Tcl_Size length)
 {
     if (!PreflightKeyName(pf, bytes, length, "formal parameter"))
         return 0;
-    if (length == 0) {
+    if (length == 0)
+    {
         R_Error(&pf->r, "tbcx: argument with no name");
         return 0;
     }
-    for (Tcl_Size i = 0; i + 1 < length; i++) {
-        if (bytes[i] == ':' && bytes[i + 1] == ':') {
-            R_Error(&pf->r,
-                "tbcx: formal parameter is not a simple name");
+    for (Tcl_Size i = 0; i + 1 < length; i++)
+    {
+        if (bytes[i] == ':' && bytes[i + 1] == ':')
+        {
+            R_Error(&pf->r, "tbcx: formal parameter is not a simple name");
             return 0;
         }
-        if (bytes[i] == '(' && bytes[length - 1] == ')') {
-            R_Error(&pf->r,
-                "tbcx: formal parameter is an array element");
+        if (bytes[i] == '(' && bytes[length - 1] == ')')
+        {
+            R_Error(&pf->r, "tbcx: formal parameter is an array element");
             return 0;
         }
     }
     return 1;
 }
 
-static int PreflightArgumentList(
-    TbcxPreflight *pf,
-    const unsigned char *bytes,
-    uint32_t length,
-    Tcl_Size *argumentCountOut)
+static int PreflightArgumentList(TbcxPreflight* pf, const unsigned char* bytes, uint32_t length, Tcl_Size* argumentCountOut)
 {
-    const char *cursor = length ? (const char *)bytes : "";
-    const char *end = cursor + length;
+    const char* cursor = length ? (const char*)bytes : "";
+    const char* end = cursor + length;
     Tcl_Size argumentCount = 0;
 
     if (!PreflightKeyName(pf, bytes, length, "argument list"))
         return 0;
 
-    for (;;) {
+    for (;;)
+    {
         TbcxPreflightListElement spec;
         int haveSpec = 0;
-        if (!PreflightNextListElement(pf, &cursor, end, &spec,
-                &haveSpec))
+        if (!PreflightNextListElement(pf, &cursor, end, &spec, &haveSpec))
             return 0;
         if (!haveSpec)
             break;
-        if (argumentCount == TBCX_MAX_LOCALS) {
+        if (argumentCount == TBCX_MAX_LOCALS)
+        {
             if (spec.owned)
                 Tcl_Free(spec.owned);
             R_Error(&pf->r, "tbcx: too many formal parameters");
@@ -862,31 +911,31 @@ static int PreflightArgumentList(
         }
         argumentCount++;
 
-        const char *fieldCursor = (const char *)spec.bytes;
-        const char *fieldEnd = fieldCursor + spec.length;
+        const char* fieldCursor = (const char*)spec.bytes;
+        const char* fieldEnd = fieldCursor + spec.length;
         Tcl_Size fieldCount = 0;
         int valid = 1;
-        for (;;) {
+        for (;;)
+        {
             TbcxPreflightListElement field;
             int haveField = 0;
-            if (!PreflightNextListElement(pf, &fieldCursor, fieldEnd,
-                    &field, &haveField)) {
+            if (!PreflightNextListElement(pf, &fieldCursor, fieldEnd, &field, &haveField))
+            {
                 valid = 0;
                 break;
             }
             if (!haveField)
                 break;
             fieldCount++;
-            if (fieldCount == 1 &&
-                !PreflightArgumentName(pf, field.bytes, field.length))
+            if (fieldCount == 1 && !PreflightArgumentName(pf, field.bytes, field.length))
                 valid = 0;
             if (field.owned)
                 Tcl_Free(field.owned);
             if (!valid)
                 break;
-            if (fieldCount > 2) {
-                R_Error(&pf->r,
-                    "tbcx: too many fields in argument specifier");
+            if (fieldCount > 2)
+            {
+                R_Error(&pf->r, "tbcx: too many fields in argument specifier");
                 valid = 0;
                 break;
             }
@@ -895,7 +944,8 @@ static int PreflightArgumentList(
             Tcl_Free(spec.owned);
         if (!valid)
             return 0;
-        if (fieldCount == 0) {
+        if (fieldCount == 0)
+        {
             R_Error(&pf->r, "tbcx: argument with no name");
             return 0;
         }
@@ -906,31 +956,26 @@ static int PreflightArgumentList(
     return 1;
 }
 
-static int PreflightSourceError(
-    TbcxPreflight *pf,
-    TbcxExecSourceKind kind,
-    uint64_t offset)
+static int PreflightSourceError(TbcxPreflight* pf, TbcxExecSourceKind kind, uint64_t offset)
 {
-    const char *kindName = Tbcx_ExecSourceKindName(kind);
-    Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf(
-        "tbcx: strict artifact contains %s source at byte %llu",
-        kindName, (unsigned long long)offset));
-    Tcl_SetErrorCode(pf->r.interp, "TBCX", "LOAD", "SOURCE",
-        kindName, NULL);
+    const char* kindName = Tbcx_ExecSourceKindName(kind);
+    Tcl_SetObjResult(
+        pf->r.interp,
+        Tcl_ObjPrintf("tbcx: strict artifact contains %s source at byte %llu", kindName, (unsigned long long)offset));
+    Tcl_SetErrorCode(pf->r.interp, "TBCX", "LOAD", "SOURCE", kindName, NULL);
     pf->r.err = TCL_ERROR;
     return 0;
 }
 
-static int PreflightExecutableSource(
-    TbcxPreflight *pf,
-    TbcxExecSourceKind kind)
+static int PreflightExecutableSource(TbcxPreflight* pf, TbcxExecSourceKind kind)
 {
     uint32_t length = 0;
     uint64_t offset = 0;
 
     if (!PreflightLPString(pf, NULL, &length, &offset))
         return 0;
-    if (pf->image->executableSourceFieldCount == TCL_SIZE_MAX) {
+    if (pf->image->executableSourceFieldCount == TCL_SIZE_MAX)
+    {
         R_Error(&pf->r, "tbcx: executable-source field count overflow");
         return 0;
     }
@@ -938,8 +983,10 @@ static int PreflightExecutableSource(
 #ifdef TBCX_BENCH_COUNTERS
     TBCX_BENCH_INC(executableSourceFieldsRead);
 #endif
-    if (length != 0u) {
-        if (UINT64_MAX - pf->image->executableSourceBytes < length) {
+    if (length != 0u)
+    {
+        if (UINT64_MAX - pf->image->executableSourceBytes < length)
+        {
             R_Error(&pf->r, "tbcx: executable-source byte count overflow");
             return 0;
         }
@@ -948,285 +995,302 @@ static int PreflightExecutableSource(
 #ifdef TBCX_BENCH_COUNTERS
         TBCX_BENCH_INC(nonemptyExecutableSourceFieldsRead);
 #endif
-        if (!pf->haveFirstNonempty) {
+        if (!pf->haveFirstNonempty)
+        {
             pf->haveFirstNonempty = 1;
             pf->firstNonemptyKind = kind;
             pf->firstNonemptyOffset = offset;
         }
-        if (pf->policyKnown &&
-            (pf->image->sourcePolicy &
-             TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u)
+        if (pf->policyKnown && (pf->image->sourcePolicy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u)
             return PreflightSourceError(pf, kind, offset);
     }
     return 1;
 }
 
-static int PreflightCodeShape(
-    TbcxPreflight *pf,
-    const unsigned char *code,
-    uint32_t codeLen)
+static int PreflightCodeShape(TbcxPreflight* pf, const unsigned char* code, uint32_t codeLen)
 {
-    const InstructionDesc *table =
-        (const InstructionDesc *)TclGetInstructionTable();
+    const InstructionDesc* table = (const InstructionDesc*)TclGetInstructionTable();
     uint32_t pc = 0;
     uint32_t lastPc = 0;
 
-    if (codeLen == 0) {
+    if (codeLen == 0)
+    {
         R_Error(&pf->r, "tbcx: empty bytecode block");
         return 0;
     }
-    while (pc < codeLen) {
+    while (pc < codeLen)
+    {
         unsigned opcode = code[pc];
-        if (opcode > LAST_INST_OPCODE || table[opcode].numBytes <= 0) {
-            Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf(
-                "tbcx: invalid opcode 0x%02x at pc %u", opcode, pc));
+        if (opcode > LAST_INST_OPCODE || table[opcode].numBytes <= 0)
+        {
+            Tcl_SetObjResult(pf->r.interp, Tcl_ObjPrintf("tbcx: invalid opcode 0x%02x at pc %u", opcode, pc));
             pf->r.err = TCL_ERROR;
             return 0;
         }
         uint32_t width = (uint32_t)table[opcode].numBytes;
-        if (width > codeLen - pc) {
+        if (width > codeLen - pc)
+        {
             R_Error(&pf->r, "tbcx: truncated instruction in bytecode block");
             return 0;
         }
         lastPc = pc;
         pc += width;
     }
-    if (!table[code[lastPc]].name ||
-        strcmp(table[code[lastPc]].name, "done") != 0) {
+    if (!table[code[lastPc]].name || strcmp(table[code[lastPc]].name, "done") != 0)
+    {
         R_Error(&pf->r, "tbcx: bytecode block does not end with done");
         return 0;
     }
     return 1;
 }
 
-static int PreflightLiteral(TbcxPreflight *pf, int depth) {
+static int PreflightLiteral(TbcxPreflight* pf, int depth)
+{
     uint32_t tag = 0;
 
-    if (depth > TBCX_MAX_LITERAL_DEPTH) {
+    if (depth > TBCX_MAX_LITERAL_DEPTH)
+    {
         R_Error(&pf->r, "tbcx: literal nesting too deep");
         return 0;
     }
-    if (++pf->totalLiterals > TBCX_MAX_IMAGE_LITERAL_RECORDS) {
+    if (++pf->totalLiterals > TBCX_MAX_IMAGE_LITERAL_RECORDS)
+    {
         R_Error(&pf->r, "tbcx: too many literal records");
         return 0;
     }
     if (!Tbcx_R_U32(&pf->r, &tag))
         return 0;
 
-    switch (tag) {
-    case TBCX_LIT_BIGNUM: {
-        uint8_t sign = 0;
-        uint32_t magnitude = 0;
-        if (!Tbcx_R_U8(&pf->r, &sign) ||
-            !Tbcx_R_U32(&pf->r, &magnitude))
-            return 0;
-        if (magnitude > TBCX_MAX_CODE) {
-            R_Error(&pf->r, "tbcx: bignum too large");
-            return 0;
-        }
-        if ((sign == 0 && magnitude != 0) ||
-            ((sign == 1 || sign == 2) && magnitude == 0) || sign > 2) {
-            R_Error(&pf->r,
-                "tbcx: invalid bignum sign/magnitude encoding");
-            return 0;
-        }
-        return PreflightSkip(pf, magnitude);
-    }
-    case TBCX_LIT_BOOLEAN: {
-        uint8_t value = 0;
-        if (!Tbcx_R_U8(&pf->r, &value))
-            return 0;
-        if (value > 1) {
-            R_Error(&pf->r, "tbcx: invalid boolean literal encoding");
-            return 0;
-        }
-        return 1;
-    }
-    case TBCX_LIT_BYTEARR: {
-        uint32_t length = 0;
-        if (!Tbcx_R_U32(&pf->r, &length))
-            return 0;
-        if (length > TBCX_MAX_STR) {
-            R_Error(&pf->r, "tbcx: bytearray too large");
-            return 0;
-        }
-        return PreflightSkip(pf, length);
-    }
-    case TBCX_LIT_DICT: {
-        uint32_t count = 0;
-        if (!Tbcx_R_U32(&pf->r, &count))
-            return 0;
-        if (count > TBCX_MAX_CONTAINER_ELEMS) {
-            R_Error(&pf->r, "tbcx: dict too many pairs");
-            return 0;
-        }
-        for (uint32_t i = 0; i < count; i++) {
-            if (!PreflightLiteral(pf, depth + 1) ||
-                !PreflightLiteral(pf, depth + 1))
+    switch (tag)
+    {
+        case TBCX_LIT_BIGNUM:
+        {
+            uint8_t sign = 0;
+            uint32_t magnitude = 0;
+            if (!Tbcx_R_U8(&pf->r, &sign) || !Tbcx_R_U32(&pf->r, &magnitude))
                 return 0;
-        }
-        return 1;
-    }
-    case TBCX_LIT_DOUBLE:
-    case TBCX_LIT_WIDEINT:
-    case TBCX_LIT_WIDEUINT:
-        return PreflightSkip(pf, 8u);
-    case TBCX_LIT_LIST: {
-        uint32_t count = 0;
-        if (!Tbcx_R_U32(&pf->r, &count))
-            return 0;
-        if (count > TBCX_MAX_CONTAINER_ELEMS) {
-            R_Error(&pf->r, "tbcx: list too many elements");
-            return 0;
-        }
-        for (uint32_t i = 0; i < count; i++)
-            if (!PreflightLiteral(pf, depth + 1))
-                return 0;
-        return 1;
-    }
-    case TBCX_LIT_STRING:
-        return PreflightLPString(pf, NULL, NULL, NULL);
-    case TBCX_LIT_LAMBDA_BC: {
-        const unsigned char *ns = NULL;
-        uint32_t nsLength = 0;
-        uint32_t numArgs = 0;
-        TbcxPreflightBlock body;
-        if (!PreflightLPString(pf, &ns, &nsLength, NULL) ||
-            !PreflightAbsoluteName(pf, ns, nsLength,
-                "lambda namespace") ||
-            !Tbcx_R_U32(&pf->r, &numArgs))
-            return 0;
-        if (numArgs > TBCX_MAX_LOCALS) {
-            R_Error(&pf->r, "tbcx: too many lambda arguments");
-            return 0;
-        }
-        for (uint32_t i = 0; i < numArgs; i++) {
-            const unsigned char *name = NULL;
-            uint32_t nameLength = 0;
-            uint8_t hasDefault = 0;
-            if (!PreflightLPString(pf, &name, &nameLength, NULL) ||
-                !PreflightArgumentName(pf, name, nameLength) ||
-                !Tbcx_R_U8(&pf->r, &hasDefault))
-                return 0;
-            if (hasDefault > 1) {
-                R_Error(&pf->r,
-                    "tbcx: invalid lambda default-value flag");
+            if (magnitude > TBCX_MAX_CODE)
+            {
+                R_Error(&pf->r, "tbcx: bignum too large");
                 return 0;
             }
-            if (hasDefault && !PreflightLiteral(pf, depth + 1))
+            if ((sign == 0 && magnitude != 0) || ((sign == 1 || sign == 2) && magnitude == 0) || sign > 2)
+            {
+                R_Error(&pf->r, "tbcx: invalid bignum sign/magnitude encoding");
                 return 0;
+            }
+            return PreflightSkip(pf, magnitude);
         }
-        if (!PreflightBlock(pf, 0, &body))
-            return 0;
-        if (numArgs > body.numLocals) {
-            R_Error(&pf->r,
-                "tbcx: lambda arguments exceed compiled local count");
-            return 0;
+        case TBCX_LIT_BOOLEAN:
+        {
+            uint8_t value = 0;
+            if (!Tbcx_R_U8(&pf->r, &value))
+                return 0;
+            if (value > 1)
+            {
+                R_Error(&pf->r, "tbcx: invalid boolean literal encoding");
+                return 0;
+            }
+            return 1;
         }
-        return PreflightExecutableSource(pf, TBCX_EXEC_SOURCE_LAMBDA);
-    }
-    case TBCX_LIT_BYTESRC: {
-        const unsigned char *ns = NULL;
-        uint32_t nsLength = 0;
-        if (!PreflightExecutableSource(pf,
-                TBCX_EXEC_SOURCE_BYTESRC) ||
-            !PreflightLPString(pf, &ns, &nsLength, NULL) ||
-            !PreflightAbsoluteName(pf, ns, nsLength,
-                "bytesrc literal namespace"))
+        case TBCX_LIT_BYTEARR:
+        {
+            uint32_t length = 0;
+            if (!Tbcx_R_U32(&pf->r, &length))
+                return 0;
+            if (length > TBCX_MAX_STR)
+            {
+                R_Error(&pf->r, "tbcx: bytearray too large");
+                return 0;
+            }
+            return PreflightSkip(pf, length);
+        }
+        case TBCX_LIT_DICT:
+        {
+            uint32_t count = 0;
+            if (!Tbcx_R_U32(&pf->r, &count))
+                return 0;
+            if (count > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(&pf->r, "tbcx: dict too many pairs");
+                return 0;
+            }
+            for (uint32_t i = 0; i < count; i++)
+            {
+                if (!PreflightLiteral(pf, depth + 1) || !PreflightLiteral(pf, depth + 1))
+                    return 0;
+            }
+            return 1;
+        }
+        case TBCX_LIT_DOUBLE:
+        case TBCX_LIT_WIDEINT:
+        case TBCX_LIT_WIDEUINT:
+            return PreflightSkip(pf, 8u);
+        case TBCX_LIT_LIST:
+        {
+            uint32_t count = 0;
+            if (!Tbcx_R_U32(&pf->r, &count))
+                return 0;
+            if (count > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(&pf->r, "tbcx: list too many elements");
+                return 0;
+            }
+            for (uint32_t i = 0; i < count; i++)
+                if (!PreflightLiteral(pf, depth + 1))
+                    return 0;
+            return 1;
+        }
+        case TBCX_LIT_STRING:
+            return PreflightLPString(pf, NULL, NULL, NULL);
+        case TBCX_LIT_LAMBDA_BC:
+        {
+            const unsigned char* ns = NULL;
+            uint32_t nsLength = 0;
+            uint32_t numArgs = 0;
+            TbcxPreflightBlock body;
+            if (!PreflightLPString(pf, &ns, &nsLength, NULL) || !PreflightAbsoluteName(pf, ns, nsLength, "lambda namespace") ||
+                !Tbcx_R_U32(&pf->r, &numArgs))
+                return 0;
+            if (numArgs > TBCX_MAX_LOCALS)
+            {
+                R_Error(&pf->r, "tbcx: too many lambda arguments");
+                return 0;
+            }
+            for (uint32_t i = 0; i < numArgs; i++)
+            {
+                const unsigned char* name = NULL;
+                uint32_t nameLength = 0;
+                uint8_t hasDefault = 0;
+                if (!PreflightLPString(pf, &name, &nameLength, NULL) || !PreflightArgumentName(pf, name, nameLength) ||
+                    !Tbcx_R_U8(&pf->r, &hasDefault))
+                    return 0;
+                if (hasDefault > 1)
+                {
+                    R_Error(&pf->r, "tbcx: invalid lambda default-value flag");
+                    return 0;
+                }
+                if (hasDefault && !PreflightLiteral(pf, depth + 1))
+                    return 0;
+            }
+            if (!PreflightBlock(pf, 0, &body))
+                return 0;
+            if (numArgs > body.numLocals)
+            {
+                R_Error(&pf->r, "tbcx: lambda arguments exceed compiled local count");
+                return 0;
+            }
+            return PreflightExecutableSource(pf, TBCX_EXEC_SOURCE_LAMBDA);
+        }
+        case TBCX_LIT_BYTESRC:
+        {
+            const unsigned char* ns = NULL;
+            uint32_t nsLength = 0;
+            if (!PreflightExecutableSource(pf, TBCX_EXEC_SOURCE_BYTESRC) || !PreflightLPString(pf, &ns, &nsLength, NULL) ||
+                !PreflightAbsoluteName(pf, ns, nsLength, "bytesrc literal namespace"))
+                return 0;
+            return PreflightBlock(pf, 0, NULL);
+        }
+        default:
+            R_Error(&pf->r, "tbcx: unknown literal tag");
             return 0;
-        return PreflightBlock(pf, 0, NULL);
-    }
-    default:
-        R_Error(&pf->r, "tbcx: unknown literal tag");
-        return 0;
     }
 }
 
-static int PreflightAuxArray(TbcxPreflight *pf, uint32_t *countOut) {
+static int PreflightAuxArray(TbcxPreflight* pf, uint32_t* countOut)
+{
     uint32_t count = 0;
     if (!Tbcx_R_U32(&pf->r, &count))
         return 0;
-    if (count > TBCX_MAX_AUX) {
+    if (count > TBCX_MAX_AUX)
+    {
         R_Error(&pf->r, "tbcx: aux too many");
         return 0;
     }
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count; i++)
+    {
         uint32_t tag = 0;
         uint32_t entries = 0;
         if (!Tbcx_R_U32(&pf->r, &tag))
             return 0;
-        switch (tag) {
-        case TBCX_AUX_JT_STR:
-            if (!Tbcx_R_U32(&pf->r, &entries))
-                return 0;
-            if (entries > TBCX_MAX_LITERALS) {
-                R_Error(&pf->r, "tbcx: jump table too large");
-                return 0;
-            }
-            for (uint32_t k = 0; k < entries; k++) {
-                const unsigned char *key = NULL;
-                uint32_t keyLength = 0;
-                if (!PreflightLPString(pf, &key, &keyLength, NULL) ||
-                    (keyLength > 0 &&
-                        memchr(key, '\0', keyLength) != NULL) ||
-                    !PreflightSkip(pf, 4u)) {
-                    if (!pf->r.err) {
-                        R_Error(&pf->r,
-                            "tbcx: string jump-table key contains embedded NUL");
+        switch (tag)
+        {
+            case TBCX_AUX_JT_STR:
+                if (!Tbcx_R_U32(&pf->r, &entries))
+                    return 0;
+                if (entries > TBCX_MAX_LITERALS)
+                {
+                    R_Error(&pf->r, "tbcx: jump table too large");
+                    return 0;
+                }
+                for (uint32_t k = 0; k < entries; k++)
+                {
+                    const unsigned char* key = NULL;
+                    uint32_t keyLength = 0;
+                    if (!PreflightLPString(pf, &key, &keyLength, NULL) ||
+                        (keyLength > 0 && memchr(key, '\0', keyLength) != NULL) || !PreflightSkip(pf, 4u))
+                    {
+                        if (!pf->r.err)
+                        {
+                            R_Error(&pf->r, "tbcx: string jump-table key contains embedded NUL");
+                        }
+                        return 0;
                     }
+                }
+                break;
+            case TBCX_AUX_JT_NUM:
+                if (!Tbcx_R_U32(&pf->r, &entries))
+                    return 0;
+                if (entries > TBCX_MAX_LITERALS)
+                {
+                    R_Error(&pf->r, "tbcx: numeric jump table too large");
                     return 0;
                 }
-            }
-            break;
-        case TBCX_AUX_JT_NUM:
-            if (!Tbcx_R_U32(&pf->r, &entries))
-                return 0;
-            if (entries > TBCX_MAX_LITERALS) {
-                R_Error(&pf->r, "tbcx: numeric jump table too large");
-                return 0;
-            }
-            if (!PreflightSkip(pf, (uint64_t)entries * 12u))
-                return 0;
-            break;
-        case TBCX_AUX_DICTUPD:
-            if (!Tbcx_R_U32(&pf->r, &entries))
-                return 0;
-            if (entries > TBCX_MAX_LITERALS) {
-                R_Error(&pf->r, "tbcx: dict-update aux too large");
-                return 0;
-            }
-            if (!PreflightSkip(pf, (uint64_t)entries * 4u))
-                return 0;
-            break;
-        case TBCX_AUX_NEWFORE: {
-            uint32_t numLists = 0, loop = 0, first = 0, duplicate = 0;
-            if (!Tbcx_R_U32(&pf->r, &numLists) ||
-                !Tbcx_R_U32(&pf->r, &loop) ||
-                !Tbcx_R_U32(&pf->r, &first) ||
-                !Tbcx_R_U32(&pf->r, &duplicate))
-                return 0;
-            if (numLists > TBCX_MAX_LITERALS || duplicate != numLists) {
-                R_Error(&pf->r, "tbcx: foreach aux mismatch");
-                return 0;
-            }
-            for (uint32_t list = 0; list < numLists; list++) {
-                uint32_t vars = 0;
-                if (!Tbcx_R_U32(&pf->r, &vars))
+                if (!PreflightSkip(pf, (uint64_t)entries * 12u))
                     return 0;
-                if (vars > TBCX_MAX_LITERALS) {
-                    R_Error(&pf->r, "tbcx: foreach varlist too large");
+                break;
+            case TBCX_AUX_DICTUPD:
+                if (!Tbcx_R_U32(&pf->r, &entries))
+                    return 0;
+                if (entries > TBCX_MAX_LITERALS)
+                {
+                    R_Error(&pf->r, "tbcx: dict-update aux too large");
                     return 0;
                 }
-                if (!PreflightSkip(pf, (uint64_t)vars * 4u))
+                if (!PreflightSkip(pf, (uint64_t)entries * 4u))
                     return 0;
+                break;
+            case TBCX_AUX_NEWFORE:
+            {
+                uint32_t numLists = 0, loop = 0, first = 0, duplicate = 0;
+                if (!Tbcx_R_U32(&pf->r, &numLists) || !Tbcx_R_U32(&pf->r, &loop) || !Tbcx_R_U32(&pf->r, &first) ||
+                    !Tbcx_R_U32(&pf->r, &duplicate))
+                    return 0;
+                if (numLists > TBCX_MAX_LITERALS || duplicate != numLists)
+                {
+                    R_Error(&pf->r, "tbcx: foreach aux mismatch");
+                    return 0;
+                }
+                for (uint32_t list = 0; list < numLists; list++)
+                {
+                    uint32_t vars = 0;
+                    if (!Tbcx_R_U32(&pf->r, &vars))
+                        return 0;
+                    if (vars > TBCX_MAX_LITERALS)
+                    {
+                        R_Error(&pf->r, "tbcx: foreach varlist too large");
+                        return 0;
+                    }
+                    if (!PreflightSkip(pf, (uint64_t)vars * 4u))
+                        return 0;
+                }
+                (void)loop;
+                (void)first;
+                break;
             }
-            (void)loop;
-            (void)first;
-            break;
-        }
-        default:
-            R_Error(&pf->r, "tbcx: unsupported AuxData tag");
-            return 0;
+            default:
+                R_Error(&pf->r, "tbcx: unsupported AuxData tag");
+                return 0;
         }
     }
     *countOut = count;
@@ -1238,15 +1302,11 @@ static int PreflightAuxArray(TbcxPreflight *pf, uint32_t *countOut) {
  * This creates no Tcl_Obj, namespace, command, Proc, Method, shim, or
  * ByteCode, and all temporary allocations are released before returning. */
 static int PreflightValidateBlockSemantics(
-    TbcxPreflight *pf,
-    const unsigned char *code,
-    const TbcxPreflightBlock *block,
-    Tcl_Size auxOffset,
-    Tcl_Size epilogueOffset)
+    TbcxPreflight* pf, const unsigned char* code, const TbcxPreflightBlock* block, Tcl_Size auxOffset, Tcl_Size epilogueOffset)
 {
     TbcxIn validationReader;
-    AuxData *aux = NULL;
-    ExceptionRange *exceptions = NULL;
+    AuxData* aux = NULL;
+    ExceptionRange* exceptions = NULL;
     uint32_t numAux = 0;
     uint32_t numExceptions = 0;
     int result = 0;
@@ -1254,21 +1314,26 @@ static int PreflightValidateBlockSemantics(
     Tbcx_R_InitImage(&validationReader, pf->r.interp, pf->image);
     validationReader.imagePos = auxOffset;
     validationReader.absoluteOffset = (uint64_t)auxOffset;
-    if (!ReadAuxArray(&validationReader, &aux, &numAux) ||
-        !ReadExceptions(&validationReader, &exceptions, &numExceptions)) {
+    if (!ReadAuxArray(&validationReader, &aux, &numAux) || !ReadExceptions(&validationReader, &exceptions, &numExceptions))
+    {
         pf->r.err = TCL_ERROR;
         goto done;
     }
-    if (validationReader.imagePos != epilogueOffset ||
-        numAux != block->numAux ||
-        numExceptions != block->numExceptions) {
-        R_Error(&pf->r,
-            "tbcx: neutral block section boundary mismatch");
+    if (validationReader.imagePos != epilogueOffset || numAux != block->numAux || numExceptions != block->numExceptions)
+    {
+        R_Error(&pf->r, "tbcx: neutral block section boundary mismatch");
         goto done;
     }
-    if (ValidateBlockOperands(pf->r.interp, code, block->codeLen,
-            block->numLiterals, block->numAux, block->numLocals,
-            aux, exceptions, block->numExceptions) != TCL_OK) {
+    if (ValidateBlockOperands(pf->r.interp,
+                              code,
+                              block->codeLen,
+                              block->numLiterals,
+                              block->numAux,
+                              block->numLocals,
+                              aux,
+                              exceptions,
+                              block->numExceptions) != TCL_OK)
+    {
         pf->r.err = TCL_ERROR;
         goto done;
     }
@@ -1281,19 +1346,16 @@ done:
     return result;
 }
 
-static int PreflightBlock(
-    TbcxPreflight *pf,
-    int isTop,
-    TbcxPreflightBlock *result)
+static int PreflightBlock(TbcxPreflight* pf, int isTop, TbcxPreflightBlock* result)
 {
     TbcxPreflightBlock block;
-    const unsigned char *code = NULL;
+    const unsigned char* code = NULL;
 
     memset(&block, 0, sizeof(block));
     pf->totalBlocks++;
     pf->blockDepth++;
-    if (pf->totalBlocks > (256u * 1024u) ||
-        pf->blockDepth > TBCX_MAX_LITERAL_DEPTH) {
+    if (pf->totalBlocks > (256u * 1024u) || pf->blockDepth > TBCX_MAX_LITERAL_DEPTH)
+    {
         R_Error(&pf->r, "tbcx: block nesting/count exceeds limit");
         pf->blockDepth--;
         return 0;
@@ -1301,18 +1363,19 @@ static int PreflightBlock(
 
     if (!Tbcx_R_U32(&pf->r, &block.codeLen))
         goto fail;
-    if (block.codeLen > TBCX_MAX_CODE) {
+    if (block.codeLen > TBCX_MAX_CODE)
+    {
         R_Error(&pf->r, "tbcx: code too large");
         goto fail;
     }
     code = block.codeLen ? pf->r.imageBytes + pf->r.imagePos : NULL;
-    if (!PreflightSkip(pf, block.codeLen) ||
-        !PreflightCodeShape(pf, code, block.codeLen))
+    if (!PreflightSkip(pf, block.codeLen) || !PreflightCodeShape(pf, code, block.codeLen))
         goto fail;
 
     if (!Tbcx_R_U32(&pf->r, &block.numLiterals))
         goto fail;
-    if (block.numLiterals > TBCX_MAX_LITERALS) {
+    if (block.numLiterals > TBCX_MAX_LITERALS)
+    {
         R_Error(&pf->r, "tbcx: too many literals");
         goto fail;
     }
@@ -1326,88 +1389,88 @@ static int PreflightBlock(
 
     if (!Tbcx_R_U32(&pf->r, &block.numExceptions))
         goto fail;
-    if (block.numExceptions > TBCX_MAX_EXCEPT) {
+    if (block.numExceptions > TBCX_MAX_EXCEPT)
+    {
         R_Error(&pf->r, "tbcx: too many exceptions");
         goto fail;
     }
-    for (uint32_t i = 0; i < block.numExceptions; i++) {
+    for (uint32_t i = 0; i < block.numExceptions; i++)
+    {
         uint8_t type = 0;
         uint32_t nesting = 0, start = 0, length = 0;
         uint32_t cont = 0, brk = 0, catchOffset = 0;
-        if (!Tbcx_R_U8(&pf->r, &type) ||
-            !Tbcx_R_U32(&pf->r, &nesting) ||
-            !Tbcx_R_U32(&pf->r, &start) ||
-            !Tbcx_R_U32(&pf->r, &length) ||
-            !Tbcx_R_U32(&pf->r, &cont) ||
-            !Tbcx_R_U32(&pf->r, &brk) ||
+        if (!Tbcx_R_U8(&pf->r, &type) || !Tbcx_R_U32(&pf->r, &nesting) || !Tbcx_R_U32(&pf->r, &start) ||
+            !Tbcx_R_U32(&pf->r, &length) || !Tbcx_R_U32(&pf->r, &cont) || !Tbcx_R_U32(&pf->r, &brk) ||
             !Tbcx_R_U32(&pf->r, &catchOffset))
             goto fail;
-        if (type != (uint8_t)LOOP_EXCEPTION_RANGE &&
-            type != (uint8_t)CATCH_EXCEPTION_RANGE) {
+        if (type != (uint8_t)LOOP_EXCEPTION_RANGE && type != (uint8_t)CATCH_EXCEPTION_RANGE)
+        {
             R_Error(&pf->r, "tbcx: invalid exception range type");
             goto fail;
         }
-        if (nesting >= block.numExceptions || length == 0 ||
-            start >= block.codeLen || length > block.codeLen - start) {
+        if (nesting >= block.numExceptions || length == 0 || start >= block.codeLen || length > block.codeLen - start)
+        {
             R_Error(&pf->r, "tbcx: invalid exception range");
             goto fail;
         }
-        if (type == (uint8_t)LOOP_EXCEPTION_RANGE) {
-            if (catchOffset != UINT32_MAX) {
-                R_Error(&pf->r,
-                    "tbcx: LOOP exception range with catch target");
+        if (type == (uint8_t)LOOP_EXCEPTION_RANGE)
+        {
+            if (catchOffset != UINT32_MAX)
+            {
+                R_Error(&pf->r, "tbcx: LOOP exception range with catch target");
                 goto fail;
             }
-        } else if (cont != UINT32_MAX || brk != UINT32_MAX) {
-            R_Error(&pf->r,
-                "tbcx: CATCH exception range with loop target");
+        }
+        else if (cont != UINT32_MAX || brk != UINT32_MAX)
+        {
+            R_Error(&pf->r, "tbcx: CATCH exception range with loop target");
             goto fail;
         }
     }
 
     Tcl_Size epilogueOffset = pf->r.imagePos;
 
-    if (!Tbcx_R_U32(&pf->r, &block.maxStack) ||
-        !Tbcx_R_U32(&pf->r, &block.policy) ||
-        !Tbcx_R_U32(&pf->r, &block.numLocals))
+    if (!Tbcx_R_U32(&pf->r, &block.maxStack) || !Tbcx_R_U32(&pf->r, &block.policy) || !Tbcx_R_U32(&pf->r, &block.numLocals))
         goto fail;
-    if (block.maxStack > TBCX_MAX_STACK) {
+    if (block.maxStack > TBCX_MAX_STACK)
+    {
         R_Error(&pf->r, "tbcx: maxStack exceeds limit");
         goto fail;
     }
-    if (block.numLocals > TBCX_MAX_LOCALS) {
+    if (block.numLocals > TBCX_MAX_LOCALS)
+    {
         R_Error(&pf->r, "tbcx: numLocals exceeds limit");
         goto fail;
     }
-    if (isTop) {
-        if (Tbcx_ValidateBlockPolicy(pf->r.interp, block.policy) != TCL_OK) {
+    if (isTop)
+    {
+        if (Tbcx_ValidateBlockPolicy(pf->r.interp, block.policy) != TCL_OK)
+        {
             pf->r.err = TCL_ERROR;
             goto fail;
         }
         pf->image->sourcePolicy = block.policy;
         pf->policyKnown = 1;
-        if ((block.policy &
-                TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u &&
-            pf->haveFirstNonempty) {
-            (void)PreflightSourceError(pf, pf->firstNonemptyKind,
-                pf->firstNonemptyOffset);
+        if ((block.policy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u && pf->haveFirstNonempty)
+        {
+            (void)PreflightSourceError(pf, pf->firstNonemptyKind, pf->firstNonemptyOffset);
             goto fail;
         }
-    } else if (block.policy != 0u) {
+    }
+    else if (block.policy != 0u)
+    {
         R_Error(&pf->r, "tbcx: nonzero nested block policy field");
         goto fail;
     }
-    for (uint32_t i = 0; i < block.numLocals; i++) {
-        const unsigned char *name = NULL;
+    for (uint32_t i = 0; i < block.numLocals; i++)
+    {
+        const unsigned char* name = NULL;
         uint32_t nameLength = 0;
-        if (!PreflightLPString(pf, &name, &nameLength, NULL) ||
-            !PreflightKeyName(pf, name, nameLength,
-                "compiled local name"))
+        if (!PreflightLPString(pf, &name, &nameLength, NULL) || !PreflightKeyName(pf, name, nameLength, "compiled local name"))
             goto fail;
     }
 
-    if (!PreflightValidateBlockSemantics(pf, code, &block, auxOffset,
-            epilogueOffset))
+    if (!PreflightValidateBlockSemantics(pf, code, &block, auxOffset, epilogueOffset))
         goto fail;
 
     pf->blockDepth--;
@@ -1420,7 +1483,8 @@ fail:
     return 0;
 }
 
-int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
+int Tbcx_PreflightArtifact(Tcl_Interp* ip, TbcxArtifactImage* image)
+{
     TbcxPreflight pf;
     TbcxPreflightBlock top;
     uint32_t magic = 0, format = 0, tclVersion = 0;
@@ -1438,34 +1502,27 @@ int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
     image->nonemptyExecutableSourceFieldCount = 0;
     image->executableSourceBytes = 0;
 
-    if (!Tbcx_R_U32(&pf.r, &magic) ||
-        !Tbcx_R_U32(&pf.r, &format) ||
-        !Tbcx_R_U32(&pf.r, &tclVersion) ||
-        !Tbcx_R_U64(&pf.r, &headerCodeLen) ||
-        !Tbcx_R_U32(&pf.r, &headerExcept) ||
-        !Tbcx_R_U32(&pf.r, &headerLiterals) ||
-        !Tbcx_R_U32(&pf.r, &headerAux) ||
-        !Tbcx_R_U32(&pf.r, &headerLocals) ||
-        !Tbcx_R_U32(&pf.r, &headerStack) ||
+    if (!Tbcx_R_U32(&pf.r, &magic) || !Tbcx_R_U32(&pf.r, &format) || !Tbcx_R_U32(&pf.r, &tclVersion) ||
+        !Tbcx_R_U64(&pf.r, &headerCodeLen) || !Tbcx_R_U32(&pf.r, &headerExcept) || !Tbcx_R_U32(&pf.r, &headerLiterals) ||
+        !Tbcx_R_U32(&pf.r, &headerAux) || !Tbcx_R_U32(&pf.r, &headerLocals) || !Tbcx_R_U32(&pf.r, &headerStack) ||
         !PreflightLPString(&pf, NULL, NULL, NULL))
         return TCL_ERROR;
-    if (magic != TBCX_MAGIC || format != TBCX_FORMAT) {
+    if (magic != TBCX_MAGIC || format != TBCX_FORMAT)
+    {
         R_Error(&pf.r, "tbcx: bad header (unknown magic or format)");
         return TCL_ERROR;
     }
-    if (tclVersion != Tbcx_PackTclVersion()) {
+    if (tclVersion != Tbcx_PackTclVersion())
+    {
         R_Error(&pf.r, "tbcx: incompatible Tcl version");
         return TCL_ERROR;
     }
 
     if (!PreflightBlock(&pf, 1, &top))
         return TCL_ERROR;
-    if (headerCodeLen != top.codeLen ||
-        headerExcept != top.numExceptions ||
-        headerLiterals != top.numLiterals ||
-        headerAux != top.numAux ||
-        headerLocals != top.numLocals ||
-        headerStack != top.maxStack) {
+    if (headerCodeLen != top.codeLen || headerExcept != top.numExceptions || headerLiterals != top.numLiterals ||
+        headerAux != top.numAux || headerLocals != top.numLocals || headerStack != top.maxStack)
+    {
         R_Error(&pf.r, "tbcx: top-level header/block metadata mismatch");
         return TCL_ERROR;
     }
@@ -1473,33 +1530,29 @@ int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
     uint32_t numProcs = 0;
     if (!Tbcx_R_U32(&pf.r, &numProcs))
         return TCL_ERROR;
-    if (numProcs > TBCX_MAX_PROCS) {
+    if (numProcs > TBCX_MAX_PROCS)
+    {
         R_Error(&pf.r, "tbcx: too many proc records");
         return TCL_ERROR;
     }
-    for (uint32_t i = 0; i < numProcs; i++) {
-        const unsigned char *name = NULL;
-        const unsigned char *ns = NULL;
-        const unsigned char *args = NULL;
+    for (uint32_t i = 0; i < numProcs; i++)
+    {
+        const unsigned char* name = NULL;
+        const unsigned char* ns = NULL;
+        const unsigned char* args = NULL;
         uint32_t nameLength = 0;
         uint32_t nsLength = 0;
         uint32_t argsLength = 0;
         Tcl_Size argumentCount = 0;
         TbcxPreflightBlock body;
-        if (!PreflightLPString(&pf, &name, &nameLength, NULL) ||
-            !PreflightKeyName(&pf, name, nameLength, "proc name") ||
-            !PreflightLPString(&pf, &ns, &nsLength, NULL) ||
-            !PreflightAbsoluteName(&pf, ns, nsLength,
-                "proc namespace") ||
-            !PreflightLPString(&pf, &args, &argsLength, NULL) ||
-            !PreflightArgumentList(&pf, args, argsLength,
-                &argumentCount) ||
-            !PreflightExecutableSource(&pf, TBCX_EXEC_SOURCE_PROC) ||
-            !PreflightBlock(&pf, 0, &body))
+        if (!PreflightLPString(&pf, &name, &nameLength, NULL) || !PreflightKeyName(&pf, name, nameLength, "proc name") ||
+            !PreflightLPString(&pf, &ns, &nsLength, NULL) || !PreflightAbsoluteName(&pf, ns, nsLength, "proc namespace") ||
+            !PreflightLPString(&pf, &args, &argsLength, NULL) || !PreflightArgumentList(&pf, args, argsLength, &argumentCount) ||
+            !PreflightExecutableSource(&pf, TBCX_EXEC_SOURCE_PROC) || !PreflightBlock(&pf, 0, &body))
             return TCL_ERROR;
-        if (argumentCount > body.numLocals) {
-            R_Error(&pf.r,
-                "tbcx: proc arguments exceed compiled local count");
+        if (argumentCount > body.numLocals)
+        {
+            R_Error(&pf.r, "tbcx: proc arguments exceed compiled local count");
             return TCL_ERROR;
         }
     }
@@ -1507,30 +1560,30 @@ int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
     uint32_t numClasses = 0;
     if (!Tbcx_R_U32(&pf.r, &numClasses))
         return TCL_ERROR;
-    if (numClasses > TBCX_MAX_CLASSES) {
+    if (numClasses > TBCX_MAX_CLASSES)
+    {
         R_Error(&pf.r, "tbcx: too many class records");
         return TCL_ERROR;
     }
-    for (uint32_t i = 0; i < numClasses; i++) {
-        const unsigned char *className = NULL;
+    for (uint32_t i = 0; i < numClasses; i++)
+    {
+        const unsigned char* className = NULL;
         uint32_t classNameLength = 0;
         uint32_t numSupers = 0;
         if (!PreflightLPString(&pf, &className, &classNameLength, NULL) ||
-            !PreflightAbsoluteName(&pf, className, classNameLength,
-                "class FQN") ||
-            !Tbcx_R_U32(&pf.r, &numSupers))
+            !PreflightAbsoluteName(&pf, className, classNameLength, "class FQN") || !Tbcx_R_U32(&pf.r, &numSupers))
             return TCL_ERROR;
-        if (numSupers > 1024u) {
+        if (numSupers > 1024u)
+        {
             R_Error(&pf.r, "tbcx: too many superclasses");
             return TCL_ERROR;
         }
-        for (uint32_t s = 0; s < numSupers; s++) {
-            const unsigned char *superName = NULL;
+        for (uint32_t s = 0; s < numSupers; s++)
+        {
+            const unsigned char* superName = NULL;
             uint32_t superNameLength = 0;
-            if (!PreflightLPString(&pf, &superName,
-                    &superNameLength, NULL) ||
-                !PreflightAbsoluteName(&pf, superName,
-                    superNameLength, "superclass FQN"))
+            if (!PreflightLPString(&pf, &superName, &superNameLength, NULL) ||
+                !PreflightAbsoluteName(&pf, superName, superNameLength, "superclass FQN"))
                 return TCL_ERROR;
         }
     }
@@ -1538,51 +1591,47 @@ int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
     uint32_t numMethods = 0;
     if (!Tbcx_R_U32(&pf.r, &numMethods))
         return TCL_ERROR;
-    if (numMethods > TBCX_MAX_METHODS) {
+    if (numMethods > TBCX_MAX_METHODS)
+    {
         R_Error(&pf.r, "tbcx: too many method records");
         return TCL_ERROR;
     }
-    for (uint32_t i = 0; i < numMethods; i++) {
-        const unsigned char *className = NULL;
-        const unsigned char *name = NULL;
-        const unsigned char *args = NULL;
+    for (uint32_t i = 0; i < numMethods; i++)
+    {
+        const unsigned char* className = NULL;
+        const unsigned char* name = NULL;
+        const unsigned char* args = NULL;
         uint8_t kind = 0, scope = 0, origin = 0;
         uint32_t classNameLength = 0, nameLength = 0, argsLength = 0;
         Tcl_Size argumentCount = 0;
         TbcxPreflightBlock body;
         if (!PreflightLPString(&pf, &className, &classNameLength, NULL) ||
-            !PreflightAbsoluteName(&pf, className, classNameLength,
-                "method class FQN") ||
-            !Tbcx_R_U8(&pf.r, &kind) ||
-            !Tbcx_R_U8(&pf.r, &scope) ||
-            !Tbcx_R_U8(&pf.r, &origin))
+            !PreflightAbsoluteName(&pf, className, classNameLength, "method class FQN") || !Tbcx_R_U8(&pf.r, &kind) ||
+            !Tbcx_R_U8(&pf.r, &scope) || !Tbcx_R_U8(&pf.r, &origin))
             return TCL_ERROR;
-        if (Tbcx_ValidateMethodMetadata(ip, kind, scope, origin) != TCL_OK) {
+        if (Tbcx_ValidateMethodMetadata(ip, kind, scope, origin) != TCL_OK)
+        {
             pf.r.err = TCL_ERROR;
             return TCL_ERROR;
         }
-        if (!PreflightLPString(&pf, &name, &nameLength, NULL) ||
-            !PreflightKeyName(&pf, name, nameLength, "method name") ||
-            !PreflightLPString(&pf, &args, &argsLength, NULL) ||
-            !PreflightArgumentList(&pf, args, argsLength,
-                &argumentCount))
+        if (!PreflightLPString(&pf, &name, &nameLength, NULL) || !PreflightKeyName(&pf, name, nameLength, "method name") ||
+            !PreflightLPString(&pf, &args, &argsLength, NULL) || !PreflightArgumentList(&pf, args, argsLength, &argumentCount))
             return TCL_ERROR;
-        if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) &&
-            nameLength != 0u) {
-            R_Error(&pf.r,
-                "tbcx: constructor/destructor record has a method name");
+        if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && nameLength != 0u)
+        {
+            R_Error(&pf.r, "tbcx: constructor/destructor record has a method name");
             return TCL_ERROR;
         }
-        if (kind == TBCX_METH_DTOR && argsLength != 0u) {
+        if (kind == TBCX_METH_DTOR && argsLength != 0u)
+        {
             R_Error(&pf.r, "tbcx: destructor record has arguments");
             return TCL_ERROR;
         }
-        if (!PreflightExecutableSource(&pf, TBCX_EXEC_SOURCE_METHOD) ||
-            !PreflightBlock(&pf, 0, &body))
+        if (!PreflightExecutableSource(&pf, TBCX_EXEC_SOURCE_METHOD) || !PreflightBlock(&pf, 0, &body))
             return TCL_ERROR;
-        if (argumentCount > body.numLocals) {
-            R_Error(&pf.r,
-                "tbcx: method arguments exceed compiled local count");
+        if (argumentCount > body.numLocals)
+        {
+            R_Error(&pf.r, "tbcx: method arguments exceed compiled local count");
             return TCL_ERROR;
         }
     }
@@ -1593,37 +1642,39 @@ int Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image) {
 }
 
 #ifdef TBCX_BENCH_COUNTERS
-static uint64_t BenchCounterValue(_Atomic uint64_t *counter, int reset) {
-    return reset
-        ? atomic_exchange_explicit(counter, 0u, memory_order_relaxed)
-        : atomic_load_explicit(counter, memory_order_relaxed);
+static uint64_t BenchCounterValue(_Atomic uint64_t* counter, int reset)
+{
+    return reset ? atomic_exchange_explicit(counter, 0u, memory_order_relaxed)
+                 : atomic_load_explicit(counter, memory_order_relaxed);
 }
 
-static int BenchCounterPut(Tcl_Interp *ip, Tcl_Obj *dict,
-                           const char *name, _Atomic uint64_t *counter,
-                           int reset) {
-    return Tcl_DictObjPut(ip, dict, Tcl_NewStringObj(name, -1),
-        Tcl_NewWideIntObj((Tcl_WideInt)BenchCounterValue(counter, reset)));
+static int BenchCounterPut(Tcl_Interp* ip, Tcl_Obj* dict, const char* name, _Atomic uint64_t* counter, int reset)
+{
+    return Tcl_DictObjPut(
+        ip, dict, Tcl_NewStringObj(name, -1), Tcl_NewWideIntObj((Tcl_WideInt)BenchCounterValue(counter, reset)));
 }
 
-int Tbcx_BenchStatsObjCmd(TCL_UNUSED(void *), Tcl_Interp *ip, Tcl_Size objc,
-                          Tcl_Obj *const objv[]) {
+int Tbcx_BenchStatsObjCmd(TCL_UNUSED(void*), Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     int reset = 0;
 
     TBCX_CHECK_INTERP_THREAD(ip);
-    if (objc == 2 && strcmp(Tbcx_GetStringSafe(objv[1]), "reset") == 0) {
+    if (objc == 2 && strcmp(Tbcx_GetStringSafe(objv[1]), "reset") == 0)
+    {
         reset = 1;
-    } else if (objc != 1) {
+    }
+    else if (objc != 1)
+    {
         Tcl_WrongNumArgs(ip, 1, objv, "?reset?");
         return TCL_ERROR;
     }
 
-    Tcl_Obj *dict = Tcl_NewDictObj();
-#define TBCX_BENCH_PUT(field_) \
-    do { \
-        if (BenchCounterPut(ip, dict, #field_, &tbcxBench.field_, reset) \
-                != TCL_OK) \
-            return TCL_ERROR; \
+    Tcl_Obj* dict = Tcl_NewDictObj();
+#define TBCX_BENCH_PUT(field_)                                                                                                   \
+    do                                                                                                                           \
+    {                                                                                                                            \
+        if (BenchCounterPut(ip, dict, #field_, &tbcxBench.field_, reset) != TCL_OK)                                              \
+            return TCL_ERROR;                                                                                                    \
     } while (0)
     TBCX_BENCH_PUT(bytecodeBlocks);
     TBCX_BENCH_PUT(codeCopyOps);
@@ -1650,55 +1701,38 @@ int Tbcx_BenchStatsObjCmd(TCL_UNUSED(void *), Tcl_Interp *ip, Tcl_Size objc,
 }
 #endif
 
-static inline void RefreshBC(ByteCode *bcPtr, Tcl_Interp *ip, Namespace *nsPtr) {
+static inline void RefreshBC(ByteCode* bcPtr, Tcl_Interp* ip, Namespace* nsPtr)
+{
     if (!bcPtr)
         return;
-    Interp *iPtr = (Interp *)ip;
-    /* Release the previous interpHandle (if any) before preserving the new
-       one.  Without this, stale handles can accumulate and -- in nested
-       child interpreters -- reference freed interp structures. */
+    Interp* iPtr = (Interp*)ip;
+    /* Replace the interpreter handle and refresh the compile/namespace
+     * epochs. */
     if (bcPtr->interpHandle)
         TclHandleRelease(bcPtr->interpHandle);
     bcPtr->interpHandle = TclHandlePreserve(iPtr->handle);
     bcPtr->compileEpoch = iPtr->compileEpoch;
-    bcPtr->nsPtr        = nsPtr;
-    bcPtr->nsEpoch      = nsPtr ? nsPtr->resolverEpoch : 0;
+    bcPtr->nsPtr = nsPtr;
+    bcPtr->nsEpoch = nsPtr ? nsPtr->resolverEpoch : 0;
 }
 
-/* FixLiteralPoolProcPtr — propagate a ByteCode's procPtr to all bytecode
- * literals in its literal pool that currently have procPtr=NULL.
- *
- * The saver's P1/P2 optimizations precompile body literals (namespace eval,
- * while, for, foreach, try, if bodies) as separate TBCX_LIT_BYTESRC objects
- * in the literal pool.  These inner bytecodes are created with procPtr=NULL
- * because their enclosing proc context is not known at literal-read time.
- *
- * When the bytecode engine (TEBCresume) evaluates one of these inner bodies
- * via an NRE yield/resume path (e.g. coroutine yield inside a while loop),
- * it dereferences codePtr->procPtr->firstLocalPtr without a NULL guard.
- * If procPtr is NULL, this crashes at address 0x30 (offset of firstLocalPtr
- * in the Proc struct on 64-bit).
- *
- * This function propagates the parent ByteCode's procPtr to all
- * NULL-procPtr bytecode literals, matching the semantic that these
- * body literals execute in the enclosing proc's context.
- *
- * ByteCode.procPtr is a non-owning backpointer — TclReleaseByteCode
- * does not decrement it.  Proc lifetime is managed by the procbody/
- * lambda internal rep via TclProcCleanupProc.  The inner bytecode
- * literals live in the parent's literal pool and are freed when the
- * parent ByteCode is freed, so the backpointers cannot outlive the
- * Proc they point to.  No refCount increment is needed. */
-static void FixLiteralPoolProcPtr(ByteCode *bcPtr) {
+/* Assign the enclosing Proc to nested bytecode literals whose procPtr is
+ * NULL. These literals execute in the enclosing procedure context.
+ * ByteCode.procPtr is a non-owning backpointer; Proc lifetime is held by the
+ * procbody or lambda representation. */
+static void FixLiteralPoolProcPtr(ByteCode* bcPtr)
+{
     if (!bcPtr || !bcPtr->procPtr || bcPtr->numLitObjects <= 0 || !bcPtr->objArrayPtr)
         return;
     assert(bcPtr->procPtr->iPtr != NULL && "FixLiteralPoolProcPtr: procPtr->iPtr must be non-NULL");
-    Tcl_Obj **litObjv = bcPtr->objArrayPtr;
-    for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++) {
+    Tcl_Obj** litObjv = bcPtr->objArrayPtr;
+    for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++)
+    {
         if (!litObjv[i])
             continue;
-        ByteCode *litBC = TbcxGetByteCode(litObjv[i]);
-        if (litBC && !litBC->procPtr) {
+        ByteCode* litBC = TbcxGetByteCode(litObjv[i]);
+        if (litBC && !litBC->procPtr)
+        {
             litBC->procPtr = bcPtr->procPtr; /* non-owning backpointer */
             FixLiteralPoolProcPtr(litBC);
         }
@@ -1712,15 +1746,18 @@ static void FixLiteralPoolProcPtr(ByteCode *bcPtr) {
  * freeing a Proc that was propagated into nested bytecode literals,
  * call this to eliminate all dangling backpointers — not just the
  * immediate children but the full recursive tree. */
-static void NullLiteralPoolProcPtr(ByteCode *bcPtr, Proc *target) {
+static void NullLiteralPoolProcPtr(ByteCode* bcPtr, Proc* target)
+{
     if (!bcPtr || !target || bcPtr->numLitObjects <= 0 || !bcPtr->objArrayPtr)
         return;
-    Tcl_Obj **litObjv = bcPtr->objArrayPtr;
-    for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++) {
+    Tcl_Obj** litObjv = bcPtr->objArrayPtr;
+    for (Tcl_Size i = 0; i < bcPtr->numLitObjects; i++)
+    {
         if (!litObjv[i])
             continue;
-        ByteCode *litBC = TbcxGetByteCode(litObjv[i]);
-        if (litBC && litBC->procPtr == target) {
+        ByteCode* litBC = TbcxGetByteCode(litObjv[i]);
+        if (litBC && litBC->procPtr == target)
+        {
             litBC->procPtr = NULL;
             NullLiteralPoolProcPtr(litBC, target);
         }
@@ -1745,16 +1782,18 @@ static void NullLiteralPoolProcPtr(ByteCode *bcPtr, Proc *target) {
  * The KEEP path is used by procs, methods, and lambdas reconstructed from a
  * procbody.  It preserves deserialized non-argument local names and adds the
  * argument extras area Tcl's InitArgsAndLocals expects. */
-static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
+static void TbcxFixLocalCacheExtras(ByteCode* bcPtr, Proc* procPtr)
+{
     if (!bcPtr || !procPtr || !bcPtr->localCachePtr)
         return;
 
-    LocalCache *old     = bcPtr->localCachePtr;
-    Tcl_Size    numVars = old->numVars;
-    Tcl_Size    numArgs = procPtr->numArgs;
+    LocalCache* old = bcPtr->localCachePtr;
+    Tcl_Size numVars = old->numVars;
+    Tcl_Size numArgs = procPtr->numArgs;
 
-    size_t      nameBytes, extraBytes, bytes;
-    if (!tbcx_checked_mul((size_t)numVars, sizeof(Tcl_Obj *), &nameBytes) || !tbcx_checked_mul((size_t)numArgs, sizeof(Var), &extraBytes))
+    size_t nameBytes, extraBytes, bytes;
+    if (!tbcx_checked_mul((size_t)numVars, sizeof(Tcl_Obj*), &nameBytes) ||
+        !tbcx_checked_mul((size_t)numArgs, sizeof(Var), &extraBytes))
         return; /* overflow — skip cache fix; Tcl rebuilds on first call */
     bytes = offsetof(LocalCache, varName0);
     if (nameBytes > SIZE_MAX - bytes)
@@ -1763,15 +1802,16 @@ static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
     if (extraBytes > SIZE_MAX - bytes)
         return;
     bytes += extraBytes;
-    LocalCache *lc = (LocalCache *)Tcl_Alloc(bytes);
+    LocalCache* lc = (LocalCache*)Tcl_Alloc(bytes);
     memset(lc, 0, bytes);
-    lc->refCount       = 1;
-    lc->numVars        = numVars;
+    lc->refCount = 1;
+    lc->numVars = numVars;
 
     /* Copy variable names from the old (TBCX) cache */
-    Tcl_Obj **oldNames = (Tcl_Obj **)&old->varName0;
-    Tcl_Obj **newNames = (Tcl_Obj **)&lc->varName0;
-    for (Tcl_Size i = 0; i < numVars; i++) {
+    Tcl_Obj** oldNames = (Tcl_Obj**)&old->varName0;
+    Tcl_Obj** newNames = (Tcl_Obj**)&lc->varName0;
+    for (Tcl_Size i = 0; i < numVars; i++)
+    {
         newNames[i] = oldNames[i];
         if (newNames[i])
             Tcl_IncrRefCount(newNames[i]);
@@ -1779,18 +1819,22 @@ static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
 
     /* Populate the extras area from the Proc's CompiledLocal chain.
        Each argument gets: flags (VAR_IS_ARGS bit) and defValuePtr. */
-    if (numArgs > 0) {
-        Var           *varPtr = (Var *)(newNames + numVars);
-        CompiledLocal *cl     = procPtr->firstLocalPtr;
-        for (Tcl_Size a = 0; a < numArgs && cl; a++, cl = cl->nextPtr) {
-            varPtr[a].flags        = (cl->flags & VAR_IS_ARGS);
+    if (numArgs > 0)
+    {
+        Var* varPtr = (Var*)(newNames + numVars);
+        CompiledLocal* cl = procPtr->firstLocalPtr;
+        for (Tcl_Size a = 0; a < numArgs && cl; a++, cl = cl->nextPtr)
+        {
+            varPtr[a].flags = (cl->flags & VAR_IS_ARGS);
             varPtr[a].value.objPtr = cl->defValuePtr;
         }
     }
 
     /* Release old cache and install new one */
-    if (--old->refCount <= 0) {
-        for (Tcl_Size i = 0; i < old->numVars; i++) {
+    if (--old->refCount <= 0)
+    {
+        for (Tcl_Size i = 0; i < old->numVars; i++)
+        {
             if (oldNames[i])
                 Tcl_DecrRefCount(oldNames[i]);
         }
@@ -1804,10 +1848,11 @@ static void TbcxFixLocalCacheExtras(ByteCode *bcPtr, Proc *procPtr) {
  * management for what is purely a transient lookup key.  Caller must call
  * Tcl_DStringFree(ds) when done.
  * Returns 1 on success, 0 if a required string object is invalid. */
-static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj *name) {
+static int MethodKeyBuf(Tcl_DString* ds, Tcl_Obj* clsFqn, uint8_t kind, uint8_t origin, Tcl_Obj* name)
+{
     Tcl_DStringInit(ds);
-    Tcl_Size    fqnLen = 0;
-    const char *fqn    = Tbcx_GetStringFromObjStrict(NULL, clsFqn, &fqnLen);
+    Tcl_Size fqnLen = 0;
+    const char* fqn = Tbcx_GetStringFromObjStrict(NULL, clsFqn, &fqnLen);
     if (!fqn)
         return 0;
     Tcl_DStringAppend(ds, fqn, fqnLen);
@@ -1817,14 +1862,17 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t 
          * without a Tcl_Obj round-trip.  Falls back to two digits for values
          * up to 99, which covers any future extension. */
         char kindBuf[4];
-        int  kindLen;
-        if (kind < 10) {
+        int kindLen;
+        if (kind < 10)
+        {
             kindBuf[0] = '0' + (char)kind;
-            kindLen    = 1;
-        } else {
+            kindLen = 1;
+        }
+        else
+        {
             kindBuf[0] = '0' + (char)(kind / 10);
             kindBuf[1] = '0' + (char)(kind % 10);
-            kindLen    = 2;
+            kindLen = 2;
         }
         Tcl_DStringAppend(ds, kindBuf, kindLen);
     }
@@ -1836,10 +1884,12 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t 
         Tcl_DStringAppend(ds, ob, 1);
     }
     Tcl_DStringAppend(ds, "\x1F", 1);
-    if (name) {
-        Tcl_Size    nLen = 0;
-        const char *n    = Tbcx_GetStringFromObjStrict(NULL, name, &nLen);
-        if (!n) {
+    if (name)
+    {
+        Tcl_Size nLen = 0;
+        const char* n = Tbcx_GetStringFromObjStrict(NULL, name, &nLen);
+        if (!n)
+        {
             Tcl_DStringFree(ds);
             return 0;
         }
@@ -1851,11 +1901,12 @@ static int MethodKeyBuf(Tcl_DString *ds, Tcl_Obj *clsFqn, uint8_t kind, uint8_t 
 /* PairScope — extract the TBCX_MSCOPE_* scope from a {args, procbody, scope}
  * methodsByKey triple.  Returns TBCX_MSCOPE_DEFAULT when the third element is
  * absent (defensive) or unreadable. */
-static int PairScope(Tcl_Interp *ip, Tcl_Obj *pair) {
+static int PairScope(Tcl_Interp* ip, Tcl_Obj* pair)
+{
     if (!pair)
         return TBCX_MSCOPE_DEFAULT;
-    Tcl_Size  n     = 0;
-    Tcl_Obj **elems = NULL;
+    Tcl_Size n = 0;
+    Tcl_Obj** elems = NULL;
     if (Tcl_ListObjGetElements(ip, pair, &n, &elems) != TCL_OK || n < 3)
         return TBCX_MSCOPE_DEFAULT;
     Tcl_WideInt v = 0;
@@ -1866,32 +1917,21 @@ static int PairScope(Tcl_Interp *ip, Tcl_Obj *pair) {
     return (int)v;
 }
 
-/* OOShim_TakeRecord — pop and return the FRONT (oldest) precompiled
- * {args, procbody, scope} triple for a method key, or NULL if the key is
- * absent or its FIFO list is empty.
- *
- * Records are appended by ReadMethod in serialization order, which equals the
- * source's definition order.  Consuming the front therefore hands each
- * definition site the body the source defined at that point — this is what
- * makes interleaved same-key redefinitions (e.g. `oo::define C { method m … }`
- * observed, then redefined, then observed again) install the right body each
- * time, where a single-slot last-write-wins hash could not.
- *
- * The popped triple is moved onto os->retired (which keeps a reference) rather
- * than returned with a transferred reference, so its precompiled Proc stays
- * alive for the remainder of the load.  The caller therefore borrows the
- * result and must NOT DecrRefCount it. */
-static Tcl_Obj *OOShim_TakeRecord(OOShim *os, const char *key) {
-    Tcl_HashEntry *he = Tcl_FindHashEntry(&os->methodsByKey, key);
+/* Pop and return the oldest precompiled {args, procbody, scope} triple for a
+ * method key. Records use source-definition order. The popped triple moves to
+ * os->retired for the remainder of the load, and the caller borrows it. */
+static Tcl_Obj* OOShim_TakeRecord(OOShim* os, const char* key)
+{
+    Tcl_HashEntry* he = Tcl_FindHashEntry(&os->methodsByKey, key);
     if (!he)
         return NULL;
-    Tcl_Obj *list = (Tcl_Obj *)Tcl_GetHashValue(he);
+    Tcl_Obj* list = (Tcl_Obj*)Tcl_GetHashValue(he);
     if (!list)
         return NULL;
     Tcl_Size n = 0;
     if (Tcl_ListObjLength(NULL, list, &n) != TCL_OK || n <= 0)
         return NULL;
-    Tcl_Obj *front = NULL;
+    Tcl_Obj* front = NULL;
     if (Tcl_ListObjIndex(NULL, list, 0, &front) != TCL_OK || !front)
         return NULL;
     /* Retain on os->retired BEFORE removing from the FIFO so the triple's
@@ -1902,31 +1942,28 @@ static Tcl_Obj *OOShim_TakeRecord(OOShim *os, const char *key) {
     return front;
 }
 
-/* TbcxApplyExportVisibility — set a freshly-installed method's export state
- * (public vs unexported) through TclOO's own `oo::define export|unexport`.
- * Those subcommands require Tcl's full ensemble-dispatch context, so a direct
- * savedDefineProc call silently no-ops; we temporarily restore the original
- * oo::define handler on the Command struct (removing the shim so there is no
- * re-entrancy through CmdOOShim), evaluate, then re-install the shim.  Safe
- * because the loader is single-threaded and no user code runs in between. */
-static int TbcxApplyExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *name, int makePublic) {
+/* Set method visibility through TclOO's `oo::define export|unexport` ensemble
+ * dispatch. The original handler is active during evaluation and the shim is
+ * reinstalled afterward. No user code runs while handlers are exchanged. */
+static int TbcxApplyExportVisibility(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, Tcl_Obj* name, int makePublic)
+{
     if (!os->defineCmdPtr || !name)
         return TCL_OK; /* nothing we can safely do */
-    os->defineCmdPtr->objProc2       = os->savedDefineProc;
+    os->defineCmdPtr->objProc2 = os->savedDefineProc;
     os->defineCmdPtr->objClientData2 = os->savedDefineCD;
     if (os->savedDefineNre)
         os->defineCmdPtr->nreProc2 = os->savedDefineNre;
 
-    Tcl_Obj *defCmd = Tcl_NewStringObj("oo::define", -1);
+    Tcl_Obj* defCmd = Tcl_NewStringObj("oo::define", -1);
     Tcl_IncrRefCount(defCmd);
-    Tcl_Obj *sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
+    Tcl_Obj* sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
     Tcl_IncrRefCount(sub);
-    Tcl_Obj *av[4] = {defCmd, clsFqn, sub, name};
-    int      rc    = Tcl_EvalObjv(ip, 4, av, 0);
+    Tcl_Obj* av[4] = {defCmd, clsFqn, sub, name};
+    int rc = Tcl_EvalObjv(ip, 4, av, 0);
     Tcl_DecrRefCount(sub);
     Tcl_DecrRefCount(defCmd);
 
-    os->defineCmdPtr->objProc2       = CmdOOShim;
+    os->defineCmdPtr->objProc2 = CmdOOShim;
     os->defineCmdPtr->objClientData2 = os;
     if (os->savedDefineNre)
         os->defineCmdPtr->nreProc2 = CmdOOShim;
@@ -1938,24 +1975,25 @@ static int TbcxApplyExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn
 /* TbcxApplyObjExportVisibility — like TbcxApplyExportVisibility but for a
  * per-object method, routing through `oo::objdefine OBJ export|unexport NAME`
  * with the objdefine shim temporarily removed. */
-static int TbcxApplyObjExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, int makePublic) {
+static int TbcxApplyObjExportVisibility(Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* name, int makePublic)
+{
     if (!os->hasObjDefine || !os->objdefCmdPtr || !name)
         return TCL_OK;
-    os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+    os->objdefCmdPtr->objProc2 = os->savedObjdefProc;
     os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
     if (os->savedObjdefNre)
         os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
 
-    Tcl_Obj *defCmd = Tcl_NewStringObj("oo::objdefine", -1);
+    Tcl_Obj* defCmd = Tcl_NewStringObj("oo::objdefine", -1);
     Tcl_IncrRefCount(defCmd);
-    Tcl_Obj *sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
+    Tcl_Obj* sub = Tcl_NewStringObj(makePublic ? "export" : "unexport", -1);
     Tcl_IncrRefCount(sub);
-    Tcl_Obj *av[4] = {defCmd, objFqn, sub, name};
-    int      rc    = Tcl_EvalObjv(ip, 4, av, 0);
+    Tcl_Obj* av[4] = {defCmd, objFqn, sub, name};
+    int rc = Tcl_EvalObjv(ip, 4, av, 0);
     Tcl_DecrRefCount(sub);
     Tcl_DecrRefCount(defCmd);
 
-    os->objdefCmdPtr->objProc2       = CmdOOShimObjDef;
+    os->objdefCmdPtr->objProc2 = CmdOOShimObjDef;
     os->objdefCmdPtr->objClientData2 = os;
     if (os->savedObjdefNre)
         os->objdefCmdPtr->nreProc2 = CmdOOShimObjDef;
@@ -1967,18 +2005,20 @@ static int TbcxApplyObjExportVisibility(Tcl_Interp *ip, OOShim *os, Tcl_Obj *obj
 /* TbcxInstallObjPrivateMethod — (re)create a per-object true-private method
  * with the precompiled body via the flat `oo::objdefine OBJ private method`
  * form so the TIP 500 true-private scope is established by TclOO itself. */
-static int TbcxInstallObjPrivateMethod(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody, uint8_t kind) {
-    Tcl_Obj *cmd = Tcl_NewStringObj("oo::objdefine", -1);
+static int TbcxInstallObjPrivateMethod(
+    Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* name, Tcl_Obj* args, Tcl_Obj* preBody, uint8_t kind)
+{
+    Tcl_Obj* cmd = Tcl_NewStringObj("oo::objdefine", -1);
     Tcl_IncrRefCount(cmd);
-    Tcl_Obj *priv = Tcl_NewStringObj("private", -1);
+    Tcl_Obj* priv = Tcl_NewStringObj("private", -1);
     Tcl_IncrRefCount(priv);
-    Tcl_Obj *sub = Tcl_NewStringObj((kind == TBCX_METH_CLASS) ? "classmethod" : "method", -1);
+    Tcl_Obj* sub = Tcl_NewStringObj((kind == TBCX_METH_CLASS) ? "classmethod" : "method", -1);
     Tcl_IncrRefCount(sub);
     Tcl_IncrRefCount(name);
     Tcl_IncrRefCount(args);
     Tcl_IncrRefCount(preBody);
-    Tcl_Obj *av[7] = {cmd, objFqn, priv, sub, name, args, preBody};
-    int      rc    = os->savedObjdefProc(os->savedObjdefCD, ip, 7, av);
+    Tcl_Obj* av[7] = {cmd, objFqn, priv, sub, name, args, preBody};
+    int rc = os->savedObjdefProc(os->savedObjdefCD, ip, 7, av);
     Tcl_DecrRefCount(preBody);
     Tcl_DecrRefCount(args);
     Tcl_DecrRefCount(name);
@@ -1988,21 +2028,23 @@ static int TbcxInstallObjPrivateMethod(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objF
     return rc;
 }
 
-static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_Obj *nameOpt, Tcl_Obj *argsOpt, Tcl_Obj *bodyOpt, int scope) {
-    if (!ip || !os || !clsFqn || !bodyOpt || kind > TBCX_METH_SELF ||
-        scope < TBCX_MSCOPE_DEFAULT || scope > TBCX_MSCOPE_TRUE_PRIVATE ||
-        ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS ||
-          kind == TBCX_METH_SELF) && (!nameOpt || !argsOpt)) ||
-        (kind == TBCX_METH_CTOR && !argsOpt)) {
-        if (ip) {
-            Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                "tbcx: invalid internal method-definition arguments", -1));
+static int
+DefOO(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, uint8_t kind, Tcl_Obj* nameOpt, Tcl_Obj* argsOpt, Tcl_Obj* bodyOpt, int scope)
+{
+    if (!ip || !os || !clsFqn || !bodyOpt || kind > TBCX_METH_SELF || scope < TBCX_MSCOPE_DEFAULT ||
+        scope > TBCX_MSCOPE_TRUE_PRIVATE ||
+        ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS || kind == TBCX_METH_SELF) && (!nameOpt || !argsOpt)) ||
+        (kind == TBCX_METH_CTOR && !argsOpt))
+    {
+        if (ip)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid internal method-definition arguments", -1));
         }
         return TCL_ERROR;
     }
-    int      rc    = TCL_OK;
+    int rc = TCL_OK;
     /* argv0 is only used for error messages in the original handler */
-    Tcl_Obj *argv0 = Tcl_NewStringObj("oo::define", -1);
+    Tcl_Obj* argv0 = Tcl_NewStringObj("oo::define", -1);
     Tcl_IncrRefCount(argv0);
 
     /* Fast path for methods (instance/class).  The method visibility (scope)
@@ -2016,34 +2058,40 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
          - PUBLIC/UNEXPORTED on `classmethod` (which does NOT accept options):
            create name-default, then apply export/unexport via TclOO.
          - DEFAULT: name-case visibility. */
-    if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) {
-        const char *kwStr = (kind == TBCX_METH_CLASS) ? "classmethod" : "method";
+    if (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS)
+    {
+        const char* kwStr = (kind == TBCX_METH_CLASS) ? "classmethod" : "method";
         Tcl_IncrRefCount(nameOpt);
         Tcl_IncrRefCount(argsOpt);
         Tcl_IncrRefCount(bodyOpt);
-        if (scope == TBCX_MSCOPE_TRUE_PRIVATE) {
-            Tcl_Obj *priv = Tcl_NewStringObj("private", -1);
+        if (scope == TBCX_MSCOPE_TRUE_PRIVATE)
+        {
+            Tcl_Obj* priv = Tcl_NewStringObj("private", -1);
             Tcl_IncrRefCount(priv);
-            Tcl_Obj *sub = Tcl_NewStringObj(kwStr, -1);
+            Tcl_Obj* sub = Tcl_NewStringObj(kwStr, -1);
             Tcl_IncrRefCount(sub);
-            Tcl_Obj *av[7] = {argv0, clsFqn, priv, sub, nameOpt, argsOpt, bodyOpt};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+            Tcl_Obj* av[7] = {argv0, clsFqn, priv, sub, nameOpt, argsOpt, bodyOpt};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
             Tcl_DecrRefCount(sub);
             Tcl_DecrRefCount(priv);
-        } else if (kind == TBCX_METH_INST && (scope == TBCX_MSCOPE_PUBLIC || scope == TBCX_MSCOPE_UNEXPORTED)) {
-            Tcl_Obj *sub = Tcl_NewStringObj("method", -1);
+        }
+        else if (kind == TBCX_METH_INST && (scope == TBCX_MSCOPE_PUBLIC || scope == TBCX_MSCOPE_UNEXPORTED))
+        {
+            Tcl_Obj* sub = Tcl_NewStringObj("method", -1);
             Tcl_IncrRefCount(sub);
-            Tcl_Obj *opt = Tcl_NewStringObj((scope == TBCX_MSCOPE_PUBLIC) ? "-export" : "-unexport", -1);
+            Tcl_Obj* opt = Tcl_NewStringObj((scope == TBCX_MSCOPE_PUBLIC) ? "-export" : "-unexport", -1);
             Tcl_IncrRefCount(opt);
-            Tcl_Obj *av[7] = {argv0, clsFqn, sub, nameOpt, opt, argsOpt, bodyOpt};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+            Tcl_Obj* av[7] = {argv0, clsFqn, sub, nameOpt, opt, argsOpt, bodyOpt};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
             Tcl_DecrRefCount(opt);
             Tcl_DecrRefCount(sub);
-        } else {
-            Tcl_Obj *sub = Tcl_NewStringObj(kwStr, -1);
+        }
+        else
+        {
+            Tcl_Obj* sub = Tcl_NewStringObj(kwStr, -1);
             Tcl_IncrRefCount(sub);
-            Tcl_Obj *av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 6, av);
+            Tcl_Obj* av[6] = {argv0, clsFqn, sub, nameOpt, argsOpt, bodyOpt};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 6, av);
             Tcl_DecrRefCount(sub);
             /* classmethod cannot carry an option; apply export/unexport now. */
             if (rc == TCL_OK && kind == TBCX_METH_CLASS && (scope == TBCX_MSCOPE_PUBLIC || scope == TBCX_MSCOPE_UNEXPORTED))
@@ -2056,20 +2104,17 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         return rc;
     }
 
-    /* Self methods: create-then-swap via oo::define CLS self method.
-       Direct procbody substitution fails because TclOO's internal handling
-       of self methods (same path as oo::objdefine) doesn't survive method
-       chain rebuilds triggered by subclass "superclass" declarations.
-       Instead: (1) create with ";" placeholder body, (2) swap bodyPtr. */
-    if (kind == TBCX_METH_SELF) {
-        const Tcl_ObjInternalRep *pbIR           = Tcl_FetchInternalRep(bodyOpt, tbcxTyProcBody);
-        Proc                     *preProc        = pbIR ? (Proc *)pbIR->twoPtrValue.ptr1 : NULL;
+    /* Self methods use create-then-swap through `oo::define CLS self method`:
+     * create a ";" placeholder, then replace its bodyPtr. */
+    if (kind == TBCX_METH_SELF)
+    {
+        const Tcl_ObjInternalRep* pbIR = Tcl_FetchInternalRep(bodyOpt, tbcxTyProcBody);
+        Proc* preProc = pbIR ? (Proc*)pbIR->twoPtrValue.ptr1 : NULL;
 
-        /* Save preProc fields BEFORE step 1 — the procbody's Proc may be
-           corrupted during oo::define handler execution (observed:
-           numCompiledLocals becomes garbage after step 1). */
-        Tcl_Obj                  *savedBody      = preProc ? preProc->bodyPtr : NULL;
-        Tcl_Size                  savedNumLocals = preProc ? preProc->numCompiledLocals : 0;
+        /* Retain the precompiled body and local-count metadata across the
+         * placeholder definition. */
+        Tcl_Obj* savedBody = preProc ? preProc->bodyPtr : NULL;
+        Tcl_Size savedNumLocals = preProc ? preProc->numCompiledLocals : 0;
         if (savedBody)
             Tcl_IncrRefCount(savedBody);
 
@@ -2078,29 +2123,32 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
            -export/-private/-unexport), so the subsequent body swap — which
            only touches the Proc bodyPtr, not the Method flags — preserves it
            and no separate, epoch-bumping export/unexport pass is needed. */
-        Tcl_Obj *selfSub = Tcl_NewStringObj("self", -1);
+        Tcl_Obj* selfSub = Tcl_NewStringObj("self", -1);
         Tcl_IncrRefCount(selfSub);
-        Tcl_Obj *methSub = Tcl_NewStringObj("method", -1);
+        Tcl_Obj* methSub = Tcl_NewStringObj("method", -1);
         Tcl_IncrRefCount(methSub);
         Tcl_IncrRefCount(nameOpt);
         Tcl_IncrRefCount(argsOpt);
-        Tcl_Obj *placeholder = Tcl_NewStringObj(";", 1);
+        Tcl_Obj* placeholder = Tcl_NewStringObj(";", 1);
         Tcl_IncrRefCount(placeholder);
-        Tcl_Obj *scopeOpt = NULL;
+        Tcl_Obj* scopeOpt = NULL;
         if (scope == TBCX_MSCOPE_PUBLIC)
             scopeOpt = Tcl_NewStringObj("-export", -1);
         else if (scope == TBCX_MSCOPE_UNEXPORTED)
             scopeOpt = Tcl_NewStringObj("-unexport", -1);
         else if (scope == TBCX_MSCOPE_TRUE_PRIVATE)
             scopeOpt = Tcl_NewStringObj("-private", -1);
-        if (scopeOpt) {
+        if (scopeOpt)
+        {
             Tcl_IncrRefCount(scopeOpt);
-            Tcl_Obj *av[8] = {argv0, clsFqn, selfSub, methSub, nameOpt, scopeOpt, argsOpt, placeholder};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 8, av);
+            Tcl_Obj* av[8] = {argv0, clsFqn, selfSub, methSub, nameOpt, scopeOpt, argsOpt, placeholder};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 8, av);
             Tcl_DecrRefCount(scopeOpt);
-        } else {
-            Tcl_Obj *av[7] = {argv0, clsFqn, selfSub, methSub, nameOpt, argsOpt, placeholder};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
+        }
+        else
+        {
+            Tcl_Obj* av[7] = {argv0, clsFqn, selfSub, methSub, nameOpt, argsOpt, placeholder};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 7, av);
         }
         Tcl_DecrRefCount(placeholder);
         Tcl_DecrRefCount(argsOpt);
@@ -2111,30 +2159,37 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         /* Step 2: Swap Proc bodyPtr with precompiled bytecode.
            Use savedBody/savedNumLocals instead of reading from preProc
            (which may have been corrupted during step 1). */
-        if (rc == TCL_OK && savedBody) {
+        if (rc == TCL_OK && savedBody)
+        {
             Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, clsFqn);
-            if (tclObj) {
-                Object *oPtr = (Object *)tclObj;
-                if (oPtr->methodsPtr) {
-                    Tcl_Obj *mNameObj = Tcl_NewStringObj(Tbcx_GetStringSafe(nameOpt), -1);
+            if (tclObj)
+            {
+                Object* oPtr = (Object*)tclObj;
+                if (oPtr->methodsPtr)
+                {
+                    Tcl_Obj* mNameObj = Tcl_NewStringObj(Tbcx_GetStringSafe(nameOpt), -1);
                     Tcl_IncrRefCount(mNameObj);
-                    Tcl_HashEntry *he = Tcl_FindHashEntry(oPtr->methodsPtr, (const char *)mNameObj);
+                    Tcl_HashEntry* he = Tcl_FindHashEntry(oPtr->methodsPtr, (const char*)mNameObj);
                     Tcl_DecrRefCount(mNameObj);
-                    if (he) {
-                        Method *meth = (Method *)Tcl_GetHashValue(he);
-                        if (meth && meth->clientData) {
-                            ProcedureMethod *pmPtr = (ProcedureMethod *)meth->clientData;
-                            if (pmPtr && pmPtr->procPtr) {
-                                Proc *selfProc = pmPtr->procPtr;
+                    if (he)
+                    {
+                        Method* meth = (Method*)Tcl_GetHashValue(he);
+                        if (meth && meth->clientData)
+                        {
+                            ProcedureMethod* pmPtr = (ProcedureMethod*)meth->clientData;
+                            if (pmPtr && pmPtr->procPtr)
+                            {
+                                Proc* selfProc = pmPtr->procPtr;
                                 Tcl_IncrRefCount(savedBody);
                                 if (selfProc->bodyPtr)
                                     Tcl_DecrRefCount(selfProc->bodyPtr);
                                 selfProc->bodyPtr = savedBody;
                                 CompiledLocals(selfProc, savedNumLocals);
                                 {
-                                    ByteCode *bc = TbcxGetByteCode(savedBody);
-                                    if (bc) {
-                                        Namespace *nsPtr = (Namespace *)oPtr->namespacePtr;
+                                    ByteCode* bc = TbcxGetByteCode(savedBody);
+                                    if (bc)
+                                    {
+                                        Namespace* nsPtr = (Namespace*)oPtr->namespacePtr;
                                         TbcxFixupByteCode(bc, selfProc, ip, nsPtr, TBCX_FIXUP_CACHE_KEEP);
                                     }
                                 }
@@ -2152,10 +2207,11 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
     }
 
     int hasPrecompiled = (bodyOpt && bodyOpt->typePtr == tbcxTyProcBody) ? 1 : 0;
-    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && hasPrecompiled) {
+    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && hasPrecompiled)
+    {
         /* Extract precompiled Proc from the procbody object */
-        const Tcl_ObjInternalRep *pbIR            = Tcl_FetchInternalRep(bodyOpt, tbcxTyProcBody);
-        Proc                     *preProc         = pbIR ? (Proc *)pbIR->twoPtrValue.ptr1 : NULL;
+        const Tcl_ObjInternalRep* pbIR = Tcl_FetchInternalRep(bodyOpt, tbcxTyProcBody);
+        Proc* preProc = pbIR ? (Proc*)pbIR->twoPtrValue.ptr1 : NULL;
 
         /* Step 1: Create ctor/dtor with empty body via the saved original
            oo::define.  TclOO builds the full Method/Proc/dispatch structure,
@@ -2166,28 +2222,31 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
            (sets constructorPtr/destructorPtr to NULL) instead of creating
            a Method with a Proc.  A semicolon is the minimal no-op body
            that produces a real Method we can swap the bytecode into. */
-        Tcl_Obj                  *placeholderBody = Tcl_NewStringObj(";", 1);
+        Tcl_Obj* placeholderBody = Tcl_NewStringObj(";", 1);
         Tcl_IncrRefCount(placeholderBody);
 
-        if (kind == TBCX_METH_CTOR) {
-            Tcl_Obj *sub = Tcl_NewStringObj("constructor", -1);
+        if (kind == TBCX_METH_CTOR)
+        {
+            Tcl_Obj* sub = Tcl_NewStringObj("constructor", -1);
             Tcl_IncrRefCount(sub);
             Tcl_IncrRefCount(argsOpt);
-            Tcl_Obj *cav[5] = {argv0, clsFqn, sub, argsOpt, placeholderBody};
-            rc              = os->savedDefineProc(os->savedDefineCD, ip, 5, cav);
+            Tcl_Obj* cav[5] = {argv0, clsFqn, sub, argsOpt, placeholderBody};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 5, cav);
             Tcl_DecrRefCount(argsOpt);
             Tcl_DecrRefCount(sub);
-        } else /* TBCX_METH_DTOR */
+        }
+        else /* TBCX_METH_DTOR */
         {
-            Tcl_Obj *sub = Tcl_NewStringObj("destructor", -1);
+            Tcl_Obj* sub = Tcl_NewStringObj("destructor", -1);
             Tcl_IncrRefCount(sub);
-            Tcl_Obj *dav[4] = {argv0, clsFqn, sub, placeholderBody};
-            rc              = os->savedDefineProc(os->savedDefineCD, ip, 4, dav);
+            Tcl_Obj* dav[4] = {argv0, clsFqn, sub, placeholderBody};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 4, dav);
             Tcl_DecrRefCount(sub);
         }
         Tcl_DecrRefCount(placeholderBody);
 
-        if (rc != TCL_OK) {
+        if (rc != TCL_OK)
+        {
             Tcl_DecrRefCount(argv0);
             return rc;
         }
@@ -2195,19 +2254,23 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
         /* Step 2: Locate the Proc that TclOO just created and swap its
            bodyPtr with the precompiled bytecode.  This preserves the full
            TclOO constructor/destructor dispatch chain. */
-        if (preProc && preProc->bodyPtr) {
+        if (preProc && preProc->bodyPtr)
+        {
             Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, clsFqn);
-            Class     *clsPtr = tclObj ? (Class *)Tcl_GetObjectAsClass(tclObj) : NULL;
-            if (clsPtr) {
-                Method *meth = (kind == TBCX_METH_CTOR) ? clsPtr->constructorPtr : clsPtr->destructorPtr;
-                if (meth && meth->clientData) {
-                    ProcedureMethod *pmPtr = (ProcedureMethod *)meth->clientData;
-                    if (pmPtr && pmPtr->procPtr) {
-                        Proc    *ctorProc = pmPtr->procPtr;
+            Class* clsPtr = tclObj ? (Class*)Tcl_GetObjectAsClass(tclObj) : NULL;
+            if (clsPtr)
+            {
+                Method* meth = (kind == TBCX_METH_CTOR) ? clsPtr->constructorPtr : clsPtr->destructorPtr;
+                if (meth && meth->clientData)
+                {
+                    ProcedureMethod* pmPtr = (ProcedureMethod*)meth->clientData;
+                    if (pmPtr && pmPtr->procPtr)
+                    {
+                        Proc* ctorProc = pmPtr->procPtr;
 
                         /* Swap bodyPtr: drop the empty-body bytecode,
                            install the precompiled one. */
-                        Tcl_Obj *preBody  = preProc->bodyPtr;
+                        Tcl_Obj* preBody = preProc->bodyPtr;
                         Tcl_IncrRefCount(preBody);
                         if (ctorProc->bodyPtr)
                             Tcl_DecrRefCount(ctorProc->bodyPtr);
@@ -2217,12 +2280,13 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
                            beyond the declared arguments. */
                         CompiledLocals(ctorProc, preProc->numCompiledLocals);
 
-                        /* Fix bytecode linkage: point bc→procPtr at the
-                           real TclOO Proc and refresh epochs. */
-                        ByteCode *bc = TbcxGetByteCode(preBody);
-                        if (bc) {
-                            Object    *oPtr  = (Object *)tclObj;
-                            Namespace *nsPtr = (Namespace *)oPtr->namespacePtr;
+                        /* Point bc→procPtr at the TclOO Proc and refresh
+                         * epochs. */
+                        ByteCode* bc = TbcxGetByteCode(preBody);
+                        if (bc)
+                        {
+                            Object* oPtr = (Object*)tclObj;
+                            Namespace* nsPtr = (Namespace*)oPtr->namespacePtr;
                             TbcxFixupByteCode(bc, ctorProc, ip, nsPtr, TBCX_FIXUP_CACHE_KEEP);
                         }
                     }
@@ -2234,13 +2298,14 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
     }
 
     /* Fallback ctor/dtor (non-precompiled body): forward directly */
-    if (kind == TBCX_METH_CTOR) {
-        Tcl_Obj *sub = Tcl_NewStringObj("constructor", -1);
+    if (kind == TBCX_METH_CTOR)
+    {
+        Tcl_Obj* sub = Tcl_NewStringObj("constructor", -1);
         Tcl_IncrRefCount(sub);
         Tcl_IncrRefCount(argsOpt);
         Tcl_IncrRefCount(bodyOpt);
-        Tcl_Obj *av[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
-        rc             = os->savedDefineProc(os->savedDefineCD, ip, 5, av);
+        Tcl_Obj* av[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
+        rc = os->savedDefineProc(os->savedDefineCD, ip, 5, av);
         Tcl_DecrRefCount(bodyOpt);
         Tcl_DecrRefCount(argsOpt);
         Tcl_DecrRefCount(sub);
@@ -2250,32 +2315,39 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
 
     /* Destructors: use short form (no args) or long form based on argsOpt. */
     { /* destructor */
-        Tcl_Obj *sub = Tcl_NewStringObj("destructor", -1);
+        Tcl_Obj* sub = Tcl_NewStringObj("destructor", -1);
         Tcl_IncrRefCount(sub);
         /* Choose 4-arg or 5-arg form based on argsOpt emptiness */
         int useShort = 1;
-        if (argsOpt) {
-            Tcl_Size L      = -1;
-            int      listRc = Tcl_ListObjLength(ip, argsOpt, &L);
-            if (listRc != TCL_OK) {
+        if (argsOpt)
+        {
+            Tcl_Size L = -1;
+            int listRc = Tcl_ListObjLength(ip, argsOpt, &L);
+            if (listRc != TCL_OK)
+            {
                 /* Treat failed list canonicalization as "unknown" and keep
                    the short destructor form, but do not leak a stale interp
                    result into the surrounding evaluation. */
                 Tcl_ResetResult(ip);
-            } else if (L > 0) {
+            }
+            else if (L > 0)
+            {
                 useShort = 0;
             }
         }
-        if (useShort) {
+        if (useShort)
+        {
             Tcl_IncrRefCount(bodyOpt);
-            Tcl_Obj *dv[4] = {argv0, clsFqn, sub, bodyOpt};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 4, dv);
+            Tcl_Obj* dv[4] = {argv0, clsFqn, sub, bodyOpt};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 4, dv);
             Tcl_DecrRefCount(bodyOpt);
-        } else {
+        }
+        else
+        {
             Tcl_IncrRefCount(argsOpt);
             Tcl_IncrRefCount(bodyOpt);
-            Tcl_Obj *dv[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
-            rc             = os->savedDefineProc(os->savedDefineCD, ip, 5, dv);
+            Tcl_Obj* dv[5] = {argv0, clsFqn, sub, argsOpt, bodyOpt};
+            rc = os->savedDefineProc(os->savedDefineCD, ip, 5, dv);
             Tcl_DecrRefCount(bodyOpt);
             Tcl_DecrRefCount(argsOpt);
         }
@@ -2285,10 +2357,11 @@ static int DefOO(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, uint8_t kind, Tcl_
     }
 }
 
-static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *builderBody) {
-    int            rc             = TCL_OK;
-    Tcl_Size       fqnLen         = 0;
-    const char    *fqn            = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
+static int PrecompClass(Tcl_Interp* ip, OOShim* os, Tcl_Obj* clsFqn, Tcl_Obj* builderBody)
+{
+    int rc = TCL_OK;
+    Tcl_Size fqnLen = 0;
+    const char* fqn = Tbcx_GetStringFromObjSafe(clsFqn, &fqnLen);
 
     /* Capture method visibility BEFORE swapping bodies.  DefOO re-creates each
        method via oo::define, which resets its visibility to the name-case
@@ -2304,23 +2377,25 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
          - reexportList:   methods PUBLIC now whose name-default is private
            (e.g. an in-body `export Bar` on a PascalCase name) — re-export them.
        The two sets are disjoint, so order is irrelevant. */
-    Tcl_Obj *unexportedList = Tcl_NewListObj(0, NULL);
+    Tcl_Obj* unexportedList = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(unexportedList);
-    Tcl_Obj *reexportList = Tcl_NewListObj(0, NULL);
+    Tcl_Obj* reexportList = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(reexportList);
     {
         Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, clsFqn);
         if (!tclObj)
             Tcl_ResetResult(ip); /* not yet an object: leave both lists empty */
-        Class *clsPtr = tclObj ? (Class *)Tcl_GetObjectAsClass(tclObj) : NULL;
-        if (clsPtr) {
+        Class* clsPtr = tclObj ? (Class*)Tcl_GetObjectAsClass(tclObj) : NULL;
+        if (clsPtr)
+        {
             Tcl_HashSearch ms;
-            Tcl_HashEntry *me;
-            for (me = Tcl_FirstHashEntry(&clsPtr->classMethods, &ms); me; me = Tcl_NextHashEntry(&ms)) {
-                Method *mPtr = (Method *)Tcl_GetHashValue(me);
+            Tcl_HashEntry* me;
+            for (me = Tcl_FirstHashEntry(&clsPtr->classMethods, &ms); me; me = Tcl_NextHashEntry(&ms))
+            {
+                Method* mPtr = (Method*)Tcl_GetHashValue(me);
                 if (!mPtr || !mPtr->namePtr)
                     continue;
-                const char *nm = Tcl_GetString(mPtr->namePtr);
+                const char* nm = Tcl_GetString(mPtr->namePtr);
                 if (!nm || nm[0] == '\0')
                     continue;
                 /* TIP 500 true-private methods are re-installed in private
@@ -2329,7 +2404,7 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
                    them to subclass-visible methods. */
                 if (mPtr->flags & TRUE_PRIVATE_METHOD)
                     continue;
-                int isPublic  = (mPtr->flags & PUBLIC_METHOD) != 0;
+                int isPublic = (mPtr->flags & PUBLIC_METHOD) != 0;
                 int defPublic = (nm[0] >= 'a' && nm[0] <= 'z');
                 if (isPublic && !defPublic)
                     Tcl_ListObjAppendElement(ip, reexportList, mPtr->namePtr);
@@ -2355,44 +2430,49 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
     ClassBuilderCollectMethods(ip, clsFqn, builderBody, &keys);
 
     Tcl_HashSearch ks;
-    Tcl_HashEntry *ke;
-    for (ke = Tcl_FirstHashEntry(&keys, &ks); ke && rc == TCL_OK; ke = Tcl_NextHashEntry(&ks)) {
-        const char *k     = (const char *)Tcl_GetHashKey(&keys, ke);
-        Tcl_Size    count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(ke);
+    Tcl_HashEntry* ke;
+    for (ke = Tcl_FirstHashEntry(&keys, &ks); ke && rc == TCL_OK; ke = Tcl_NextHashEntry(&ks))
+    {
+        const char* k = (const char*)Tcl_GetHashKey(&keys, ke);
+        Tcl_Size count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(ke);
         if (!k || count <= 0)
             continue;
         /* Parse kind and name from the key (FQN \x1F kind \x1F origin \x1F name);
            origin is always class here, set by ClassBuilderCollectMethods. */
-        Tcl_Size    kLen = (Tcl_Size)strlen(k);
+        Tcl_Size kLen = (Tcl_Size)strlen(k);
         if (!(kLen > fqnLen + 1 && k[fqnLen] == '\x1F'))
             continue;
-        const char *p = k + fqnLen + 1;     /* after first \x1F (kind) */
-        const char *q = strchr(p, '\x1F');  /* second sep (after kind) */
+        const char* p = k + fqnLen + 1;    /* after first \x1F (kind) */
+        const char* q = strchr(p, '\x1F'); /* second sep (after kind) */
         if (!q)
             continue;
         unsigned kind = 0;
-        for (const char *snum = p; snum < q; snum++) {
-            if (*snum < '0' || *snum > '9') {
+        for (const char* snum = p; snum < q; snum++)
+        {
+            if (*snum < '0' || *snum > '9')
+            {
                 kind = 0;
                 break;
             }
             kind = (unsigned)(kind * 10 + (unsigned)(*snum - '0'));
         }
-        const char *o  = q + 1;             /* origin digit(s) */
-        const char *r2 = strchr(o, '\x1F'); /* third sep (after origin) */
+        const char* o = q + 1;              /* origin digit(s) */
+        const char* r2 = strchr(o, '\x1F'); /* third sep (after origin) */
         if (!r2)
             continue;
-        const char *nameStr = r2 + 1; /* may be empty for ctor/dtor */
+        const char* nameStr = r2 + 1; /* may be empty for ctor/dtor */
 
         /* Consume `count` FIFO records (front == this builder's, in definition
            order); keep the last. */
-        Tcl_Obj *pair = NULL;
-        for (Tcl_Size i = 0; i < count; i++) {
-            Tcl_Obj *rec = OOShim_TakeRecord(os, k);
+        Tcl_Obj* pair = NULL;
+        for (Tcl_Size i = 0; i < count; i++)
+        {
+            Tcl_Obj* rec = OOShim_TakeRecord(os, k);
             if (rec)
                 pair = rec; /* borrowed (owned by os->retired) */
         }
-        if (!pair) {
+        if (!pair)
+        {
             /* The builder defined this method (sentinel body) but no precompiled
                record was available — fail loudly rather than leave a no-op. */
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing precompiled method body for %s %s", fqn, nameStr));
@@ -2400,33 +2480,35 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
             break;
         }
         Tcl_Obj *savedArgs = NULL, *procBody = NULL;
-        int      methScope = TBCX_MSCOPE_DEFAULT;
+        int methScope = TBCX_MSCOPE_DEFAULT;
         {
-            Tcl_Size  pairLen   = 0;
-            Tcl_Obj **pairElems = NULL;
-            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) != TCL_OK || pairLen < 2) {
+            Tcl_Size pairLen = 0;
+            Tcl_Obj** pairElems = NULL;
+            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) != TCL_OK || pairLen < 2)
+            {
                 Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: malformed method record", -1));
                 rc = TCL_ERROR;
                 break;
             }
             savedArgs = pairElems[0];
-            procBody  = pairElems[1];
+            procBody = pairElems[1];
             methScope = PairScope(ip, pair);
         }
 
-        Tcl_Obj *nameO = NULL;
-        if (nameStr && *nameStr) {
+        Tcl_Obj* nameO = NULL;
+        if (nameStr && *nameStr)
+        {
             nameO = Tcl_NewStringObj(nameStr, -1);
             Tcl_IncrRefCount(nameO);
         }
         TBCX_BENCH_INC(nonPureMethodRecreations);
-        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO,
-                   savedArgs /* "" for dtor */, procBody, methScope);
+        rc = DefOO(ip, os, clsFqn, (uint8_t)kind, nameO, savedArgs /* "" for dtor */, procBody, methScope);
         if (nameO)
             Tcl_DecrRefCount(nameO);
     }
     Tcl_DeleteHashTable(&keys);
-    if (rc != TCL_OK) {
+    if (rc != TCL_OK)
+    {
         /* leave the interp error as-is */
         if (unexportedList)
             Tcl_DecrRefCount(unexportedList);
@@ -2434,65 +2516,55 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
             Tcl_DecrRefCount(reexportList);
         return rc;
     }
-    /* Restore method visibility lost during DefOO body swaps.  DefOO
-       re-creates methods via oo::define, which resets each method's
-       visibility from the first char of its name (public iff [a-z]*).
-       Two corrections are needed, and they are exact mirrors:
-         - unexportedList: methods PRIVATE before the swap whose name-default
-           is public (lowercase) — re-unexport them.
-         - reexportList:   methods PUBLIC before the swap whose name-default
-           is private (e.g. an in-body `export Bar` on a PascalCase name) —
-           re-export them.  Without this half, an in-body export (e.g.
-           `export DoFlush`) would be lost.
-       The two sets are disjoint (one from the private set, one from the
-       public set), so order is irrelevant.
-
-       The unexport/export subcommands require Tcl's full command dispatch
-       context (TclOO dispatches them through an internal ensemble mechanism).
-       Direct savedDefineProc calls bypass that context and silently fail.  We
-       temporarily restore the original handler on the Command struct so
-       that Tcl_EvalObjv("oo::define") routes to TclOO directly — no
-       recursion through CmdOOShim because the shim is temporarily removed.
-       This is safe: single-threaded, no user code executes in these loops. */
-    if (rc == TCL_OK && os->defineCmdPtr) {
-        Tcl_Size  uLen = 0, eLen = 0;
+    /* Reapply stored method visibility after DefOO body swaps.
+     * unexportedList contains private methods with public name defaults;
+     * reexportList contains public methods with private name defaults. The
+     * sets are disjoint. Visibility changes use TclOO's full command dispatch
+     * while the original handler is temporarily active. */
+    if (rc == TCL_OK && os->defineCmdPtr)
+    {
+        Tcl_Size uLen = 0, eLen = 0;
         Tcl_Obj **uElems = NULL, **eElems = NULL;
         if (unexportedList)
             Tcl_ListObjGetElements(ip, unexportedList, &uLen, &uElems);
         if (reexportList)
             Tcl_ListObjGetElements(ip, reexportList, &eLen, &eElems);
-        if (uLen > 0 || eLen > 0) {
+        if (uLen > 0 || eLen > 0)
+        {
             /* Temporarily restore original handlers */
-            os->defineCmdPtr->objProc2       = os->savedDefineProc;
+            os->defineCmdPtr->objProc2 = os->savedDefineProc;
             os->defineCmdPtr->objClientData2 = os->savedDefineCD;
             if (os->savedDefineNre)
                 os->defineCmdPtr->nreProc2 = os->savedDefineNre;
 
-            Tcl_Obj *defCmd = Tcl_NewStringObj("oo::define", -1);
+            Tcl_Obj* defCmd = Tcl_NewStringObj("oo::define", -1);
             Tcl_IncrRefCount(defCmd);
-            Tcl_Obj *unexpSub = Tcl_NewStringObj("unexport", -1);
+            Tcl_Obj* unexpSub = Tcl_NewStringObj("unexport", -1);
             Tcl_IncrRefCount(unexpSub);
-            Tcl_Obj *expSub = Tcl_NewStringObj("export", -1);
+            Tcl_Obj* expSub = Tcl_NewStringObj("export", -1);
             Tcl_IncrRefCount(expSub);
-            for (Tcl_Size ui = 0; rc == TCL_OK && ui < uLen; ui++) {
-                Tcl_Obj *av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
-                rc             = Tcl_EvalObjv(ip, 4, av, 0);
+            for (Tcl_Size ui = 0; rc == TCL_OK && ui < uLen; ui++)
+            {
+                Tcl_Obj* av[4] = {defCmd, clsFqn, unexpSub, uElems[ui]};
+                rc = Tcl_EvalObjv(ip, 4, av, 0);
             }
-            for (Tcl_Size ei = 0; rc == TCL_OK && ei < eLen; ei++) {
-                Tcl_Obj *av[4] = {defCmd, clsFqn, expSub, eElems[ei]};
-                rc             = Tcl_EvalObjv(ip, 4, av, 0);
+            for (Tcl_Size ei = 0; rc == TCL_OK && ei < eLen; ei++)
+            {
+                Tcl_Obj* av[4] = {defCmd, clsFqn, expSub, eElems[ei]};
+                rc = Tcl_EvalObjv(ip, 4, av, 0);
             }
             Tcl_DecrRefCount(expSub);
             Tcl_DecrRefCount(unexpSub);
             Tcl_DecrRefCount(defCmd);
 
             /* Re-install the shim */
-            os->defineCmdPtr->objProc2       = CmdOOShim;
+            os->defineCmdPtr->objProc2 = CmdOOShim;
             os->defineCmdPtr->objClientData2 = os;
             if (os->savedDefineNre)
                 os->defineCmdPtr->nreProc2 = CmdOOShim;
 
-            if (rc == TCL_OK) {
+            if (rc == TCL_OK)
+            {
                 Tcl_ResetResult(ip);
             }
         }
@@ -2517,13 +2589,15 @@ static int PrecompClass(Tcl_Interp *ip, OOShim *os, Tcl_Obj *clsFqn, Tcl_Obj *bu
  * ========================================================================== */
 
 /* LdNextWord — advance to the next word token in a parsed command. */
-static inline const Tcl_Token *LdNextWord(const Tcl_Token *wordTok) {
+static inline const Tcl_Token* LdNextWord(const Tcl_Token* wordTok)
+{
     return wordTok + 1 + wordTok->numComponents;
 }
 
 /* LdCmdCore — strip a leading ::-qualified prefix from a command word so a
  * fully-qualified builder subcommand matches its bare keyword. */
-static inline const char *LdCmdCore(const char *s) {
+static inline const char* LdCmdCore(const char* s)
+{
     if (!s)
         return "";
     while (s[0] == ':' && s[1] == ':')
@@ -2535,61 +2609,75 @@ static inline const char *LdCmdCore(const char *s) {
  * the word is not a static literal (contains variable/command substitution).
  * Mirrors the save side's WordLiteralObj so load-side parsing of a stubbed
  * builder body yields identical word values.  Returns a refcount-1 Tcl_Obj. */
-static Tcl_Obj *LdWordLiteralObj(const Tcl_Token *wordTok) {
-    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents == 1) {
-        const Tcl_Token *t = wordTok + 1;
-        if (t->type == TCL_TOKEN_TEXT) {
-            Tcl_Obj *o = Tcl_NewStringObj(t->start, t->size);
+static Tcl_Obj* LdWordLiteralObj(const Tcl_Token* wordTok)
+{
+    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents == 1)
+    {
+        const Tcl_Token* t = wordTok + 1;
+        if (t->type == TCL_TOKEN_TEXT)
+        {
+            Tcl_Obj* o = Tcl_NewStringObj(t->start, t->size);
             Tcl_IncrRefCount(o);
             return o;
         }
     }
-    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents > 1) {
+    if (wordTok->type == TCL_TOKEN_WORD && wordTok->numComponents > 1)
+    {
         int allLiteral = 1;
-        for (Tcl_Size i = 0; i < wordTok->numComponents; i++) {
-            const Tcl_Token *sub = wordTok + 1 + i;
-            if (sub->type != TCL_TOKEN_TEXT && sub->type != TCL_TOKEN_BS) {
+        for (Tcl_Size i = 0; i < wordTok->numComponents; i++)
+        {
+            const Tcl_Token* sub = wordTok + 1 + i;
+            if (sub->type != TCL_TOKEN_TEXT && sub->type != TCL_TOKEN_BS)
+            {
                 allLiteral = 0;
                 break;
             }
         }
-        if (allLiteral) {
+        if (allLiteral)
+        {
             Tcl_DString ds;
             Tcl_DStringInit(&ds);
-            for (Tcl_Size i = 0; i < wordTok->numComponents; i++) {
-                const Tcl_Token *sub = wordTok + 1 + i;
-                if (sub->type == TCL_TOKEN_TEXT) {
+            for (Tcl_Size i = 0; i < wordTok->numComponents; i++)
+            {
+                const Tcl_Token* sub = wordTok + 1 + i;
+                if (sub->type == TCL_TOKEN_TEXT)
+                {
                     Tcl_DStringAppend(&ds, sub->start, sub->size);
-                } else {
+                }
+                else
+                {
                     char buf[8];
-                    int  count     = 0;
-                    int  resultLen = Tcl_UtfBackslash(sub->start, &count, buf);
+                    int count = 0;
+                    int resultLen = Tcl_UtfBackslash(sub->start, &count, buf);
                     Tcl_DStringAppend(&ds, buf, resultLen);
                 }
             }
-            Tcl_Obj *o = Tcl_NewStringObj(Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
+            Tcl_Obj* o = Tcl_NewStringObj(Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
             Tcl_DStringFree(&ds);
             Tcl_IncrRefCount(o);
             return o;
         }
     }
-    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD) {
-        const char *s = wordTok->start;
-        Tcl_Size    n = wordTok->size;
-        if (n >= 2 && s[0] == '{' && s[n - 1] == '}') {
-            Tcl_Obj *o = Tcl_NewStringObj(s + 1, n - 2);
+    if (wordTok->type == TCL_TOKEN_SIMPLE_WORD)
+    {
+        const char* s = wordTok->start;
+        Tcl_Size n = wordTok->size;
+        if (n >= 2 && s[0] == '{' && s[n - 1] == '}')
+        {
+            Tcl_Obj* o = Tcl_NewStringObj(s + 1, n - 2);
             Tcl_IncrRefCount(o);
             return o;
         }
-        Tcl_Obj *o = Tcl_NewStringObj(s, n);
+        Tcl_Obj* o = Tcl_NewStringObj(s, n);
         Tcl_IncrRefCount(o);
         return o;
     }
     {
-        const char *s = wordTok->start;
-        Tcl_Size    n = wordTok->size;
-        if (n >= 2 && s[0] == '{' && s[n - 1] == '}') {
-            Tcl_Obj *o = Tcl_NewStringObj(s + 1, n - 2);
+        const char* s = wordTok->start;
+        Tcl_Size n = wordTok->size;
+        if (n >= 2 && s[0] == '{' && s[n - 1] == '}')
+        {
+            Tcl_Obj* o = Tcl_NewStringObj(s + 1, n - 2);
             Tcl_IncrRefCount(o);
             return o;
         }
@@ -2610,85 +2698,104 @@ static Tcl_Obj *LdWordLiteralObj(const Tcl_Token *wordTok) {
  * the entire builder verbatim (a non-literal name/args/body, or a runtime-
  * variable target), so its real bytecode is already installed by the forward
  * and none of its methods may be patched. */
-static void ObjBuilderCollectMethodsRec(Tcl_Interp *ip, const char *bstr, Tcl_Size blen, Tcl_HashTable *namesOut, int *sawUnsup, int *anyVerbatim, int depth) {
+static void ObjBuilderCollectMethodsRec(
+    Tcl_Interp* ip, const char* bstr, Tcl_Size blen, Tcl_HashTable* namesOut, int* sawUnsup, int* anyVerbatim, int depth)
+{
     if (depth > TBCX_OBJBUILD_MAX_DEPTH)
         return;
-    Tcl_Parse   p;
-    const char *cur    = bstr;
-    Tcl_Size    remain = blen;
-    while (remain > 0) {
-        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+    Tcl_Parse p;
+    const char* cur = bstr;
+    Tcl_Size remain = blen;
+    while (remain > 0)
+    {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK)
+        {
             Tcl_FreeParse(&p);
             break;
         }
-        if (p.numWords >= 1) {
-            const Tcl_Token *w0 = p.tokenPtr;
+        if (p.numWords >= 1)
+        {
+            const Tcl_Token* w0 = p.tokenPtr;
             if (w0->type == TCL_TOKEN_COMMAND)
                 w0++;
-            Tcl_Obj *cmd = LdWordLiteralObj(w0);
-            if (cmd) {
-                const char *kw = LdCmdCore(Tcl_GetString(cmd));
-                if (strcmp(kw, "method") == 0 && p.numWords >= 4) {
+            Tcl_Obj* cmd = LdWordLiteralObj(w0);
+            if (cmd)
+            {
+                const char* kw = LdCmdCore(Tcl_GetString(cmd));
+                if (strcmp(kw, "method") == 0 && p.numWords >= 4)
+                {
                     /* Name is always the word right after `method` (a scope
                        option, if any, sits between name and args). */
-                    const Tcl_Token *wN   = LdNextWord(w0);
-                    Tcl_Obj         *name = wN ? LdWordLiteralObj(wN) : NULL;
+                    const Tcl_Token* wN = LdNextWord(w0);
+                    Tcl_Obj* name = wN ? LdWordLiteralObj(wN) : NULL;
                     /* Body is the last word.  Only the exact tbcx stub sentinel
                        marks a captured method; any other body (a real body, a
                        genuinely-empty {}, or a non-literal word) means the saver
                        left this whole builder verbatim. */
-                    const Tcl_Token *wB = w0;
+                    const Tcl_Token* wB = w0;
                     for (Tcl_Size wi = 0; wi + 1 < p.numWords; wi++)
                         wB = LdNextWord(wB);
-                    int      isStub = 0;
-                    Tcl_Obj *body   = LdWordLiteralObj(wB);
-                    if (body) {
-                        Tcl_Size    bln = 0;
-                        const char *bs  = Tbcx_GetStringFromObjSafe(body, &bln);
+                    int isStub = 0;
+                    Tcl_Obj* body = LdWordLiteralObj(wB);
+                    if (body)
+                    {
+                        Tcl_Size bln = 0;
+                        const char* bs = Tbcx_GetStringFromObjSafe(body, &bln);
                         if (bln == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs, TBCX_METH_STUB_BODY, (size_t)bln) == 0)
                             isStub = 1;
                         Tcl_DecrRefCount(body);
                     }
                     if (!isStub && anyVerbatim)
                         *anyVerbatim = 1;
-                    if (name) {
-                        int            isNew = 0;
-                        Tcl_HashEntry *he    = Tcl_CreateHashEntry(namesOut, Tcl_GetString(name), &isNew);
-                        intptr_t       prev  = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
-                        Tcl_SetHashValue(he, (void *)(prev + 1)); /* occurrence count */
+                    if (name)
+                    {
+                        int isNew = 0;
+                        Tcl_HashEntry* he = Tcl_CreateHashEntry(namesOut, Tcl_GetString(name), &isNew);
+                        intptr_t prev = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
+                        Tcl_SetHashValue(he, (void*)(prev + 1)); /* occurrence count */
                         Tcl_DecrRefCount(name);
                     }
-                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
+                }
+                else if (strcmp(kw, "private") == 0 && p.numWords == 2)
+                {
                     /* Block form: recurse into `private { … }`. */
-                    const Tcl_Token *wBlock = LdNextWord(w0);
-                    Tcl_Obj         *block  = wBlock ? LdWordLiteralObj(wBlock) : NULL;
-                    if (block) {
-                        Tcl_Size    bl2 = 0;
-                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                    const Tcl_Token* wBlock = LdNextWord(w0);
+                    Tcl_Obj* block = wBlock ? LdWordLiteralObj(wBlock) : NULL;
+                    if (block)
+                    {
+                        Tcl_Size bl2 = 0;
+                        const char* bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
                         ObjBuilderCollectMethodsRec(ip, bs2, bl2, namesOut, sawUnsup, anyVerbatim, depth + 1);
                         Tcl_DecrRefCount(block);
                     }
-                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
+                }
+                else if (strcmp(kw, "private") == 0 && p.numWords >= 3)
+                {
                     /* Inline form: `private method NAME …` — recurse over the
                        tail (everything after the leading `private` word). */
-                    const char *raw  = p.commandStart;
-                    Tcl_Size    rl   = p.commandSize;
-                    Tcl_Size    skip = 0;
+                    const char* raw = p.commandStart;
+                    Tcl_Size rl = p.commandSize;
+                    Tcl_Size skip = 0;
                     while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
                         skip++;
                     while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
                         skip++;
                     if (skip < rl)
                         ObjBuilderCollectMethodsRec(ip, raw + skip, rl - skip, namesOut, sawUnsup, anyVerbatim, depth + 1);
-                } else if (strcmp(kw, "classmethod") == 0 || strcmp(kw, "constructor") == 0 || strcmp(kw, "destructor") == 0) {
+                }
+                else if (strcmp(kw, "classmethod") == 0 || strcmp(kw, "constructor") == 0 || strcmp(kw, "destructor") == 0)
+                {
                     /* Body-bearing forms that object-definition replay cannot
                        install as per-object methods. */
                     if (sawUnsup)
                         *sawUnsup = 1;
-                } else if (strcmp(kw, "self") == 0 && p.numWords >= 3) {
-                    const Tcl_Token *wSub = LdNextWord(w0);
-                    Tcl_Obj         *sub  = wSub ? LdWordLiteralObj(wSub) : NULL;
-                    if (sub) {
+                }
+                else if (strcmp(kw, "self") == 0 && p.numWords >= 3)
+                {
+                    const Tcl_Token* wSub = LdNextWord(w0);
+                    Tcl_Obj* sub = wSub ? LdWordLiteralObj(wSub) : NULL;
+                    if (sub)
+                    {
                         if (strcmp(Tcl_GetString(sub), "method") == 0 && sawUnsup)
                             *sawUnsup = 1;
                         Tcl_DecrRefCount(sub);
@@ -2697,7 +2804,7 @@ static void ObjBuilderCollectMethodsRec(Tcl_Interp *ip, const char *bstr, Tcl_Si
                 Tcl_DecrRefCount(cmd);
             }
         }
-        cur    = p.commandStart + p.commandSize;
+        cur = p.commandStart + p.commandSize;
         remain = (bstr + blen) - cur;
         Tcl_FreeParse(&p);
     }
@@ -2714,13 +2821,15 @@ static void ObjBuilderCollectMethodsRec(Tcl_Interp *ip, const char *bstr, Tcl_Si
  * destructor) is present, and *anyVerbatimOut when any method body is not the
  * stub sentinel (whole-builder verbatim).  namesOut must be an initialized
  * TCL_STRING_KEYS table; each name maps to its occurrence count in the builder. */
-static int ObjBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *builderBody, Tcl_HashTable *namesOut, int *sawUnsupportedBodyFormOut, int *anyVerbatimOut) {
+static int ObjBuilderCollectMethods(
+    Tcl_Interp* ip, Tcl_Obj* builderBody, Tcl_HashTable* namesOut, int* sawUnsupportedBodyFormOut, int* anyVerbatimOut)
+{
     if (sawUnsupportedBodyFormOut)
         *sawUnsupportedBodyFormOut = 0;
     if (anyVerbatimOut)
         *anyVerbatimOut = 0;
-    Tcl_Size    blen = 0;
-    const char *bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
+    Tcl_Size blen = 0;
+    const char* bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
     ObjBuilderCollectMethodsRec(ip, bstr, blen, namesOut, sawUnsupportedBodyFormOut, anyVerbatimOut, 0);
     return TCL_OK;
 }
@@ -2735,51 +2844,67 @@ static int ObjBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *builderBody, Tcl_Ha
  * and inline `private method …`.  keysOut maps each method KEY
  * (FQN\x1Fkind\x1Forigin=class\x1Fname, as built by MethodKeyBuf) to its
  * occurrence count. */
-static void ClassBuilderCollectMethodsRec(Tcl_Interp *ip, Tcl_Obj *clsFqn, const char *bstr, Tcl_Size blen, Tcl_HashTable *keysOut, int depth) {
+static void
+ClassBuilderCollectMethodsRec(Tcl_Interp* ip, Tcl_Obj* clsFqn, const char* bstr, Tcl_Size blen, Tcl_HashTable* keysOut, int depth)
+{
     if (depth > TBCX_OBJBUILD_MAX_DEPTH)
         return;
-    Tcl_Parse   p;
-    const char *cur    = bstr;
-    Tcl_Size    remain = blen;
-    while (remain > 0) {
-        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK) {
+    Tcl_Parse p;
+    const char* cur = bstr;
+    Tcl_Size remain = blen;
+    while (remain > 0)
+    {
+        if (Tcl_ParseCommand(ip, cur, remain, 0, &p) != TCL_OK)
+        {
             Tcl_FreeParse(&p);
             break;
         }
-        if (p.numWords >= 1) {
-            const Tcl_Token *w0 = p.tokenPtr;
+        if (p.numWords >= 1)
+        {
+            const Tcl_Token* w0 = p.tokenPtr;
             if (w0->type == TCL_TOKEN_COMMAND)
                 w0++;
-            Tcl_Obj *cmd = LdWordLiteralObj(w0);
-            if (cmd) {
-                const char *kw          = LdCmdCore(Tcl_GetString(cmd));
-                uint8_t     mkind       = TBCX_METH_NONE;
-                Tcl_Obj    *name        = NULL; /* method/classmethod name only */
-                int         bodyBearing = 0;
-                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4) {
+            Tcl_Obj* cmd = LdWordLiteralObj(w0);
+            if (cmd)
+            {
+                const char* kw = LdCmdCore(Tcl_GetString(cmd));
+                uint8_t mkind = TBCX_METH_NONE;
+                Tcl_Obj* name = NULL; /* method/classmethod name only */
+                int bodyBearing = 0;
+                if ((strcmp(kw, "method") == 0 || strcmp(kw, "classmethod") == 0) && p.numWords >= 4)
+                {
                     mkind = (strcmp(kw, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
-                    const Tcl_Token *wN = LdNextWord(w0);
-                    name                = wN ? LdWordLiteralObj(wN) : NULL;
-                    bodyBearing         = 1;
-                } else if (strcmp(kw, "constructor") == 0 && p.numWords >= 2) {
-                    mkind       = TBCX_METH_CTOR;
+                    const Tcl_Token* wN = LdNextWord(w0);
+                    name = wN ? LdWordLiteralObj(wN) : NULL;
                     bodyBearing = 1;
-                } else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2) {
-                    mkind       = TBCX_METH_DTOR;
+                }
+                else if (strcmp(kw, "constructor") == 0 && p.numWords >= 2)
+                {
+                    mkind = TBCX_METH_CTOR;
                     bodyBearing = 1;
-                } else if (strcmp(kw, "private") == 0 && p.numWords == 2) {
-                    const Tcl_Token *wBlock = LdNextWord(w0);
-                    Tcl_Obj         *block  = wBlock ? LdWordLiteralObj(wBlock) : NULL;
-                    if (block) {
-                        Tcl_Size    bl2 = 0;
-                        const char *bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
+                }
+                else if (strcmp(kw, "destructor") == 0 && p.numWords >= 2)
+                {
+                    mkind = TBCX_METH_DTOR;
+                    bodyBearing = 1;
+                }
+                else if (strcmp(kw, "private") == 0 && p.numWords == 2)
+                {
+                    const Tcl_Token* wBlock = LdNextWord(w0);
+                    Tcl_Obj* block = wBlock ? LdWordLiteralObj(wBlock) : NULL;
+                    if (block)
+                    {
+                        Tcl_Size bl2 = 0;
+                        const char* bs2 = Tbcx_GetStringFromObjSafe(block, &bl2);
                         ClassBuilderCollectMethodsRec(ip, clsFqn, bs2, bl2, keysOut, depth + 1);
                         Tcl_DecrRefCount(block);
                     }
-                } else if (strcmp(kw, "private") == 0 && p.numWords >= 3) {
-                    const char *raw  = p.commandStart;
-                    Tcl_Size    rl   = p.commandSize;
-                    Tcl_Size    skip = 0;
+                }
+                else if (strcmp(kw, "private") == 0 && p.numWords >= 3)
+                {
+                    const char* raw = p.commandStart;
+                    Tcl_Size rl = p.commandSize;
+                    Tcl_Size skip = 0;
                     while (skip < rl && raw[skip] != ' ' && raw[skip] != '\t')
                         skip++;
                     while (skip < rl && (raw[skip] == ' ' || raw[skip] == '\t'))
@@ -2789,28 +2914,36 @@ static void ClassBuilderCollectMethodsRec(Tcl_Interp *ip, Tcl_Obj *clsFqn, const
                 }
                 /* `self` forms: skipped (no branch). */
 
-                if (bodyBearing) {
+                if (bodyBearing)
+                {
                     /* Body is the last word; only the sentinel marks a captured
                        (stubbed) method.  Any other body was left verbatim. */
-                    const Tcl_Token *wB = w0;
+                    const Tcl_Token* wB = w0;
                     for (Tcl_Size wi = 0; wi + 1 < p.numWords; wi++)
                         wB = LdNextWord(wB);
-                    int      isStub = 0;
-                    Tcl_Obj *body   = LdWordLiteralObj(wB);
-                    if (body) {
-                        Tcl_Size    bln = 0;
-                        const char *bs  = Tbcx_GetStringFromObjSafe(body, &bln);
+                    int isStub = 0;
+                    Tcl_Obj* body = LdWordLiteralObj(wB);
+                    if (body)
+                    {
+                        Tcl_Size bln = 0;
+                        const char* bs = Tbcx_GetStringFromObjSafe(body, &bln);
                         if (bln == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs, TBCX_METH_STUB_BODY, (size_t)bln) == 0)
                             isStub = 1;
                         Tcl_DecrRefCount(body);
                     }
-                    if (isStub) {
+                    if (isStub)
+                    {
                         Tcl_DString keyDs;
-                        if (MethodKeyBuf(&keyDs, clsFqn, mkind, TBCX_MORIGIN_CLASS, (mkind == TBCX_METH_INST || mkind == TBCX_METH_CLASS) ? name : NULL)) {
-                            int            isNew = 0;
-                            Tcl_HashEntry *he    = Tcl_CreateHashEntry(keysOut, Tcl_DStringValue(&keyDs), &isNew);
-                            intptr_t       prev  = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
-                            Tcl_SetHashValue(he, (void *)(prev + 1));
+                        if (MethodKeyBuf(&keyDs,
+                                         clsFqn,
+                                         mkind,
+                                         TBCX_MORIGIN_CLASS,
+                                         (mkind == TBCX_METH_INST || mkind == TBCX_METH_CLASS) ? name : NULL))
+                        {
+                            int isNew = 0;
+                            Tcl_HashEntry* he = Tcl_CreateHashEntry(keysOut, Tcl_DStringValue(&keyDs), &isNew);
+                            intptr_t prev = isNew ? 0 : (intptr_t)Tcl_GetHashValue(he);
+                            Tcl_SetHashValue(he, (void*)(prev + 1));
                             Tcl_DStringFree(&keyDs);
                         }
                     }
@@ -2820,15 +2953,16 @@ static void ClassBuilderCollectMethodsRec(Tcl_Interp *ip, Tcl_Obj *clsFqn, const
                 Tcl_DecrRefCount(cmd);
             }
         }
-        cur    = p.commandStart + p.commandSize;
+        cur = p.commandStart + p.commandSize;
         remain = (bstr + blen) - cur;
         Tcl_FreeParse(&p);
     }
 }
 
-static void ClassBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj *builderBody, Tcl_HashTable *keysOut) {
-    Tcl_Size    blen = 0;
-    const char *bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
+static void ClassBuilderCollectMethods(Tcl_Interp* ip, Tcl_Obj* clsFqn, Tcl_Obj* builderBody, Tcl_HashTable* keysOut)
+{
+    Tcl_Size blen = 0;
+    const char* bstr = Tbcx_GetStringFromObjSafe(builderBody, &blen);
     ClassBuilderCollectMethodsRec(ip, clsFqn, bstr, blen, keysOut, 0);
 }
 
@@ -2839,17 +2973,18 @@ static void ClassBuilderCollectMethods(Tcl_Interp *ip, Tcl_Obj *clsFqn, Tcl_Obj 
  * bytecode (its ";" string rep is never compiled).  Visibility is NOT applied
  * here — re-defining a method resets it to the name-case default; the caller
  * restores any non-default export state afterward via TbcxApplyObjExportVisibility. */
-static int DefOOObj(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, Tcl_Obj *args, Tcl_Obj *preBody) {
-    Tcl_Obj *objdefWord = Tcl_NewStringObj("oo::objdefine", -1);
+static int DefOOObj(Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* name, Tcl_Obj* args, Tcl_Obj* preBody)
+{
+    Tcl_Obj* objdefWord = Tcl_NewStringObj("oo::objdefine", -1);
     Tcl_IncrRefCount(objdefWord);
-    Tcl_Obj *methodWord = Tcl_NewStringObj("method", -1);
+    Tcl_Obj* methodWord = Tcl_NewStringObj("method", -1);
     Tcl_IncrRefCount(methodWord);
     Tcl_IncrRefCount(objFqn);
     Tcl_IncrRefCount(name);
     Tcl_IncrRefCount(args);
     Tcl_IncrRefCount(preBody);
-    Tcl_Obj *av[6] = {objdefWord, objFqn, methodWord, name, args, preBody};
-    int      rc    = os->savedObjdefProc(os->savedObjdefCD, ip, 6, av);
+    Tcl_Obj* av[6] = {objdefWord, objFqn, methodWord, name, args, preBody};
+    int rc = os->savedObjdefProc(os->savedObjdefCD, ip, 6, av);
     Tcl_DecrRefCount(preBody);
     Tcl_DecrRefCount(args);
     Tcl_DecrRefCount(name);
@@ -2859,39 +2994,46 @@ static int DefOOObj(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *name, 
     return rc;
 }
 
-static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *builderBody) {
+static int PrecompObject(Tcl_Interp* ip, OOShim* os, Tcl_Obj* objFqn, Tcl_Obj* builderBody)
+{
     /* 1. Collect the exact method names defined by the just-forwarded builder. */
     Tcl_HashTable names;
     Tcl_InitHashTable(&names, TCL_STRING_KEYS);
     int sawUnsupported = 0;
-    int anyVerbatim    = 0;
+    int anyVerbatim = 0;
     ObjBuilderCollectMethods(ip, builderBody, &names, &sawUnsupported, &anyVerbatim);
 
     /* 2. Resolve the target object.  Per-object replay patches the object's
        OWN method table even when the object is also a class — never via
        oo::define / Tcl_GetObjectAsClass. */
     Tcl_Object tclObj = Tcl_GetObjectFromObj(ip, objFqn);
-    if (!tclObj) {
+    if (!tclObj)
+    {
         Tcl_DeleteHashTable(&names);
         return TCL_ERROR; /* leave TclOO's "no such object" error in the interp */
     }
-    Object *oPtr = (Object *)tclObj;
+    Object* oPtr = (Object*)tclObj;
 
     /* A body-bearing form object replay cannot install slipped past a
        successful forward (TclOO normally rejects classmethod/self method/
        constructor/destructor for oo::objdefine, so rc would already be an
        error and PrecompObject would not run).  Fail loudly rather than leave
        an unpatched stub installed. */
-    if (sawUnsupported) {
+    if (sawUnsupported)
+    {
         Tcl_DeleteHashTable(&names);
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: unsupported per-object method form (classmethod/self/constructor/destructor) in oo::objdefine builder for %s", Tbcx_GetStringSafe(objFqn)));
+        Tcl_SetObjResult(ip,
+                         Tcl_ObjPrintf("tbcx: unsupported per-object method form (classmethod/self/constructor/destructor) in "
+                                       "oo::objdefine builder for %s",
+                                       Tbcx_GetStringSafe(objFqn)));
         return TCL_ERROR;
     }
 
     /* Declarative-only builder (no methods): nothing to patch. */
     Tcl_HashSearch s;
-    Tcl_HashEntry *e;
-    if (Tcl_FirstHashEntry(&names, &s) == NULL) {
+    Tcl_HashEntry* e;
+    if (Tcl_FirstHashEntry(&names, &s) == NULL)
+    {
         Tcl_DeleteHashTable(&names);
         return TCL_OK;
     }
@@ -2905,7 +3047,8 @@ static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *b
        forward.  None of its methods may be patched (and it owns no records to
        patch from), so leave them all intact — deciding per method would let an
        empty-bodied sibling be wrongly patched from another builder's record. */
-    if (anyVerbatim) {
+    if (anyVerbatim)
+    {
         Tcl_DeleteHashTable(&names);
         return TCL_OK;
     }
@@ -2917,12 +3060,13 @@ static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *b
        for its own replay.  Per-object replay installs instance-kind
        (TBCX_METH_INST) object-origin records only. */
     int rc = TCL_OK;
-    for (e = Tcl_FirstHashEntry(&names, &s); e && rc == TCL_OK; e = Tcl_NextHashEntry(&s)) {
-        const char *nm    = (const char *)Tcl_GetHashKey(&names, e);
-        Tcl_Size    count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(e);
+    for (e = Tcl_FirstHashEntry(&names, &s); e && rc == TCL_OK; e = Tcl_NextHashEntry(&s))
+    {
+        const char* nm = (const char*)Tcl_GetHashKey(&names, e);
+        Tcl_Size count = (Tcl_Size)(intptr_t)Tcl_GetHashValue(e);
         if (count <= 0)
             continue;
-        Tcl_Obj *nameObj = Tcl_NewStringObj(nm, -1);
+        Tcl_Obj* nameObj = Tcl_NewStringObj(nm, -1);
         Tcl_IncrRefCount(nameObj);
 
         /* Snapshot this method's post-forward visibility (TclOO ground truth,
@@ -2930,56 +3074,64 @@ static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *b
            unexport) BEFORE the install below resets it to the name-case
            default.  Installing an EARLIER name does not disturb this one, so a
            per-name read just before its own install is exact. */
-        int haveSnap  = 0;
+        int haveSnap = 0;
         int snapFlags = 0;
-        if (oPtr->methodsPtr) {
-            Tcl_HashEntry *me = Tcl_FindHashEntry(oPtr->methodsPtr, (const char *)nameObj);
-            if (me) {
-                Method *mPtr = (Method *)Tcl_GetHashValue(me);
-                if (mPtr) {
-                    haveSnap  = 1;
+        if (oPtr->methodsPtr)
+        {
+            Tcl_HashEntry* me = Tcl_FindHashEntry(oPtr->methodsPtr, (const char*)nameObj);
+            if (me)
+            {
+                Method* mPtr = (Method*)Tcl_GetHashValue(me);
+                if (mPtr)
+                {
+                    haveSnap = 1;
                     snapFlags = mPtr->flags;
                 }
             }
         }
 
         Tcl_DString keyDs;
-        if (!MethodKeyBuf(&keyDs, objFqn, TBCX_METH_INST, TBCX_MORIGIN_OBJECT, nameObj)) {
+        if (!MethodKeyBuf(&keyDs, objFqn, TBCX_METH_INST, TBCX_MORIGIN_OBJECT, nameObj))
+        {
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid object-method key", -1));
             Tcl_DecrRefCount(nameObj);
             rc = TCL_ERROR;
             break;
         }
         /* Consume `count` records (front of the FIFO); keep the last. */
-        Tcl_Obj *pair = NULL;
-        for (Tcl_Size k = 0; k < count; k++) {
-            Tcl_Obj *rec = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
+        Tcl_Obj* pair = NULL;
+        for (Tcl_Size k = 0; k < count; k++)
+        {
+            Tcl_Obj* rec = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
             if (rec)
                 pair = rec; /* borrowed (owned by os->retired) */
         }
         Tcl_DStringFree(&keyDs);
-        if (!pair) {
+        if (!pair)
+        {
             /* The builder defined this method (sentinel body) but no precompiled
                record was available.  Fail loudly: a surviving stub body would
                convert a compile-time gap into wrong runtime behavior. */
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing precompiled object method body for %s %s", Tbcx_GetStringSafe(objFqn), nm));
+            Tcl_SetObjResult(
+                ip, Tcl_ObjPrintf("tbcx: missing precompiled object method body for %s %s", Tbcx_GetStringSafe(objFqn), nm));
             Tcl_DecrRefCount(nameObj);
             rc = TCL_ERROR;
             break;
         }
         Tcl_Obj *savedArgs = NULL, *preBody = NULL;
-        int      pairScope = TBCX_MSCOPE_DEFAULT;
+        int pairScope = TBCX_MSCOPE_DEFAULT;
         {
-            Tcl_Size  plen = 0;
-            Tcl_Obj **pel  = NULL;
-            if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) != TCL_OK || plen < 2) {
+            Tcl_Size plen = 0;
+            Tcl_Obj** pel = NULL;
+            if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) != TCL_OK || plen < 2)
+            {
                 Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: malformed object-method record", -1));
                 Tcl_DecrRefCount(nameObj);
                 rc = TCL_ERROR;
                 break;
             }
             savedArgs = pel[0];
-            preBody   = pel[1];
+            preBody = pel[1];
             pairScope = PairScope(ip, pair);
         }
 
@@ -2988,20 +3140,26 @@ static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *b
            object table (defensive; should not occur for a forwarded builder). */
         int defPublic = (nm[0] >= 'a' && nm[0] <= 'z');
         int isPrivate, isPublic;
-        if (haveSnap) {
+        if (haveSnap)
+        {
             isPrivate = (snapFlags & TRUE_PRIVATE_METHOD) ? 1 : 0;
-            isPublic  = (snapFlags & PUBLIC_METHOD) ? 1 : 0;
-        } else {
+            isPublic = (snapFlags & PUBLIC_METHOD) ? 1 : 0;
+        }
+        else
+        {
             isPrivate = (pairScope == TBCX_MSCOPE_TRUE_PRIVATE) ? 1 : 0;
-            isPublic  = (pairScope == TBCX_MSCOPE_PUBLIC) ? 1 : (pairScope == TBCX_MSCOPE_UNEXPORTED) ? 0 : defPublic;
+            isPublic = (pairScope == TBCX_MSCOPE_PUBLIC) ? 1 : (pairScope == TBCX_MSCOPE_UNEXPORTED) ? 0 : defPublic;
         }
 
         TBCX_BENCH_INC(nonPureMethodRecreations);
-        if (isPrivate) {
+        if (isPrivate)
+        {
             /* True-private: re-create via the flat private form so TclOO
                re-establishes the TIP 500 scope around the precompiled body. */
             rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameObj, savedArgs, preBody, TBCX_METH_INST);
-        } else {
+        }
+        else
+        {
             rc = DefOOObj(ip, os, objFqn, nameObj, savedArgs, preBody);
             if (rc == TCL_OK && isPublic != defPublic)
                 rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameObj, isPublic);
@@ -3013,103 +3171,96 @@ static int PrecompObject(Tcl_Interp *ip, OOShim *os, Tcl_Obj *objFqn, Tcl_Obj *b
     return rc;
 }
 
-typedef struct TbcxMetadataStackEntry {
-    Tcl_Obj *value;
-    int      owned;
+typedef struct TbcxMetadataStackEntry
+{
+    Tcl_Obj* value;
+    int owned;
 } TbcxMetadataStackEntry;
 
 /* Reconstruct a canonical, non-executable builder description from a
  * validated generic bytecode object.  The description is consumed only by
  * PrecompClass/PrecompObject to associate already-materialized method
  * records with this builder; Tcl never evaluates it. */
-static Tcl_Obj *ReconstructBuilderMetadata(
-    Tcl_Interp *ip,
-    Tcl_Obj *body,
-    int depth)
+static Tcl_Obj* ReconstructBuilderMetadata(Tcl_Interp* ip, Tcl_Obj* body, int depth)
 {
     if (depth > TBCX_MAX_LITERAL_DEPTH)
         return NULL;
-    ByteCode *bc = TbcxGetByteCode(body);
-    if (!bc || !bc->codeStart || bc->numCodeBytes <= 0 ||
-        bc->maxStackDepth < 0)
+    ByteCode* bc = TbcxGetByteCode(body);
+    if (!bc || !bc->codeStart || bc->numCodeBytes <= 0 || bc->maxStackDepth < 0)
         return NULL;
 
     Tcl_Size capacity = bc->maxStackDepth + 16;
     if (capacity < 32)
         capacity = 32;
     size_t bytes = 0;
-    if ((uint64_t)capacity > TBCX_MAX_CODE ||
-        !tbcx_checked_mul((size_t)capacity,
-            sizeof(TbcxMetadataStackEntry), &bytes))
+    if ((uint64_t)capacity > TBCX_MAX_CODE || !tbcx_checked_mul((size_t)capacity, sizeof(TbcxMetadataStackEntry), &bytes))
         return NULL;
-    TbcxMetadataStackEntry *stack =
-        (TbcxMetadataStackEntry *)Tcl_AttemptAlloc(bytes);
+    TbcxMetadataStackEntry* stack = (TbcxMetadataStackEntry*)Tcl_AttemptAlloc(bytes);
     if (!stack)
         return NULL;
     memset(stack, 0, bytes);
     Tcl_Size sp = 0;
     Tcl_DString script;
     Tcl_DStringInit(&script);
-    const InstructionDesc *table =
-        (const InstructionDesc *)TclGetInstructionTable();
+    const InstructionDesc* table = (const InstructionDesc*)TclGetInstructionTable();
 
-#define META_DROP(entry_) do {                                            \
-    if ((entry_).owned && (entry_).value)                                 \
-        Tcl_DecrRefCount((entry_).value);                                 \
-    (entry_).value = NULL;                                                \
-    (entry_).owned = 0;                                                   \
-} while (0)
+#define META_DROP(entry_)                                                                                                        \
+    do                                                                                                                           \
+    {                                                                                                                            \
+        if ((entry_).owned && (entry_).value)                                                                                    \
+            Tcl_DecrRefCount((entry_).value);                                                                                    \
+        (entry_).value = NULL;                                                                                                   \
+        (entry_).owned = 0;                                                                                                      \
+    } while (0)
 
     Tcl_Size pc = 0;
-    while (pc < bc->numCodeBytes) {
+    while (pc < bc->numCodeBytes)
+    {
         unsigned int opcode = bc->codeStart[pc];
         if (opcode > LAST_INST_OPCODE)
             goto metadata_fail;
-        const InstructionDesc *desc = &table[opcode];
-        if (desc->numBytes <= 0 ||
-            pc + desc->numBytes > bc->numCodeBytes)
+        const InstructionDesc* desc = &table[opcode];
+        if (desc->numBytes <= 0 || pc + desc->numBytes > bc->numCodeBytes)
             goto metadata_fail;
-        const char *name = desc->name ? desc->name : "";
+        const char* name = desc->name ? desc->name : "";
 
-        if (strcmp(name, "push") == 0 ||
-            strcmp(name, "push1") == 0 ||
-            strcmp(name, "push4") == 0) {
-            unsigned int index = desc->numBytes == 2
-                ? TclGetUInt1AtPtr(bc->codeStart + pc + 1)
-                : desc->numBytes == 5
-                    ? TclGetUInt4AtPtr(bc->codeStart + pc + 1)
-                    : UINT_MAX;
+        if (strcmp(name, "push") == 0 || strcmp(name, "push1") == 0 || strcmp(name, "push4") == 0)
+        {
+            unsigned int index = desc->numBytes == 2   ? TclGetUInt1AtPtr(bc->codeStart + pc + 1)
+                                 : desc->numBytes == 5 ? TclGetUInt4AtPtr(bc->codeStart + pc + 1)
+                                                       : UINT_MAX;
             if (index >= (unsigned)bc->numLitObjects || sp >= capacity)
                 goto metadata_fail;
-            Tcl_Obj *literal = bc->objArrayPtr[index];
-            Tcl_Obj *nested = TbcxGetByteCode(literal)
-                ? ReconstructBuilderMetadata(ip, literal, depth + 1) : NULL;
-            if (nested) {
+            Tcl_Obj* literal = bc->objArrayPtr[index];
+            Tcl_Obj* nested = TbcxGetByteCode(literal) ? ReconstructBuilderMetadata(ip, literal, depth + 1) : NULL;
+            if (nested)
+            {
                 stack[sp].value = nested;
                 stack[sp].owned = 1;
-            } else {
+            }
+            else
+            {
                 stack[sp].value = literal;
                 stack[sp].owned = 0;
             }
             sp++;
-        } else if (strcmp(name, "invokeStk") == 0 ||
-                   strcmp(name, "invokeStk1") == 0 ||
-                   strcmp(name, "invokeStk4") == 0) {
-            unsigned int argc = desc->numBytes == 2
-                ? TclGetUInt1AtPtr(bc->codeStart + pc + 1)
-                : desc->numBytes == 5
-                    ? TclGetUInt4AtPtr(bc->codeStart + pc + 1) : 0;
+        }
+        else if (strcmp(name, "invokeStk") == 0 || strcmp(name, "invokeStk1") == 0 || strcmp(name, "invokeStk4") == 0)
+        {
+            unsigned int argc = desc->numBytes == 2   ? TclGetUInt1AtPtr(bc->codeStart + pc + 1)
+                                : desc->numBytes == 5 ? TclGetUInt4AtPtr(bc->codeStart + pc + 1)
+                                                      : 0;
             if (argc == 0 || argc > (unsigned)sp)
                 goto metadata_fail;
             Tcl_Size base = sp - argc;
-            for (unsigned int i = 0; i < argc; i++) {
-                Tcl_Obj *word = stack[base + i].value;
+            for (unsigned int i = 0; i < argc; i++)
+            {
+                Tcl_Obj* word = stack[base + i].value;
                 if (!word)
                     goto metadata_fail;
                 Tcl_Size length = 0;
-                const char *value = Tbcx_GetStringFromObjSafe(word, &length);
-                if (!value || (length > 0 &&
-                        memchr(value, '\0', (size_t)length) != NULL))
+                const char* value = Tbcx_GetStringFromObjSafe(word, &length);
+                if (!value || (length > 0 && memchr(value, '\0', (size_t)length) != NULL))
                     goto metadata_fail;
                 Tcl_DStringAppendElement(&script, value);
             }
@@ -3122,15 +3273,20 @@ static Tcl_Obj *ReconstructBuilderMetadata(
             stack[sp].value = NULL; /* unknown command result */
             stack[sp].owned = 0;
             sp++;
-        } else if (strcmp(name, "pop") == 0) {
+        }
+        else if (strcmp(name, "pop") == 0)
+        {
             if (sp == 0)
                 goto metadata_fail;
             sp--;
             META_DROP(stack[sp]);
-        } else if (strcmp(name, "done") == 0) {
+        }
+        else if (strcmp(name, "done") == 0)
+        {
             break;
-        } else if (strcmp(name, "startCommand") != 0 &&
-                   strcmp(name, "nop") != 0) {
+        }
+        else if (strcmp(name, "startCommand") != 0 && strcmp(name, "nop") != 0)
+        {
             goto metadata_fail;
         }
         pc += desc->numBytes;
@@ -3139,8 +3295,7 @@ static Tcl_Obj *ReconstructBuilderMetadata(
     for (Tcl_Size i = 0; i < sp; i++)
         META_DROP(stack[i]);
     Tcl_Free(stack);
-    Tcl_Obj *result = Tcl_NewStringObj(Tcl_DStringValue(&script),
-        Tcl_DStringLength(&script));
+    Tcl_Obj* result = Tcl_NewStringObj(Tcl_DStringValue(&script), Tcl_DStringLength(&script));
     Tcl_IncrRefCount(result);
     Tcl_DStringFree(&script);
     return result;
@@ -3157,44 +3312,64 @@ metadata_fail:
 /* OOShim_IdentifyMethod — parse the oo::define subcommand to determine
  * method kind, body index, args reference, and hash key for precompiled
  * body lookup.  Sets *hasKeyOut=1 and initializes keyDs on success. */
-static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *const objv[], Tcl_Obj *clsFqn, Tcl_DString *keyDs, uint8_t *kindOut, Tcl_Size *bodyIdxOut, Tcl_Obj **runtimeArgsOut,
-                                  Tcl_Obj **nameOOut, Tcl_Obj **tmpEmptyArgsOut, int *hasKeyOut) {
-    *kindOut         = TBCX_METH_NONE;
-    *bodyIdxOut      = -1;
-    *runtimeArgsOut  = NULL;
-    *nameOOut        = NULL;
+static void OOShim_IdentifyMethod(const char* subc,
+                                  Tcl_Size objc,
+                                  Tcl_Obj* const objv[],
+                                  Tcl_Obj* clsFqn,
+                                  Tcl_DString* keyDs,
+                                  uint8_t* kindOut,
+                                  Tcl_Size* bodyIdxOut,
+                                  Tcl_Obj** runtimeArgsOut,
+                                  Tcl_Obj** nameOOut,
+                                  Tcl_Obj** tmpEmptyArgsOut,
+                                  int* hasKeyOut)
+{
+    *kindOut = TBCX_METH_NONE;
+    *bodyIdxOut = -1;
+    *runtimeArgsOut = NULL;
+    *nameOOut = NULL;
     *tmpEmptyArgsOut = NULL;
-    *hasKeyOut       = 0;
+    *hasKeyOut = 0;
 
-    if (strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) {
-        if (objc >= 6) {
-            *kindOut         = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
+    if (strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0)
+    {
+        if (objc >= 6)
+        {
+            *kindOut = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
             Tcl_Size nameIdx = objc - 3, argsIdx = objc - 2;
-            *bodyIdxOut     = objc - 1;
+            *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[argsIdx];
             if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, objv[nameIdx]))
                 *hasKeyOut = 1;
             *nameOOut = objv[nameIdx];
         }
-    } else if (strcmp(subc, "constructor") == 0) {
-        if (objc >= 5) {
-            *kindOut         = TBCX_METH_CTOR;
+    }
+    else if (strcmp(subc, "constructor") == 0)
+    {
+        if (objc >= 5)
+        {
+            *kindOut = TBCX_METH_CTOR;
             Tcl_Size argsIdx = objc - 2;
-            *bodyIdxOut      = objc - 1;
-            *runtimeArgsOut  = objv[argsIdx];
+            *bodyIdxOut = objc - 1;
+            *runtimeArgsOut = objv[argsIdx];
             if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, NULL))
                 *hasKeyOut = 1;
         }
-    } else if (strcmp(subc, "destructor") == 0) {
+    }
+    else if (strcmp(subc, "destructor") == 0)
+    {
         *kindOut = TBCX_METH_DTOR;
-        if (objc >= 5) {
+        if (objc >= 5)
+        {
             Tcl_Size argsIdx = objc - 2;
-            *bodyIdxOut      = objc - 1;
-            *runtimeArgsOut  = objv[argsIdx];
+            *bodyIdxOut = objc - 1;
+            *runtimeArgsOut = objv[argsIdx];
             if (MethodKeyBuf(keyDs, clsFqn, *kindOut, TBCX_MORIGIN_CLASS, NULL))
                 *hasKeyOut = 1;
-        } else if (objc == 4) {
-            *bodyIdxOut     = 3;
+        }
+        else if (objc == 4)
+        {
+            *bodyIdxOut = 3;
             *runtimeArgsOut = Tcl_NewStringObj("", 0);
             Tcl_IncrRefCount(*runtimeArgsOut);
             *tmpEmptyArgsOut = *runtimeArgsOut;
@@ -3203,75 +3378,89 @@ static void OOShim_IdentifyMethod(const char *subc, Tcl_Size objc, Tcl_Obj *cons
         }
     }
     /* oo::define CLS self method NAME ARGS BODY  (objc >= 7) */
-    else if (strcmp(subc, "self") == 0 && objc >= 7) {
-        const char *selfSub = Tbcx_GetStringStrict(NULL, objv[3]);
+    else if (strcmp(subc, "self") == 0 && objc >= 7)
+    {
+        const char* selfSub = Tbcx_GetStringStrict(NULL, objv[3]);
         if (!selfSub)
             return;
-        if (strcmp(selfSub, "method") == 0) {
-            *kindOut        = TBCX_METH_SELF;
+        if (strcmp(selfSub, "method") == 0)
+        {
+            *kindOut = TBCX_METH_SELF;
             /* objv: [0]=oo::define [1]=CLS [2]=self [3]=method [4]=NAME [5]=ARGS [6]=BODY */
-            *bodyIdxOut     = objc - 1;
+            *bodyIdxOut = objc - 1;
             *runtimeArgsOut = objv[objc - 2];
-            *nameOOut       = objv[objc - 3];
+            *nameOOut = objv[objc - 3];
             if (MethodKeyBuf(keyDs, clsFqn, TBCX_METH_SELF, TBCX_MORIGIN_CLASS, *nameOOut))
                 *hasKeyOut = 1;
         }
     }
 }
 
-static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+static int CmdOOShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    OOShim   *os  = (OOShim *)cd;
-    int       rc  = TCL_OK;
-    Tcl_Obj  *cls = NULL, *sub = NULL;
-    Tcl_Obj  *nameO = NULL; /* method/classmethod name when applicable */
+    OOShim* os = (OOShim*)cd;
+    int rc = TCL_OK;
+    Tcl_Obj *cls = NULL, *sub = NULL;
+    Tcl_Obj* nameO = NULL; /* method/classmethod name when applicable */
 
     /* Prepare argv for calling the saved original handler.
        argv2[0] = objv[0] (the command name the caller used). */
-    Tcl_Obj  *argvStack[TBCX_ARGV_STACK];
-    Tcl_Obj **argv2;
-    if (objc <= TBCX_ARGV_STACK) {
+    Tcl_Obj* argvStack[TBCX_ARGV_STACK];
+    Tcl_Obj** argv2;
+    if (objc <= TBCX_ARGV_STACK)
+    {
         argv2 = argvStack;
-    } else {
+    }
+    else
+    {
         size_t allocSz;
-        if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj *), (size_t)objc, &allocSz)) {
+        if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj*), (size_t)objc, &allocSz))
+        {
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument count overflow in oo::define shim", -1));
             return TCL_ERROR;
         }
-        argv2 = (Tcl_Obj **)Tcl_Alloc(allocSz);
+        argv2 = (Tcl_Obj**)Tcl_Alloc(allocSz);
     }
     argv2[0] = objv[0];
-    for (Tcl_Size i = 1; i < objc; i++) {
+    for (Tcl_Size i = 1; i < objc; i++)
+    {
         argv2[i] = objv[i];
     }
 
     /* Fast path: if we don't even have "class subcmd ..." just forward. */
-    if (objc < 3) {
+    if (objc < 3)
+    {
         rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
         if (argv2 != argvStack)
             Tcl_Free(argv2);
         return rc;
     }
 
-    cls               = objv[1];
-    sub               = objv[2];
+    cls = objv[1];
+    sub = objv[2];
 
     /* Compute if this is the builder form: "oo::define <cls> <script>" */
     int isBuilderForm = 0;
-    if (objc == 3) {
+    if (objc == 3)
+    {
         isBuilderForm = 1;
     }
 
     /* Compute class FQN under current namespace if relative. */
-    Tcl_Obj    *clsFqn = NULL;
-    const char *nm     = Tbcx_GetStringSafe(cls);
-    if (nm[0] == ':' && nm[1] == ':') {
+    Tcl_Obj* clsFqn = NULL;
+    const char* nm = Tbcx_GetStringSafe(cls);
+    if (nm[0] == ':' && nm[1] == ':')
+    {
         clsFqn = cls; /* borrow ref */
-    } else {
-        Tcl_Namespace *cur     = Tcl_GetCurrentNamespace(ip);
-        const char    *curName = cur ? cur->fullName : "::";
-        clsFqn                 = Tcl_NewStringObj(curName, -1);
-        if (!(curName[0] == ':' && curName[1] == ':' && curName[2] == '\0')) {
+    }
+    else
+    {
+        Tcl_Namespace* cur = Tcl_GetCurrentNamespace(ip);
+        const char* curName = cur ? cur->fullName : "::";
+        clsFqn = Tcl_NewStringObj(curName, -1);
+        if (!(curName[0] == ':' && curName[1] == ':' && curName[2] == '\0'))
+        {
             Tcl_AppendToObj(clsFqn, "::", 2);
         }
         Tcl_AppendObjToObj(clsFqn, cls);
@@ -3279,21 +3468,22 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
     }
 
     /* Try to locate a precompiled body matching this definition form. */
-    const char *subc = Tbcx_GetStringSafe(sub);
-    Tcl_DString keyDs;                         /* hash key "class\x1Fkind\x1Fname" */
-    int         hasKey       = 0;              /* set to 1 once keyDs is initialized */
-    Tcl_Obj    *savedArgs    = NULL;           /* canonical args saved with the precompiled body */
-    Tcl_Obj    *preBody      = NULL;           /* precompiled procbody to substitute */
-    Tcl_Obj    *runtimeArgs  = NULL;           /* args provided by the user at runtime */
-    Tcl_Obj    *tmpEmptyArgs = NULL;           /* temp "" for destructor short form */
-    Tcl_Size    bodyIdx      = -1;             /* index of body word in argv */
-    uint8_t     kind         = TBCX_METH_NONE; /* TBCX_METH_* */
-    int         methScope    = TBCX_MSCOPE_DEFAULT;
+    const char* subc = Tbcx_GetStringSafe(sub);
+    Tcl_DString keyDs;             /* hash key "class\x1Fkind\x1Fname" */
+    int hasKey = 0;                /* set to 1 once keyDs is initialized */
+    Tcl_Obj* savedArgs = NULL;     /* canonical args saved with the precompiled body */
+    Tcl_Obj* preBody = NULL;       /* precompiled procbody to substitute */
+    Tcl_Obj* runtimeArgs = NULL;   /* args provided by the user at runtime */
+    Tcl_Obj* tmpEmptyArgs = NULL;  /* temp "" for destructor short form */
+    Tcl_Size bodyIdx = -1;         /* index of body word in argv */
+    uint8_t kind = TBCX_METH_NONE; /* TBCX_METH_* */
+    int methScope = TBCX_MSCOPE_DEFAULT;
 
     /* Identify the OO subcommand and build its method key. */
     OOShim_IdentifyMethod(subc, objc, objv, clsFqn, &keyDs, &kind, &bodyIdx, &runtimeArgs, &nameO, &tmpEmptyArgs, &hasKey);
 
-    if (!isBuilderForm) {
+    if (!isBuilderForm)
+    {
         /* A flat method/ctor/dtor/self statement the saver stubbed carries the
            stub sentinel as its body.  A statement the saver left VERBATIM (a
            runtime-variable target, or a non-literal name/args/body it never
@@ -3302,29 +3492,39 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
            builder keyed the same.  This is the class-side mirror of the
            per-object sentinel gate. */
         int bodyIsStub = 0;
-        if (bodyIdx >= 0) {
-            Tcl_Size    bl0 = 0;
-            const char *bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
-            bodyIsStub      = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
+        if (bodyIdx >= 0)
+        {
+            Tcl_Size bl0 = 0;
+            const char* bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
+            bodyIsStub = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
         }
-        if (hasKey && bodyIsStub) {
+        if (hasKey && bodyIsStub)
+        {
             /* One flat statement installs one method: consume exactly one FIFO
                record (front == this statement's, in definition order). */
-            Tcl_Obj *pair = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
-            if (pair) {
-                Tcl_Size  plen = 0;
-                Tcl_Obj **pel  = NULL;
-                if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) == TCL_OK && plen >= 2) {
+            Tcl_Obj* pair = OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
+            if (pair)
+            {
+                Tcl_Size plen = 0;
+                Tcl_Obj** pel = NULL;
+                if (Tcl_ListObjGetElements(ip, pair, &plen, &pel) == TCL_OK && plen >= 2)
+                {
                     savedArgs = pel[0];
-                    preBody   = pel[1];
+                    preBody = pel[1];
                     methScope = PairScope(ip, pair);
                 }
-                if (preBody) {
-                    if (kind == TBCX_METH_CTOR) {
+                if (preBody)
+                {
+                    if (kind == TBCX_METH_CTOR)
+                    {
                         rc = DefOO(ip, os, clsFqn, TBCX_METH_CTOR, NULL, savedArgs, preBody, TBCX_MSCOPE_DEFAULT);
-                    } else if (kind == TBCX_METH_DTOR) {
+                    }
+                    else if (kind == TBCX_METH_DTOR)
+                    {
                         rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, preBody, TBCX_MSCOPE_DEFAULT);
-                    } else { /* INST / CLASS / SELF */
+                    }
+                    else
+                    { /* INST / CLASS / SELF */
                         rc = DefOO(ip, os, clsFqn, kind, nameO, savedArgs, preBody, methScope);
                     }
                     goto cleanup;
@@ -3336,28 +3536,36 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
          * Special tolerance for destructor with accidental empty-args list:
          * If objc>=5 and args=={}, collapse to canonical 4-arg form.
          */
-        if (kind == TBCX_METH_DTOR && objc >= 5 && runtimeArgs) {
-            Tcl_Size nEl    = -1;
-            int      listRc = Tcl_ListObjLength(ip, runtimeArgs, &nEl);
-            if (listRc != TCL_OK) {
+        if (kind == TBCX_METH_DTOR && objc >= 5 && runtimeArgs)
+        {
+            Tcl_Size nEl = -1;
+            int listRc = Tcl_ListObjLength(ip, runtimeArgs, &nEl);
+            if (listRc != TCL_OK)
+            {
                 /* Failed canonicalization should simply disable the special
                    empty-args shortcut.  Clear the transient list-conversion
                    error before forwarding to the original command. */
                 Tcl_ResetResult(ip);
             }
-            if (listRc == TCL_OK && nEl == 0) {
-                Tcl_Obj *body = objv[objc - 1];
-                rc            = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, body, TBCX_MSCOPE_DEFAULT);
-            } else {
+            if (listRc == TCL_OK && nEl == 0)
+            {
+                Tcl_Obj* body = objv[objc - 1];
+                rc = DefOO(ip, os, clsFqn, TBCX_METH_DTOR, NULL, NULL, body, TBCX_MSCOPE_DEFAULT);
+            }
+            else
+            {
                 /* Forward to original; normalize the class arg to FQN */
                 argv2[1] = clsFqn;
                 Tcl_IncrRefCount(clsFqn);
                 rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
                 Tcl_DecrRefCount(clsFqn);
             }
-        } else {
+        }
+        else
+        {
             /* Forward other subcommands; ensure class arg is FQN */
-            if (objc >= 2) {
+            if (objc >= 2)
+            {
                 argv2[1] = clsFqn;
                 Tcl_IncrRefCount(clsFqn);
             }
@@ -3365,26 +3573,31 @@ static int CmdOOShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const obj
             if (objc >= 2)
                 Tcl_DecrRefCount(clsFqn);
         }
-    } else {
+    }
+    else
+    {
         /* Builder form: run the builder block first, then install the
            precompiled bodies for THIS builder via PrecompClass (which parses
            the just-forwarded builder body — objv[2] == sub).  Builder-scoping
            is what keeps interleaved same-class redefinitions correct: each
            builder installs only its own methods, in definition order. */
-        if (objc >= 2) {
+        if (objc >= 2)
+        {
             argv2[1] = clsFqn;
             Tcl_IncrRefCount(clsFqn);
         }
         rc = os->savedDefineProc(os->savedDefineCD, ip, objc, argv2);
         if (objc >= 2)
             Tcl_DecrRefCount(clsFqn);
-        if (rc == TCL_OK) {
-            Tcl_Obj *metadata = ReconstructBuilderMetadata(ip, sub, 0);
-            Tcl_Obj *description = metadata ? metadata : sub;
+        if (rc == TCL_OK)
+        {
+            Tcl_Obj* metadata = ReconstructBuilderMetadata(ip, sub, 0);
+            Tcl_Obj* description = metadata ? metadata : sub;
             int patchRc = PrecompClass(ip, os, clsFqn, description);
             if (metadata)
                 Tcl_DecrRefCount(metadata);
-            if (patchRc != TCL_OK) {
+            if (patchRc != TCL_OK)
+            {
                 rc = patchRc; /* leave error in interp */
             }
         }
@@ -3406,48 +3619,57 @@ cleanup:
    the saved original oo::objdefine handler.  Uses the same
    methodsByKey registry since saver stores objdefine methods
    there keyed by the object/class FQN. */
-static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+static int CmdOOShimObjDef(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    OOShim   *os = (OOShim *)cd;
-    int       rc = TCL_OK;
+    OOShim* os = (OOShim*)cd;
+    int rc = TCL_OK;
 
     /* Prepare argv for calling the saved original handler. */
-    Tcl_Obj  *argvStack[TBCX_ARGV_STACK];
-    Tcl_Obj **argv2;
-    if (objc <= TBCX_ARGV_STACK) {
+    Tcl_Obj* argvStack[TBCX_ARGV_STACK];
+    Tcl_Obj** argv2;
+    if (objc <= TBCX_ARGV_STACK)
+    {
         argv2 = argvStack;
-    } else {
+    }
+    else
+    {
         size_t allocSz;
-        if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj *), (size_t)objc, &allocSz)) {
+        if (objc < 0 || !tbcx_checked_mul(sizeof(Tcl_Obj*), (size_t)objc, &allocSz))
+        {
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: argument count overflow in oo::objdefine shim", -1));
             return TCL_ERROR;
         }
-        argv2 = (Tcl_Obj **)Tcl_Alloc(allocSz);
+        argv2 = (Tcl_Obj**)Tcl_Alloc(allocSz);
     }
     argv2[0] = objv[0];
     for (Tcl_Size i = 1; i < objc; i++)
         argv2[i] = objv[i];
 
-    if (objc < 3) {
+    if (objc < 3)
+    {
         rc = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
         if (argv2 != argvStack)
             Tcl_Free(argv2);
         return rc;
     }
 
-    Tcl_Obj    *obj           = objv[1];
-    Tcl_Obj    *sub           = objv[2];
-    int         isBuilderForm = (objc == 3);
+    Tcl_Obj* obj = objv[1];
+    Tcl_Obj* sub = objv[2];
+    int isBuilderForm = (objc == 3);
 
     /* Compute object FQN */
-    Tcl_Obj    *objFqn        = NULL;
-    const char *nm            = Tbcx_GetStringSafe(obj);
-    if (nm[0] == ':' && nm[1] == ':') {
+    Tcl_Obj* objFqn = NULL;
+    const char* nm = Tbcx_GetStringSafe(obj);
+    if (nm[0] == ':' && nm[1] == ':')
+    {
         objFqn = obj;
-    } else {
-        Tcl_Namespace *cur     = Tcl_GetCurrentNamespace(ip);
-        const char    *curName = cur ? cur->fullName : "::";
-        objFqn                 = Tcl_NewStringObj(curName, -1);
+    }
+    else
+    {
+        Tcl_Namespace* cur = Tcl_GetCurrentNamespace(ip);
+        const char* curName = cur ? cur->fullName : "::";
+        objFqn = Tcl_NewStringObj(curName, -1);
         if (!(curName[0] == ':' && curName[1] == ':' && curName[2] == '\0'))
             Tcl_AppendToObj(objFqn, "::", 2);
         Tcl_AppendObjToObj(objFqn, obj);
@@ -3455,30 +3677,35 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
     }
 
     /* For multi-word form: try to find and substitute precompiled body */
-    if (!isBuilderForm) {
-        const char *subc = Tbcx_GetStringSafe(sub);
+    if (!isBuilderForm)
+    {
+        const char* subc = Tbcx_GetStringSafe(sub);
         Tcl_DString keyDs;
-        int         hasKey  = 0;
-        Tcl_Obj    *nameO   = NULL;
-        Tcl_Size    bodyIdx = -1;
-        uint8_t     kind    = TBCX_METH_NONE;
+        int hasKey = 0;
+        Tcl_Obj* nameO = NULL;
+        Tcl_Size bodyIdx = -1;
+        uint8_t kind = TBCX_METH_NONE;
 
-        if ((strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) && objc >= 6) {
-            kind    = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
+        if ((strcmp(subc, "method") == 0 || strcmp(subc, "classmethod") == 0) && objc >= 6)
+        {
+            kind = (strcmp(subc, "classmethod") == 0) ? TBCX_METH_CLASS : TBCX_METH_INST;
             /* Syntax: oo::objdefine OBJ method NAME ?-export|-unexport|-private? ARGS BODY.
                NAME is ALWAYS objv[3]; ARGS/BODY are the last two words, with any
                scope option in between. */
             bodyIdx = objc - 1;
-            nameO   = objv[3];
+            nameO = objv[3];
             if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, nameO))
                 hasKey = 1;
             /* Fallback: for "method" in oo::objdefine context, the saver
                may have stored it as TBCX_METH_SELF (kind=4).  Try that key
                if the INST key has no match. */
-            if (strcmp(subc, "method") == 0 && hasKey && !Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs))) {
+            if (strcmp(subc, "method") == 0 && hasKey && !Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs)))
+            {
                 Tcl_DString selfDs;
-                if (MethodKeyBuf(&selfDs, objFqn, TBCX_METH_SELF, TBCX_MORIGIN_OBJECT, nameO)) {
-                    if (Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&selfDs))) {
+                if (MethodKeyBuf(&selfDs, objFqn, TBCX_METH_SELF, TBCX_MORIGIN_OBJECT, nameO))
+                {
+                    if (Tcl_FindHashEntry(&os->methodsByKey, Tcl_DStringValue(&selfDs)))
+                    {
                         /* Rebuild keyDs with the SELF key */
                         Tcl_DStringFree(&keyDs);
                         MethodKeyBuf(&keyDs, objFqn, TBCX_METH_SELF, TBCX_MORIGIN_OBJECT, nameO);
@@ -3487,13 +3714,17 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
                     Tcl_DStringFree(&selfDs);
                 }
             }
-        } else if (strcmp(subc, "constructor") == 0 && objc >= 5) {
-            kind    = TBCX_METH_CTOR;
+        }
+        else if (strcmp(subc, "constructor") == 0 && objc >= 5)
+        {
+            kind = TBCX_METH_CTOR;
             bodyIdx = objc - 1;
             if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, NULL))
                 hasKey = 1;
-        } else if (strcmp(subc, "destructor") == 0 && objc >= 4) {
-            kind    = TBCX_METH_DTOR;
+        }
+        else if (strcmp(subc, "destructor") == 0 && objc >= 4)
+        {
+            kind = TBCX_METH_DTOR;
             bodyIdx = objc - 1;
             if (MethodKeyBuf(&keyDs, objFqn, kind, TBCX_MORIGIN_OBJECT, NULL))
                 hasKey = 1;
@@ -3504,42 +3735,53 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
            saver left unchanged) has a real body and must never be patched from
            a precompiled record — even one keyed the same by another builder. */
         int bodyIsStub = 0;
-        if (bodyIdx >= 0) {
-            Tcl_Size    bl0 = 0;
-            const char *bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
-            bodyIsStub      = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
+        if (bodyIdx >= 0)
+        {
+            Tcl_Size bl0 = 0;
+            const char* bs0 = Tbcx_GetStringFromObjSafe(objv[bodyIdx], &bl0);
+            bodyIsStub = (bl0 == (Tcl_Size)TBCX_METH_STUB_BODY_LEN && memcmp(bs0, TBCX_METH_STUB_BODY, (size_t)bl0) == 0);
         }
-        if (hasKey) {
-            if (bodyIsStub && bodyIdx >= 0) {
+        if (hasKey)
+        {
+            if (bodyIsStub && bodyIdx >= 0)
+            {
                 /* One flat statement installs one method: consume exactly one
                    FIFO record (front == this statement's, in definition order).
                    A self method delegated here from `oo::define CLS self method`
                    carries the ";" placeholder (never the sentinel), so kind is
                    never SELF on this gated path; the oo::define self path
                    consumes its own FIFO record. */
-                Tcl_Obj *pair = (kind == TBCX_METH_SELF) ? NULL : OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
-                if (pair) {
+                Tcl_Obj* pair = (kind == TBCX_METH_SELF) ? NULL : OOShim_TakeRecord(os, Tcl_DStringValue(&keyDs));
+                if (pair)
+                {
                     Tcl_Obj *savedArgs = NULL, *preBody = NULL;
-                    int      objScope  = TBCX_MSCOPE_DEFAULT;
-                    Tcl_Size  pLen   = 0;
-                    Tcl_Obj **pElems = NULL;
-                    if (Tcl_ListObjGetElements(ip, pair, &pLen, &pElems) == TCL_OK && pLen >= 2) {
+                    int objScope = TBCX_MSCOPE_DEFAULT;
+                    Tcl_Size pLen = 0;
+                    Tcl_Obj** pElems = NULL;
+                    if (Tcl_ListObjGetElements(ip, pair, &pLen, &pElems) == TCL_OK && pLen >= 2)
+                    {
                         savedArgs = pElems[0];
-                        preBody   = pElems[1];
-                        objScope  = PairScope(ip, pair);
+                        preBody = pElems[1];
+                        objScope = PairScope(ip, pair);
                     }
-                    if (preBody) {
-                        if ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && objScope == TBCX_MSCOPE_TRUE_PRIVATE) {
+                    if (preBody)
+                    {
+                        if ((kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && objScope == TBCX_MSCOPE_TRUE_PRIVATE)
+                        {
                             /* True-private per-object method: install via the
                                flat private form so TclOO establishes the scope. */
-                            rc = TbcxInstallObjPrivateMethod(ip, os, objFqn, nameO, savedArgs ? savedArgs : objv[objc - 2], preBody, kind);
-                        } else {
+                            rc = TbcxInstallObjPrivateMethod(
+                                ip, os, objFqn, nameO, savedArgs ? savedArgs : objv[objc - 2], preBody, kind);
+                        }
+                        else
+                        {
                             /* Substitute the body argument and forward. */
                             argv2[bodyIdx] = preBody;
-                            rc             = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
+                            rc = os->savedObjdefProc(os->savedObjdefCD, ip, objc, argv2);
                             /* Apply explicit export/unexport scope (per-object
                                methods default to name-case visibility). */
-                            if (rc == TCL_OK && (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) && (objScope == TBCX_MSCOPE_PUBLIC || objScope == TBCX_MSCOPE_UNEXPORTED) && nameO)
+                            if (rc == TCL_OK && (kind == TBCX_METH_INST || kind == TBCX_METH_CLASS) &&
+                                (objScope == TBCX_MSCOPE_PUBLIC || objScope == TBCX_MSCOPE_UNEXPORTED) && nameO)
                                 rc = TbcxApplyObjExportVisibility(ip, os, objFqn, nameO, objScope == TBCX_MSCOPE_PUBLIC);
                         }
                         Tcl_DStringFree(&keyDs);
@@ -3565,13 +3807,15 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
        scope options, private{} blocks, and export/unexport.  This is object-
        definition semantics, not oo::define class machinery, so it is correct
        even when objFqn names a class object. */
-    if (isBuilderForm && rc == TCL_OK) {
-        Tcl_Obj *metadata = ReconstructBuilderMetadata(ip, objv[2], 0);
-        Tcl_Obj *description = metadata ? metadata : objv[2];
+    if (isBuilderForm && rc == TCL_OK)
+    {
+        Tcl_Obj* metadata = ReconstructBuilderMetadata(ip, objv[2], 0);
+        Tcl_Obj* description = metadata ? metadata : objv[2];
         int patchRc = PrecompObject(ip, os, objFqn, description);
         if (metadata)
             Tcl_DecrRefCount(metadata);
-        if (patchRc != TCL_OK) {
+        if (patchRc != TCL_OK)
+        {
             rc = patchRc; /* preserve PrecompObject() error/result */
         }
     }
@@ -3583,59 +3827,62 @@ static int CmdOOShimObjDef(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
     return rc;
 }
 
-/* OOShimDefineCmdTrace — called when "oo::define" is renamed or deleted
- * while the shim is active.  Invalidates the cached Command* to prevent
- * stale-pointer writes in DelOOShim. */
-static void OOShimDefineCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
-    OOShim *os = (OOShim *)cd;
+/* Restore a renamed oo::define command and clear the shim's cached pointer on
+ * rename or deletion. */
+static void OOShimDefineCmdTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags)
+{
+    OOShim* os = (OOShim*)cd;
     (void)oldName;
-    if (flags & TCL_TRACE_RENAME) {
-        /* Same UAF-avoidance as ProcCmdDeleteTrace: the Command struct
-         * survives the rename, so we must restore its handlers *now*
-         * while it's still accessible — otherwise the renamed command
-         * retains our CmdOOShim with a dangling os pointer once
-         * LoadTbcxStream returns. */
-        if (os->defineCmdPtr) {
-            os->defineCmdPtr->objProc2       = os->savedDefineProc;
+    if (flags & TCL_TRACE_RENAME)
+    {
+        /* A renamed command retains its Command struct and handlers. */
+        if (os->defineCmdPtr)
+        {
+            os->defineCmdPtr->objProc2 = os->savedDefineProc;
             os->defineCmdPtr->objClientData2 = os->savedDefineCD;
-            if (os->savedDefineNre) {
+            if (os->savedDefineNre)
+            {
                 os->defineCmdPtr->nreProc2 = os->savedDefineNre;
             }
         }
         /* Rename traces remain attached to the Command.  Remove this one
            from its new name while the stack-backed OOShim is still alive. */
-        if (os->defineTraceInstalled && newName && newName[0]) {
-            Tcl_UntraceCommand(interp, newName,
-                TCL_TRACE_RENAME | TCL_TRACE_DELETE,
-                OOShimDefineCmdTrace, os);
+        if (os->defineTraceInstalled && newName && newName[0])
+        {
+            Tcl_UntraceCommand(interp, newName, TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os);
         }
     }
-    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
-        os->defineCmdPtr         = NULL;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE))
+    {
+        os->defineCmdPtr = NULL;
         os->defineTraceInstalled = 0;
     }
 }
 
 /* OOShimObjdefCmdTrace — same for "oo::objdefine". */
-static void OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
-    OOShim *os = (OOShim *)cd;
+static void OOShimObjdefCmdTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags)
+{
+    OOShim* os = (OOShim*)cd;
     (void)oldName;
-    if (flags & TCL_TRACE_RENAME) {
-        if (os->objdefCmdPtr) {
-            os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+    if (flags & TCL_TRACE_RENAME)
+    {
+        if (os->objdefCmdPtr)
+        {
+            os->objdefCmdPtr->objProc2 = os->savedObjdefProc;
             os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
-            if (os->savedObjdefNre) {
+            if (os->savedObjdefNre)
+            {
                 os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
             }
         }
-        if (os->objdefTraceInstalled && newName && newName[0]) {
-            Tcl_UntraceCommand(interp, newName,
-                TCL_TRACE_RENAME | TCL_TRACE_DELETE,
-                OOShimObjdefCmdTrace, os);
+        if (os->objdefTraceInstalled && newName && newName[0])
+        {
+            Tcl_UntraceCommand(interp, newName, TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os);
         }
     }
-    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
-        os->objdefCmdPtr         = NULL;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE))
+    {
+        os->objdefCmdPtr = NULL;
         os->objdefTraceInstalled = 0;
     }
 }
@@ -3651,7 +3898,8 @@ static void OOShimObjdefCmdTrace(void *cd, Tcl_Interp *interp, const char *oldNa
  * Thread safety / lock ordering:
  *   No TBCX mutex is held during this call.
  *   Must be called from the interp-owning thread only. */
-static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
+static int AddOOShim(Tcl_Interp* ip, OOShim* os)
+{
     memset(os, 0, sizeof(*os));
     Tcl_InitHashTable(&os->methodsByKey, TCL_STRING_KEYS);
     /* Retains every triple consumed from a methodsByKey FIFO so its precompiled
@@ -3661,44 +3909,50 @@ static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
 
     /* Find and patch oo::define */
     Tcl_Command defToken = Tcl_FindCommand(ip, "oo::define", NULL, 0);
-    if (!defToken) {
+    if (!defToken)
+    {
         Tcl_DeleteHashTable(&os->methodsByKey);
         Tcl_DecrRefCount(os->retired);
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: oo::define not found", -1));
         return TCL_ERROR;
     }
-    os->defineCmdPtr    = (Command *)defToken;
+    os->defineCmdPtr = (Command*)defToken;
     os->savedDefineProc = os->defineCmdPtr->objProc2;
-    os->savedDefineNre  = os->defineCmdPtr->nreProc2;
-    os->savedDefineCD   = os->defineCmdPtr->objClientData2;
+    os->savedDefineNre = os->defineCmdPtr->nreProc2;
+    os->savedDefineCD = os->defineCmdPtr->objClientData2;
 
-    if (Tcl_TraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os) != TCL_OK) {
+    if (Tcl_TraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os) != TCL_OK)
+    {
         Tcl_DeleteHashTable(&os->methodsByKey);
         Tcl_DecrRefCount(os->retired);
         return TCL_ERROR;
     }
-    os->defineTraceInstalled         = 1;
+    os->defineTraceInstalled = 1;
 
-    os->defineCmdPtr->objProc2       = CmdOOShim;
+    os->defineCmdPtr->objProc2 = CmdOOShim;
     os->defineCmdPtr->objClientData2 = os;
-    if (os->defineCmdPtr->nreProc2) {
+    if (os->defineCmdPtr->nreProc2)
+    {
         os->defineCmdPtr->nreProc2 = CmdOOShim;
     }
 
     /* Also shim oo::objdefine if it exists */
-    os->hasObjDefine        = 0;
+    os->hasObjDefine = 0;
     Tcl_Command objdefToken = Tcl_FindCommand(ip, "oo::objdefine", NULL, 0);
-    if (objdefToken) {
-        os->objdefCmdPtr    = (Command *)objdefToken;
+    if (objdefToken)
+    {
+        os->objdefCmdPtr = (Command*)objdefToken;
         os->savedObjdefProc = os->objdefCmdPtr->objProc2;
-        os->savedObjdefNre  = os->objdefCmdPtr->nreProc2;
-        os->savedObjdefCD   = os->objdefCmdPtr->objClientData2;
+        os->savedObjdefNre = os->objdefCmdPtr->nreProc2;
+        os->savedObjdefCD = os->objdefCmdPtr->objClientData2;
 
-        if (Tcl_TraceCommand(ip, "oo::objdefine", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os) == TCL_OK) {
-            os->objdefTraceInstalled         = 1;
-            os->objdefCmdPtr->objProc2       = CmdOOShimObjDef;
+        if (Tcl_TraceCommand(ip, "oo::objdefine", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os) == TCL_OK)
+        {
+            os->objdefTraceInstalled = 1;
+            os->objdefCmdPtr->objProc2 = CmdOOShimObjDef;
             os->objdefCmdPtr->objClientData2 = os;
-            if (os->objdefCmdPtr->nreProc2) {
+            if (os->objdefCmdPtr->nreProc2)
+            {
                 os->objdefCmdPtr->nreProc2 = CmdOOShimObjDef;
             }
             os->hasObjDefine = 1;
@@ -3707,69 +3961,83 @@ static int AddOOShim(Tcl_Interp *ip, OOShim *os) {
     return TCL_OK;
 }
 
-static void DelOOShim(Tcl_Interp *ip, OOShim *os) {
+static void DelOOShim(Tcl_Interp* ip, OOShim* os)
+{
     /* Remove traces before restoring handlers */
-    if (os->defineTraceInstalled) {
+    if (os->defineTraceInstalled)
+    {
         Tcl_UntraceCommand(ip, "oo::define", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimDefineCmdTrace, os);
         os->defineTraceInstalled = 0;
     }
     /* Restore oo::define handlers only if the Command is still alive */
-    if (os->defineCmdPtr) {
-        os->defineCmdPtr->objProc2       = os->savedDefineProc;
+    if (os->defineCmdPtr)
+    {
+        os->defineCmdPtr->objProc2 = os->savedDefineProc;
         os->defineCmdPtr->objClientData2 = os->savedDefineCD;
-        if (os->savedDefineNre) {
+        if (os->savedDefineNre)
+        {
             os->defineCmdPtr->nreProc2 = os->savedDefineNre;
         }
     }
 
-    if (os->hasObjDefine) {
-        if (os->objdefTraceInstalled) {
+    if (os->hasObjDefine)
+    {
+        if (os->objdefTraceInstalled)
+        {
             Tcl_UntraceCommand(ip, "oo::objdefine", TCL_TRACE_RENAME | TCL_TRACE_DELETE, OOShimObjdefCmdTrace, os);
             os->objdefTraceInstalled = 0;
         }
-        if (os->objdefCmdPtr) {
-            os->objdefCmdPtr->objProc2       = os->savedObjdefProc;
+        if (os->objdefCmdPtr)
+        {
+            os->objdefCmdPtr->objProc2 = os->savedObjdefProc;
             os->objdefCmdPtr->objClientData2 = os->savedObjdefCD;
-            if (os->savedObjdefNre) {
+            if (os->savedObjdefNre)
+            {
                 os->objdefCmdPtr->nreProc2 = os->savedObjdefNre;
             }
         }
     }
 
     Tcl_HashSearch s;
-    Tcl_HashEntry *e;
-    for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s)) {
+    Tcl_HashEntry* e;
+    for (e = Tcl_FirstHashEntry(&os->methodsByKey, &s); e; e = Tcl_NextHashEntry(&s))
+    {
         /* Each value is a FIFO list owning its remaining (unconsumed) triples;
            dropping the list frees them. */
-        Tcl_Obj *val = (Tcl_Obj *)Tcl_GetHashValue(e);
+        Tcl_Obj* val = (Tcl_Obj*)Tcl_GetHashValue(e);
         if (val)
             Tcl_DecrRefCount(val);
     }
     Tcl_DeleteHashTable(&os->methodsByKey);
     /* Free every triple that was consumed (moved here by OOShim_TakeRecord). */
-    if (os->retired) {
+    if (os->retired)
+    {
         Tcl_DecrRefCount(os->retired);
         os->retired = NULL;
     }
 }
 
-Tcl_Namespace *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn) {
+Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn)
+{
     /* Validate the namespace string at the API boundary rather than
        relying on each call site to validate beforehand.
        Note: embedded NULs cannot be detected from a plain const char*;
        that check belongs at the wire-reading sites (Tbcx_ValidateKeyString). */
-    if (!fqn || fqn[0] == '\0') {
+    if (!fqn || fqn[0] == '\0')
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: empty namespace path", -1));
         return NULL;
     }
-    if (!(fqn[0] == ':' && fqn[1] == ':')) {
+    if (!(fqn[0] == ':' && fqn[1] == ':'))
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: namespace must be absolute: \"%s\"", fqn));
         return NULL;
     }
-    Tcl_Namespace *nsPtr = Tcl_FindNamespace(ip, fqn, NULL, 0);
-    if (!nsPtr) {
+    Tcl_Namespace* nsPtr = Tcl_FindNamespace(ip, fqn, NULL, 0);
+    if (!nsPtr)
+    {
         nsPtr = Tcl_CreateNamespace(ip, fqn, NULL, NULL);
     }
     return nsPtr;
@@ -3779,39 +4047,40 @@ Tcl_Namespace *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn) {
  * but never calls internal TclPreserveByteCode(). Instead we set refCount = 1.
  */
 
-static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
-                              Namespace *nsPtr,
-                              const unsigned char *code, uint32_t codeLen,
-                              Tcl_Obj *const *lits, uint32_t numLits,
-                              const AuxData *auxArr, uint32_t numAux,
-                              const ExceptionRange *exArr, uint32_t numEx,
-                              Tcl_Size maxStackDepth, int setPrecompiled) {
-    Interp *iPtr = (Interp *)ip;
-    nsPtr = nsPtr ? nsPtr
-                  : (iPtr->varFramePtr ? iPtr->varFramePtr->nsPtr
-                                       : iPtr->globalNsPtr);
-    if ((codeLen && !code) || (numLits && !lits) ||
-        (numAux && !auxArr) || (numEx && !exArr) || !nsPtr) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: invalid ByteCode constructor input", -1));
+static ByteCode* TbcxByteCode(Tcl_Obj* objPtr,
+                              Tcl_Interp* ip,
+                              Namespace* nsPtr,
+                              const unsigned char* code,
+                              uint32_t codeLen,
+                              Tcl_Obj* const* lits,
+                              uint32_t numLits,
+                              const AuxData* auxArr,
+                              uint32_t numAux,
+                              const ExceptionRange* exArr,
+                              uint32_t numEx,
+                              Tcl_Size maxStackDepth,
+                              int setPrecompiled)
+{
+    Interp* iPtr = (Interp*)ip;
+    nsPtr = nsPtr ? nsPtr : (iPtr->varFramePtr ? iPtr->varFramePtr->nsPtr : iPtr->globalNsPtr);
+    if ((codeLen && !code) || (numLits && !lits) || (numAux && !auxArr) || (numEx && !exArr) || !nsPtr)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid ByteCode constructor input", -1));
         return NULL;
     }
 
     /* Sizes for packed allocation (match TclInitByteCode) */
-    const size_t codeBytes         = (size_t)codeLen;
-    size_t       objArrayBytes     = 0;
-    size_t       exceptArrayBytes  = 0;
-    size_t       auxDataArrayBytes = 0;
-    const size_t cmdLocBytes       = 0; /* no cmd-location map stored */
+    const size_t codeBytes = (size_t)codeLen;
+    size_t objArrayBytes = 0;
+    size_t exceptArrayBytes = 0;
+    size_t auxDataArrayBytes = 0;
+    const size_t cmdLocBytes = 0; /* no cmd-location map stored */
 
-    if (!tbcx_checked_mul((size_t)numLits, sizeof(Tcl_Obj *),
-                          &objArrayBytes) ||
-        !tbcx_checked_mul((size_t)numEx, sizeof(ExceptionRange),
-                          &exceptArrayBytes) ||
-        !tbcx_checked_mul((size_t)numAux, sizeof(AuxData),
-                          &auxDataArrayBytes)) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: ByteCode section sizes overflow", -1));
+    if (!tbcx_checked_mul((size_t)numLits, sizeof(Tcl_Obj*), &objArrayBytes) ||
+        !tbcx_checked_mul((size_t)numEx, sizeof(ExceptionRange), &exceptArrayBytes) ||
+        !tbcx_checked_mul((size_t)numAux, sizeof(AuxData), &auxDataArrayBytes))
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: ByteCode section sizes overflow", -1));
         return NULL;
     }
 
@@ -3820,34 +4089,57 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
        from malformed .tbcx files. */
     {
         size_t safeCap = SIZE_MAX / 2;
-        if (codeBytes > safeCap || objArrayBytes > safeCap || exceptArrayBytes > safeCap || auxDataArrayBytes > safeCap) {
+        if (codeBytes > safeCap || objArrayBytes > safeCap || exceptArrayBytes > safeCap || auxDataArrayBytes > safeCap)
+        {
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: ByteCode section sizes overflow", -1));
             return NULL;
         }
     }
 
     /* Validate exception-range offsets against the code block bounds. */
-    if (numEx > 0 && exArr) {
-        for (uint32_t vi = 0; vi < numEx; vi++) {
-            const ExceptionRange *er = &exArr[vi];
+    if (numEx > 0 && exArr)
+    {
+        for (uint32_t vi = 0; vi < numEx; vi++)
+        {
+            const ExceptionRange* er = &exArr[vi];
             /* Overflow-safe bounds check: validate offset first, then
                remaining space, to avoid uint32_t wrap-around. */
-            if ((size_t)er->codeOffset > codeBytes || (size_t)er->numCodeBytes > codeBytes - (size_t)er->codeOffset) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u offset+len (%u+%u) exceeds code size (%lu)", (unsigned)vi, (unsigned)er->codeOffset, (unsigned)er->numCodeBytes,
-                                                            (unsigned long)codeBytes));
+            if ((size_t)er->codeOffset > codeBytes || (size_t)er->numCodeBytes > codeBytes - (size_t)er->codeOffset)
+            {
+                Tcl_SetObjResult(ip,
+                                 Tcl_ObjPrintf("tbcx: exception range %u offset+len (%u+%u) exceeds code size (%lu)",
+                                               (unsigned)vi,
+                                               (unsigned)er->codeOffset,
+                                               (unsigned)er->numCodeBytes,
+                                               (unsigned long)codeBytes));
                 return NULL;
             }
-            if (er->catchOffset >= 0 && (uint32_t)er->catchOffset >= codeBytes) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u catchOffset (%u) exceeds code size (%lu)", (unsigned)vi, (unsigned)er->catchOffset, (unsigned long)codeBytes));
+            if (er->catchOffset >= 0 && (uint32_t)er->catchOffset >= codeBytes)
+            {
+                Tcl_SetObjResult(ip,
+                                 Tcl_ObjPrintf("tbcx: exception range %u catchOffset (%u) exceeds code size (%lu)",
+                                               (unsigned)vi,
+                                               (unsigned)er->catchOffset,
+                                               (unsigned long)codeBytes));
                 return NULL;
             }
             /* Validate continue/break handler offsets (same pattern as catchOffset). */
-            if (er->continueOffset >= 0 && (size_t)er->continueOffset >= codeBytes) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u continueOffset (%u) exceeds code size (%lu)", (unsigned)vi, (unsigned)er->continueOffset, (unsigned long)codeBytes));
+            if (er->continueOffset >= 0 && (size_t)er->continueOffset >= codeBytes)
+            {
+                Tcl_SetObjResult(ip,
+                                 Tcl_ObjPrintf("tbcx: exception range %u continueOffset (%u) exceeds code size (%lu)",
+                                               (unsigned)vi,
+                                               (unsigned)er->continueOffset,
+                                               (unsigned long)codeBytes));
                 return NULL;
             }
-            if (er->breakOffset >= 0 && (size_t)er->breakOffset >= codeBytes) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u breakOffset (%u) exceeds code size (%lu)", (unsigned)vi, (unsigned)er->breakOffset, (unsigned long)codeBytes));
+            if (er->breakOffset >= 0 && (size_t)er->breakOffset >= codeBytes)
+            {
+                Tcl_SetObjResult(ip,
+                                 Tcl_ObjPrintf("tbcx: exception range %u breakOffset (%u) exceeds code size (%lu)",
+                                               (unsigned)vi,
+                                               (unsigned)er->breakOffset,
+                                               (unsigned long)codeBytes));
                 return NULL;
             }
         }
@@ -3858,14 +4150,16 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
         /* Checked addition: detect wrap-around from the sum of aligned
            segments, which the per-segment SIZE_MAX/2 guard above does
            not fully prevent on 32-bit targets. */
-#define TBCX_CHECKED_ADD(sz, val)                                                                                                                                                                      \
-    do {                                                                                                                                                                                               \
-        size_t _aligned = TCL_ALIGN(val);                                                                                                                                                              \
-        if ((sz) + _aligned < (sz)) {                                                                                                                                                                  \
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: ByteCode total size overflow"));                                                                                                                 \
-            return NULL;                                                                                                                                                                               \
-        }                                                                                                                                                                                              \
-        (sz) += _aligned;                                                                                                                                                                              \
+#define TBCX_CHECKED_ADD(sz, val)                                                                                                \
+    do                                                                                                                           \
+    {                                                                                                                            \
+        size_t _aligned = TCL_ALIGN(val);                                                                                        \
+        if ((sz) + _aligned < (sz))                                                                                              \
+        {                                                                                                                        \
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: ByteCode total size overflow"));                                           \
+            return NULL;                                                                                                         \
+        }                                                                                                                        \
+        (sz) += _aligned;                                                                                                        \
     } while (0)
 
         TBCX_CHECKED_ADD(structureSize, sizeof(ByteCode));
@@ -3879,43 +4173,45 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
 #undef TBCX_CHECKED_ADD
     }
 
-    unsigned char *base = (unsigned char *)Tcl_AttemptAlloc(structureSize);
-    if (!base) {
+    unsigned char* base = (unsigned char*)Tcl_AttemptAlloc(structureSize);
+    if (!base)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (ByteCode structure)", -1));
         return NULL;
     }
-    ByteCode *codePtr = (ByteCode *)base;
+    ByteCode* codePtr = (ByteCode*)base;
 
     /* ----- Header & environment capture (same fields as core) ----- */
     memset(codePtr, 0, sizeof(ByteCode));
-    codePtr->interpHandle    = TclHandlePreserve(iPtr->handle);
-    codePtr->compileEpoch    = iPtr->compileEpoch;
-    codePtr->nsPtr           = nsPtr;
-    codePtr->nsEpoch         = nsPtr->resolverEpoch;
+    codePtr->interpHandle = TclHandlePreserve(iPtr->handle);
+    codePtr->compileEpoch = iPtr->compileEpoch;
+    codePtr->nsPtr = nsPtr;
+    codePtr->nsEpoch = nsPtr->resolverEpoch;
 
     /* *** Inline TclPreserveByteCode(codePtr) *** */
-    codePtr->refCount        = 1; /* brand-new ByteCode held by this one Tcl_Obj */
-    codePtr->flags           = ((nsPtr->compiledVarResProc || iPtr->resolverPtr) ? TCL_BYTECODE_RESOLVE_VARS : 0);
-    codePtr->source          = NULL;         /* no retained source for precompiled */
-    codePtr->procPtr         = NULL; /* linked after Proc reconstruction */
+    codePtr->refCount = 1; /* brand-new ByteCode held by this one Tcl_Obj */
+    codePtr->flags = ((nsPtr->compiledVarResProc || iPtr->resolverPtr) ? TCL_BYTECODE_RESOLVE_VARS : 0);
+    codePtr->source = NULL;  /* no retained source for precompiled */
+    codePtr->procPtr = NULL; /* linked after Proc reconstruction */
 
-    codePtr->maxExceptDepth  = TCL_INDEX_NONE;
-    codePtr->maxStackDepth   = maxStackDepth;
+    codePtr->maxExceptDepth = TCL_INDEX_NONE;
+    codePtr->maxStackDepth = maxStackDepth;
     codePtr->numAuxDataItems = (Tcl_Size)numAux;
-    codePtr->numCmdLocBytes  = 0;
-    codePtr->numCodeBytes    = (Tcl_Size)codeBytes;
-    codePtr->numCommands     = 0;
+    codePtr->numCmdLocBytes = 0;
+    codePtr->numCodeBytes = (Tcl_Size)codeBytes;
+    codePtr->numCommands = 0;
     codePtr->numExceptRanges = (Tcl_Size)numEx;
-    codePtr->numLitObjects   = (Tcl_Size)numLits;
-    codePtr->numSrcBytes     = 0;
-    codePtr->structureSize   = (Tcl_Size)structureSize;
+    codePtr->numLitObjects = (Tcl_Size)numLits;
+    codePtr->numSrcBytes = 0;
+    codePtr->structureSize = (Tcl_Size)structureSize;
 
     /* ----- Pack variable-length tails with Tcl's exact alignment sequence ---- */
-    unsigned char *p         = base + TCL_ALIGN(sizeof(ByteCode));
+    unsigned char* p = base + TCL_ALIGN(sizeof(ByteCode));
 
     /* 1) Code bytes */
-    codePtr->codeStart       = p;
-    if (codeBytes) {
+    codePtr->codeStart = p;
+    if (codeBytes)
+    {
         memcpy(p, code, codeBytes);
         TBCX_BENCH_INC(codeCopyOps);
         TBCX_BENCH_ADD(codeBytesCopied, codeBytes);
@@ -3923,11 +4219,13 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
     p += TCL_ALIGN(codeBytes);
 
     /* 2) Literal object array */
-    p                    = (unsigned char *)TCL_ALIGN((uintptr_t)p);
-    codePtr->objArrayPtr = (Tcl_Obj **)p;
-    if (numLits) {
-        for (uint32_t i = 0; i < numLits; i++) {
-            Tcl_Obj *lit            = lits[i];
+    p = (unsigned char*)TCL_ALIGN((uintptr_t)p);
+    codePtr->objArrayPtr = (Tcl_Obj**)p;
+    if (numLits)
+    {
+        for (uint32_t i = 0; i < numLits; i++)
+        {
+            Tcl_Obj* lit = lits[i];
             codePtr->objArrayPtr[i] = lit;
             if (lit)
                 Tcl_IncrRefCount(lit);
@@ -3936,65 +4234,95 @@ static ByteCode *TbcxByteCode(Tcl_Obj *objPtr, Tcl_Interp *ip,
     p += TCL_ALIGN(objArrayBytes);
 
     /* 3) Exception ranges */
-    p                       = (unsigned char *)TCL_ALIGN((uintptr_t)p);
-    codePtr->exceptArrayPtr = (ExceptionRange *)p;
-    if (numEx) {
+    p = (unsigned char*)TCL_ALIGN((uintptr_t)p);
+    codePtr->exceptArrayPtr = (ExceptionRange*)p;
+    if (numEx)
+    {
         memcpy(p, exArr, exceptArrayBytes);
     }
     p += TCL_ALIGN(exceptArrayBytes);
 
     /* 4) AuxData array */
 
-    if (numEx > 0 && exArr) {
+    if (numEx > 0 && exArr)
+    {
         Tcl_Size maxDepth = 0;
-        for (uint32_t i = 0; i < numEx; i++) {
-            const ExceptionRange *er = &exArr[i];
-            Tcl_Size        d  = (Tcl_Size)er->nestingLevel + 1; /* levels start at 0 */
-            if (d > maxDepth) {
+        for (uint32_t i = 0; i < numEx; i++)
+        {
+            const ExceptionRange* er = &exArr[i];
+            Tcl_Size d = (Tcl_Size)er->nestingLevel + 1; /* levels start at 0 */
+            if (d > maxDepth)
+            {
                 maxDepth = d;
             }
         }
         codePtr->maxExceptDepth = maxDepth;
-    } else {
+    }
+    else
+    {
         codePtr->maxExceptDepth = 0;
     }
-    p                        = (unsigned char *)TCL_ALIGN((uintptr_t)p);
-    codePtr->auxDataArrayPtr = (AuxData *)p;
-    if (numAux) {
+    p = (unsigned char*)TCL_ALIGN((uintptr_t)p);
+    codePtr->auxDataArrayPtr = (AuxData*)p;
+    if (numAux)
+    {
         memcpy(p, auxArr, auxDataArrayBytes);
     }
     p += TCL_ALIGN(auxDataArrayBytes);
 
     /* 5) (Empty) command-location map segment + required alignment step */
-    p                        = (unsigned char *)TCL_ALIGN((uintptr_t)(p + cmdLocBytes));
+    p = (unsigned char*)TCL_ALIGN((uintptr_t)(p + cmdLocBytes));
 
     /* 6) Cursors: in a precompiled image we just coalesce them to the tail */
-    codePtr->codeDeltaStart  = p;
+    codePtr->codeDeltaStart = p;
     codePtr->codeLengthStart = p;
-    codePtr->srcDeltaStart   = p;
-    codePtr->srcLengthStart  = p;
+    codePtr->srcDeltaStart = p;
+    codePtr->srcLengthStart = p;
 
     /* Locals cache is created lazily by the engine if needed */
-    codePtr->localCachePtr   = NULL;
+    codePtr->localCachePtr = NULL;
 
     /* ----- Attach as the internal rep of objPtr ----- */
     Tcl_ObjInternalRep ir;
     ir.twoPtrValue.ptr1 = codePtr;
     ir.twoPtrValue.ptr2 = NULL;
     Tcl_StoreInternalRep(objPtr, tbcxTyBytecode, &ir);
-    if (setPrecompiled) {
+    if (setPrecompiled)
+    {
         codePtr->flags |= TCL_BYTECODE_PRECOMPILED;
     }
     TBCX_BENCH_INC(bytecodeBlocks);
     return codePtr;
 }
 
-static Tcl_Obj *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned char *code, uint32_t codeLen, Tcl_Obj **lits, uint32_t numLits, AuxData *auxArr, uint32_t numAux, ExceptionRange *exArr,
-                            uint32_t numEx, int maxStackDepth, int setPrecompiled) {
-    Tcl_Obj *bcObj = Tcl_NewObj();
-    if (!TbcxByteCode(bcObj, ip, nsPtr, code, codeLen, lits, numLits,
-                      auxArr, numAux, exArr, numEx,
-                      (Tcl_Size)maxStackDepth, setPrecompiled)) {
+static Tcl_Obj* ByteCodeObj(Tcl_Interp* ip,
+                            Namespace* nsPtr,
+                            const unsigned char* code,
+                            uint32_t codeLen,
+                            Tcl_Obj** lits,
+                            uint32_t numLits,
+                            AuxData* auxArr,
+                            uint32_t numAux,
+                            ExceptionRange* exArr,
+                            uint32_t numEx,
+                            int maxStackDepth,
+                            int setPrecompiled)
+{
+    Tcl_Obj* bcObj = Tcl_NewObj();
+    if (!TbcxByteCode(bcObj,
+                      ip,
+                      nsPtr,
+                      code,
+                      codeLen,
+                      lits,
+                      numLits,
+                      auxArr,
+                      numAux,
+                      exArr,
+                      numEx,
+                      (Tcl_Size)maxStackDepth,
+                      setPrecompiled))
+    {
         Tcl_IncrRefCount(bcObj);
         Tcl_DecrRefCount(bcObj);
         return NULL;
@@ -4002,34 +4330,37 @@ static Tcl_Obj *ByteCodeObj(Tcl_Interp *ip, Namespace *nsPtr, const unsigned cha
     return bcObj;
 }
 
-static void CompiledLocals(Proc *procPtr, Tcl_Size neededCount) {
+static void CompiledLocals(Proc* procPtr, Tcl_Size neededCount)
+{
     if (!procPtr)
         return;
     if (neededCount <= procPtr->numCompiledLocals)
         return;
 
-    CompiledLocal *first = procPtr->firstLocalPtr;
-    CompiledLocal *last  = procPtr->lastLocalPtr;
+    CompiledLocal* first = procPtr->firstLocalPtr;
+    CompiledLocal* last = procPtr->lastLocalPtr;
 
-    for (Tcl_Size i = procPtr->numCompiledLocals; i < neededCount; i++) {
+    for (Tcl_Size i = procPtr->numCompiledLocals; i < neededCount; i++)
+    {
         /* Minimal allocation: struct header + 1 byte for the NUL terminator.
            Unnamed padding locals don't need the full sizeof(CompiledLocal)
            which includes the trailing name[1] flexible array. */
-        const size_t   allocSize = offsetof(CompiledLocal, name) + 1u;
-        CompiledLocal *cl        = (CompiledLocal *)Tcl_Alloc(allocSize);
+        const size_t allocSize = offsetof(CompiledLocal, name) + 1u;
+        CompiledLocal* cl = (CompiledLocal*)Tcl_Alloc(allocSize);
         memset(cl, 0, allocSize);
         cl->nameLength = 0;
-        cl->name[0]    = '\0';
+        cl->name[0] = '\0';
         cl->frameIndex = i;
         if (!first)
             first = last = cl;
-        else {
+        else
+        {
             last->nextPtr = cl;
-            last          = cl;
+            last = cl;
         }
     }
-    procPtr->firstLocalPtr     = first;
-    procPtr->lastLocalPtr      = last;
+    procPtr->firstLocalPtr = first;
+    procPtr->lastLocalPtr = last;
     procPtr->numCompiledLocals = neededCount;
 }
 
@@ -4046,46 +4377,51 @@ static void CompiledLocals(Proc *procPtr, Tcl_Size neededCount) {
  * LocalCache (which has all names) into the unnamed CompiledLocal entries,
  * so that Tcl's LocalCache rebuild produces correct name mappings.
  */
-static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
+static void FixCompiledLocalNames(Proc* procPtr, LocalCache* lc)
+{
     if (!procPtr || !lc)
         return;
-    Tcl_Obj      **names   = (Tcl_Obj **)&lc->varName0;
-    Tcl_Size       numVars = lc->numVars;
+    Tcl_Obj** names = (Tcl_Obj**)&lc->varName0;
+    Tcl_Size numVars = lc->numVars;
 
-    CompiledLocal *prev    = NULL;
-    CompiledLocal *cl      = procPtr->firstLocalPtr;
-    while (cl) {
-        if (cl->nameLength > 0) {
+    CompiledLocal* prev = NULL;
+    CompiledLocal* cl = procPtr->firstLocalPtr;
+    while (cl)
+    {
+        if (cl->nameLength > 0)
+        {
             /* already named (argument) — skip */
             prev = cl;
-            cl   = cl->nextPtr;
+            cl = cl->nextPtr;
             continue;
         }
         Tcl_Size idx = cl->frameIndex;
-        if (idx < 0 || idx >= numVars || !names[idx]) {
+        if (idx < 0 || idx >= numVars || !names[idx])
+        {
             prev = cl;
-            cl   = cl->nextPtr;
+            cl = cl->nextPtr;
             continue;
         }
-        Tcl_Size    nameLen = 0;
-        const char *nm      = Tbcx_GetStringFromObjSafe(names[idx], &nameLen);
-        if (nameLen == 0) {
+        Tcl_Size nameLen = 0;
+        const char* nm = Tbcx_GetStringFromObjSafe(names[idx], &nameLen);
+        if (nameLen == 0)
+        {
             prev = cl;
-            cl   = cl->nextPtr;
+            cl = cl->nextPtr;
             continue;
         }
 
         /* Reallocate the CompiledLocal to hold the name.
            The flexible array member name[1] needs nameLen+1 bytes. */
-        size_t         newSize = offsetof(CompiledLocal, name) + (size_t)nameLen + 1u;
-        CompiledLocal *repl    = (CompiledLocal *)Tcl_Alloc(newSize);
+        size_t newSize = offsetof(CompiledLocal, name) + (size_t)nameLen + 1u;
+        CompiledLocal* repl = (CompiledLocal*)Tcl_Alloc(newSize);
         memcpy(repl, cl, offsetof(CompiledLocal, name));
         memcpy(repl->name, nm, (size_t)nameLen);
         repl->name[nameLen] = '\0';
-        repl->nameLength    = nameLen;
+        repl->nameLength = nameLen;
         /* Splice replacement into the linked list using the tracked
            predecessor (O(1) splice). */
-        repl->nextPtr       = cl->nextPtr;
+        repl->nextPtr = cl->nextPtr;
         if (prev)
             prev->nextPtr = repl;
         else
@@ -4094,7 +4430,7 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
             procPtr->lastLocalPtr = repl;
         Tcl_Free(cl);
         prev = repl;
-        cl   = repl->nextPtr; /* continue iteration from next node */
+        cl = repl->nextPtr; /* continue iteration from next node */
     }
 }
 
@@ -4105,7 +4441,8 @@ static void FixCompiledLocalNames(Proc *procPtr, LocalCache *lc) {
  * sequence: set procPtr, refresh epochs, propagate to literal pool,
  * optionally fix the LocalCache.  A single function ensures consistency.
  * ========================================================================== */
-void TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode) {
+void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip, Namespace* ns, int cacheMode)
+{
     if (!bc)
         return;
     assert(ip != NULL && "TbcxFixupByteCode requires non-NULL interp");
@@ -4114,36 +4451,40 @@ void TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, 
     RefreshBC(bc, ip, ns);
     FixLiteralPoolProcPtr(bc);
 
-    switch (cacheMode) {
-    case TBCX_FIXUP_CACHE_KEEP:
-        /* Methods/lambdas: preserve cache with extras area + names fix */
-        if (proc) {
-            TbcxFixLocalCacheExtras(bc, proc);
-            if (bc->localCachePtr)
-                FixCompiledLocalNames(proc, bc->localCachePtr);
-        }
-        break;
-    case TBCX_FIXUP_CACHE_DROP:
-        /* Optional fallback for a freshly rebuilt Proc: NULL out the cache so
-           Tcl can reconstruct it from the complete CompiledLocal chain. */
-        if (bc->localCachePtr) {
+    switch (cacheMode)
+    {
+        case TBCX_FIXUP_CACHE_KEEP:
+            /* Methods/lambdas: preserve cache with extras area + names fix */
             if (proc)
-                FixCompiledLocalNames(proc, bc->localCachePtr);
-            LocalCache *old   = bc->localCachePtr;
-            bc->localCachePtr = NULL;
-            if (--old->refCount <= 0) {
-                Tcl_Obj **names = (Tcl_Obj **)&old->varName0;
-                for (Tcl_Size j = 0; j < old->numVars; j++)
-                    if (names[j])
-                        Tcl_DecrRefCount(names[j]);
-                Tcl_Free(old);
+            {
+                TbcxFixLocalCacheExtras(bc, proc);
+                if (bc->localCachePtr)
+                    FixCompiledLocalNames(proc, bc->localCachePtr);
             }
-        }
-        break;
-    case TBCX_FIXUP_CACHE_NONE:
-    default:
-        /* No cache handling (ReadProc: cache handled later by shim) */
-        break;
+            break;
+        case TBCX_FIXUP_CACHE_DROP:
+            /* Optional fallback for a freshly rebuilt Proc: NULL out the cache so
+               Tcl can reconstruct it from the complete CompiledLocal chain. */
+            if (bc->localCachePtr)
+            {
+                if (proc)
+                    FixCompiledLocalNames(proc, bc->localCachePtr);
+                LocalCache* old = bc->localCachePtr;
+                bc->localCachePtr = NULL;
+                if (--old->refCount <= 0)
+                {
+                    Tcl_Obj** names = (Tcl_Obj**)&old->varName0;
+                    for (Tcl_Size j = 0; j < old->numVars; j++)
+                        if (names[j])
+                            Tcl_DecrRefCount(names[j]);
+                    Tcl_Free(old);
+                }
+            }
+            break;
+        case TBCX_FIXUP_CACHE_NONE:
+        default:
+            /* No cache handling (ReadProc: cache handled later by shim) */
+            break;
     }
 }
 
@@ -4152,38 +4493,50 @@ void TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, 
  * TCL_OK if all checks pass.  On failure, sets the interp result with
  * a diagnostic and returns TCL_ERROR.
  * ========================================================================== */
-int TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label) {
-    if (!bc) {
+int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label)
+{
+    if (!bc)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx verify: %s — NULL ByteCode", label ? label : "?"));
         return TCL_ERROR;
     }
-    if (!(bc->flags & TCL_BYTECODE_PRECOMPILED)) {
+    if (!(bc->flags & TCL_BYTECODE_PRECOMPILED))
+    {
         if (ip)
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx verify: %s — PRECOMPILED flag not set (flags=0x%x)", label ? label : "?", (unsigned)bc->flags));
+            Tcl_SetObjResult(ip,
+                             Tcl_ObjPrintf("tbcx verify: %s — PRECOMPILED flag not set (flags=0x%x)",
+                                           label ? label : "?",
+                                           (unsigned)bc->flags));
         return TCL_ERROR;
     }
     /* Check interpHandle validity.  Preserve a temporary handle for the
      * comparison and release *the temporary*; bc->interpHandle itself is
      * owned by the ByteCode and must not be touched here. */
-    Interp   *iPtr = (Interp *)ip;
-    TclHandle tmp  = TclHandlePreserve(iPtr->handle);
-    if (bc->interpHandle != tmp) {
+    Interp* iPtr = (Interp*)ip;
+    TclHandle tmp = TclHandlePreserve(iPtr->handle);
+    if (bc->interpHandle != tmp)
+    {
         /* Different interp binding — diagnostic-only path.  No error. */
     }
     TclHandleRelease(tmp);
 
     /* Recursively check literal pool */
-    if (bc->numLitObjects > 0 && bc->objArrayPtr) {
-        for (Tcl_Size i = 0; i < bc->numLitObjects; i++) {
+    if (bc->numLitObjects > 0 && bc->objArrayPtr)
+    {
+        for (Tcl_Size i = 0; i < bc->numLitObjects; i++)
+        {
             if (!bc->objArrayPtr[i])
                 continue;
-            ByteCode *litBC = TbcxGetByteCode(bc->objArrayPtr[i]);
-            if (litBC && !litBC->procPtr && bc->procPtr) {
+            ByteCode* litBC = TbcxGetByteCode(bc->objArrayPtr[i]);
+            if (litBC && !litBC->procPtr && bc->procPtr)
+            {
                 if (ip)
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx verify: %s — literal %d has NULL procPtr"
-                                                       " but parent has non-NULL",
-                                                       label ? label : "?", (int)i));
+                    Tcl_SetObjResult(ip,
+                                     Tcl_ObjPrintf("tbcx verify: %s — literal %d has NULL procPtr"
+                                                   " but parent has non-NULL",
+                                                   label ? label : "?",
+                                                   (int)i));
                 return TCL_ERROR;
             }
         }
@@ -4191,100 +4544,110 @@ int TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label) {
     return TCL_OK;
 }
 
-int Tbcx_ValidateMethodMetadata(Tcl_Interp *ip, uint8_t kind, uint8_t scope, uint8_t origin) {
-    if (kind > TBCX_METH_SELF) {
+int Tbcx_ValidateMethodMetadata(Tcl_Interp* ip, uint8_t kind, uint8_t scope, uint8_t origin)
+{
+    if (kind > TBCX_METH_SELF)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method kind byte", -1));
         return TCL_ERROR;
     }
-    if (scope > TBCX_MSCOPE_TRUE_PRIVATE) {
+    if (scope > TBCX_MSCOPE_TRUE_PRIVATE)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method scope byte", -1));
         return TCL_ERROR;
     }
-    if (origin > TBCX_MORIGIN_OBJECT) {
+    if (origin > TBCX_MORIGIN_OBJECT)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid method origin byte", -1));
         return TCL_ERROR;
     }
-    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) &&
-        scope != TBCX_MSCOPE_DEFAULT) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: constructor/destructor record has invalid method scope", -1));
+    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && scope != TBCX_MSCOPE_DEFAULT)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: constructor/destructor record has invalid method scope", -1));
         return TCL_ERROR;
     }
-    if (origin == TBCX_MORIGIN_OBJECT && kind != TBCX_METH_INST) {
-        const char *kindName =
-            (kind == TBCX_METH_CLASS) ? "class method" :
-            (kind == TBCX_METH_CTOR)  ? "constructor" :
-            (kind == TBCX_METH_DTOR)  ? "destructor" :
-            (kind == TBCX_METH_SELF)  ? "self method" : "method";
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-            "tbcx: invalid object-origin %s record", kindName));
+    if (origin == TBCX_MORIGIN_OBJECT && kind != TBCX_METH_INST)
+    {
+        const char* kindName = (kind == TBCX_METH_CLASS)  ? "class method"
+                               : (kind == TBCX_METH_CTOR) ? "constructor"
+                               : (kind == TBCX_METH_DTOR) ? "destructor"
+                               : (kind == TBCX_METH_SELF) ? "self method"
+                                                          : "method";
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid object-origin %s record", kindName));
         return TCL_ERROR;
     }
     return TCL_OK;
 }
 
-static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
+static int ReadMethod(TbcxIn* r, Tcl_Interp* ip, OOShim* os)
+{
     /* classFqn */
-    char    *clsf = NULL;
+    char* clsf = NULL;
     uint32_t clsL = 0;
     if (!Tbcx_R_LPString(r, &clsf, &clsL))
         return TCL_ERROR;
-    Tcl_Obj *clsFqn = Tcl_NewStringObj(clsf, (Tcl_Size)clsL);
+    Tcl_Obj* clsFqn = Tcl_NewStringObj(clsf, (Tcl_Size)clsL);
     Tcl_IncrRefCount(clsFqn);
     Tcl_Free(clsf);
     /* kind */
     uint8_t kind = 0;
-    if (!Tbcx_R_U8(r, &kind)) {
+    if (!Tbcx_R_U8(r, &kind))
+    {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     /* scope byte — read immediately after kind. */
     uint8_t scope = 0;
-    if (!Tbcx_R_U8(r, &scope)) {
+    if (!Tbcx_R_U8(r, &scope))
+    {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     /* origin byte (class-definition vs object-definition) — keys the record. */
     uint8_t origin = 0;
-    if (!Tbcx_R_U8(r, &origin)) {
+    if (!Tbcx_R_U8(r, &origin))
+    {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    if (Tbcx_ValidateMethodMetadata(ip, kind, scope, origin) != TCL_OK) {
+    if (Tbcx_ValidateMethodMetadata(ip, kind, scope, origin) != TCL_OK)
+    {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     /* name (empty for ctor/dtor) */
-    char    *mname = NULL;
-    uint32_t mnL   = 0;
-    if (!Tbcx_R_LPString(r, &mname, &mnL)) {
+    char* mname = NULL;
+    uint32_t mnL = 0;
+    if (!Tbcx_R_LPString(r, &mname, &mnL))
+    {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    Tcl_Obj *nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
+    Tcl_Obj* nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
     Tcl_IncrRefCount(nameObj);
     Tcl_Free(mname);
-    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && mnL != 0) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: constructor/destructor record has a method name", -1));
+    if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && mnL != 0)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: constructor/destructor record has a method name", -1));
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
     /* args text */
-    char    *args = NULL;
-    uint32_t aL   = 0;
-    if (!Tbcx_R_LPString(r, &args, &aL)) {
+    char* args = NULL;
+    uint32_t aL = 0;
+    if (!Tbcx_R_LPString(r, &args, &aL))
+    {
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    Tcl_Obj *argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
+    Tcl_Obj* argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
     Tcl_IncrRefCount(argsObj);
     Tcl_Free(args);
-    if (kind == TBCX_METH_DTOR && aL != 0) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: destructor record has arguments", -1));
+    if (kind == TBCX_METH_DTOR && aL != 0)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: destructor record has arguments", -1));
         Tcl_DecrRefCount(argsObj);
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
@@ -4293,9 +4656,10 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
 
     /* Validate class FQN: reject embedded NUL and require absolute form */
     {
-        Tcl_Size    clsFqnLen = 0;
-        const char *clsFqnStr = Tbcx_GetStringFromObjStrict(ip, clsFqn, &clsFqnLen);
-        if (!clsFqnStr || Tbcx_ValidateKeyString(ip, clsFqnStr, clsFqnLen, "method class FQN", 1) != TCL_OK) {
+        Tcl_Size clsFqnLen = 0;
+        const char* clsFqnStr = Tbcx_GetStringFromObjStrict(ip, clsFqn, &clsFqnLen);
+        if (!clsFqnStr || Tbcx_ValidateKeyString(ip, clsFqnStr, clsFqnLen, "method class FQN", 1) != TCL_OK)
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -4303,10 +4667,12 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         }
     }
     /* Validate method name: reject embedded NUL (may be empty for ctor/dtor) */
-    if (mnL > 0) {
-        Tcl_Size    nameLen = 0;
-        const char *nameStr = Tbcx_GetStringFromObjStrict(ip, nameObj, &nameLen);
-        if (!nameStr || Tbcx_ValidateKeyString(ip, nameStr, nameLen, "method name", 0) != TCL_OK) {
+    if (mnL > 0)
+    {
+        Tcl_Size nameLen = 0;
+        const char* nameStr = Tbcx_GetStringFromObjStrict(ip, nameObj, &nameLen);
+        if (!nameStr || Tbcx_ValidateKeyString(ip, nameStr, nameLen, "method name", 0) != TCL_OK)
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -4322,10 +4688,10 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
      * tclcompiler/tbcload tradition for Tcl AOT output); substitute
      * the diagnostic sentinel so introspection is loud rather than
      * silently empty. */
-    char    *bodySrc = NULL;
+    char* bodySrc = NULL;
     uint32_t bodySrcLen = 0;
-    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_METHOD,
-            &bodySrc, &bodySrcLen)) {
+    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_METHOD, &bodySrc, &bodySrcLen))
+    {
         Tcl_DecrRefCount(argsObj);
         Tcl_DecrRefCount(nameObj);
         Tcl_DecrRefCount(clsFqn);
@@ -4333,8 +4699,9 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     }
 
     /* compiled block (namespace default: class namespace) + receive numLocals */
-    Namespace *clsNs  = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(clsFqn));
-    if (!clsNs) {
+    Namespace* clsNs = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(clsFqn));
+    if (!clsNs)
+    {
         if (bodySrc)
             Tcl_Free(bodySrc);
         Tcl_DecrRefCount(argsObj);
@@ -4342,9 +4709,10 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(clsFqn);
         return TCL_ERROR;
     }
-    uint32_t   nLoc   = 0;
-    Tcl_Obj   *bodyBC = Tbcx_ReadBlock(r, ip, clsNs, &nLoc, 1, 0, NULL);
-    if (!bodyBC) {
+    uint32_t nLoc = 0;
+    Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, ip, clsNs, &nLoc, 1, 0, NULL);
+    if (!bodyBC)
+    {
         if (bodySrc)
             Tcl_Free(bodySrc);
         Tcl_DecrRefCount(argsObj);
@@ -4363,50 +4731,52 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
      * touches the internal rep.  See ReadProc Stage 4.5 for the
      * detailed branch analysis. */
     Tcl_InvalidateStringRep(bodyBC);
-    if (bodySrcLen > 0) {
+    if (bodySrcLen > 0)
+    {
         Tcl_InitStringRep(bodyBC, bodySrc, (size_t)bodySrcLen);
-    } else {
-        Tcl_InitStringRep(bodyBC,
-            TBCX_STRIPPED_SOURCE_SENTINEL,
-            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
-        TBCX_BENCH_ADD(sentinelBytes,
-            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+    }
+    else
+    {
+        Tcl_InitStringRep(bodyBC, TBCX_STRIPPED_SOURCE_SENTINEL, sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+        TBCX_BENCH_ADD(sentinelBytes, sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
     }
     if (bodySrc)
         Tcl_Free(bodySrc);
     bodySrc = NULL;
     /* Build Proc + compiled locals from argsObj */
-    Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
+    Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     TBCX_BENCH_INC(procAllocations);
     memset(procPtr, 0, sizeof(Proc));
-    procPtr->iPtr     = (Interp *)ip;
+    procPtr->iPtr = (Interp*)ip;
     procPtr->refCount = 1;
-    procPtr->bodyPtr  = bodyBC;
+    procPtr->bodyPtr = bodyBC;
     Tcl_IncrRefCount(bodyBC); /* Proc's own reference */
     {
         CompiledLocal *first = NULL, *last = NULL;
-        Tcl_Size       numA = 0;
+        Tcl_Size numA = 0;
         TBCX_BENCH_INC(compiledLocalBuilds);
-        if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK) {
+        if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK)
+        {
             Tcl_DecrRefCount(bodyBC); /* Proc's reference */
             Tcl_DecrRefCount(bodyBC); /* local reference  */
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
-            Tcl_Free((char *)procPtr);
+            Tcl_Free((char*)procPtr);
             return TCL_ERROR;
         }
-        procPtr->numArgs           = numA;
+        procPtr->numArgs = numA;
         procPtr->numCompiledLocals = numA;
-        procPtr->firstLocalPtr     = first;
-        procPtr->lastLocalPtr      = last;
+        procPtr->firstLocalPtr = first;
+        procPtr->lastLocalPtr = last;
     }
     CompiledLocals(procPtr, (Tcl_Size)nLoc);
 
     /* Link ByteCode back to this Proc and refresh epochs */
     {
-        ByteCode *bcPtr = TbcxGetByteCode(bodyBC);
-        if (bcPtr) {
+        ByteCode* bcPtr = TbcxGetByteCode(bodyBC);
+        if (bcPtr)
+        {
             TbcxFixupByteCode(bcPtr, procPtr, ip, clsNs, TBCX_FIXUP_CACHE_KEEP);
         }
     }
@@ -4416,7 +4786,7 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
      * checks Tcl_GetCharLength(bodyObj) and DELETES the method if it's 0.
      * Using ";" (minimal no-op) ensures TclOO creates a real Method, then
      * recognises the procbody internal rep and uses the precompiled bytecode. */
-    Tcl_Obj *procBodyObj = Tcl_NewStringObj(";", 1);
+    Tcl_Obj* procBodyObj = Tcl_NewStringObj(";", 1);
     Tcl_IncrRefCount(procBodyObj);
     Tcl_ObjInternalRep ir;
     ir.twoPtrValue.ptr1 = procPtr;
@@ -4425,7 +4795,8 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
     procPtr->refCount++;
 
     Tcl_DString keyDs;
-    if (!MethodKeyBuf(&keyDs, clsFqn, kind, origin, (mnL ? nameObj : NULL))) {
+    if (!MethodKeyBuf(&keyDs, clsFqn, kind, origin, (mnL ? nameObj : NULL)))
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: invalid string in method key construction", -1));
         /* Release procBodyObj first — its freeIntRep drops
          * procPtr->refCount from 2 to 1.  Then call TclProcCleanupProc
@@ -4441,18 +4812,20 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
         Tcl_DecrRefCount(argsObj);
         return TCL_ERROR;
     }
-    int            isNew = 0;
-    Tcl_HashEntry *he    = Tcl_CreateHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs), &isNew);
+    int isNew = 0;
+    Tcl_HashEntry* he = Tcl_CreateHashEntry(&os->methodsByKey, Tcl_DStringValue(&keyDs), &isNew);
     Tcl_DStringFree(&keyDs);
     /* Build and validate pair BEFORE touching the old value so the hash
        entry remains valid if list construction fails.  The triple is
        {args, procbody, scope}; scope is a TBCX_MSCOPE_* integer applied to
        the installed method's visibility (see DefOO). */
-    Tcl_Obj *scopeObj = Tcl_NewWideIntObj((Tcl_WideInt)scope);
+    Tcl_Obj* scopeObj = Tcl_NewWideIntObj((Tcl_WideInt)scope);
     Tcl_IncrRefCount(scopeObj);
-    Tcl_Obj *pair = Tcl_NewListObj(0, NULL);
+    Tcl_Obj* pair = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(pair);
-    if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, scopeObj) != TCL_OK) {
+    if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK ||
+        Tcl_ListObjAppendElement(ip, pair, scopeObj) != TCL_OK)
+    {
         Tcl_DecrRefCount(scopeObj);
         Tcl_DecrRefCount(pair);
         /* Same procPtr ownership discipline as the MethodKeyBuf failure
@@ -4470,8 +4843,9 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
        serialization == definition order).  Create the list on first insert;
        the list owns each triple.  A same-key redefinition does NOT overwrite —
        both triples coexist so each definition site can consume its own. */
-    Tcl_Obj *fifo = isNew ? NULL : (Tcl_Obj *)Tcl_GetHashValue(he);
-    if (!fifo) {
+    Tcl_Obj* fifo = isNew ? NULL : (Tcl_Obj*)Tcl_GetHashValue(he);
+    if (!fifo)
+    {
         fifo = Tcl_NewListObj(0, NULL);
         Tcl_IncrRefCount(fifo);
         Tcl_SetHashValue(he, fifo);
@@ -4495,100 +4869,117 @@ static int ReadMethod(TbcxIn *r, Tcl_Interp *ip, OOShim *os) {
  * Each handles one tag from the .tbcx literal stream.  Returns a refcount-0
  * Tcl_Obj* on success or NULL on error. */
 
-static Tcl_Obj *ReadLit_Bignum(TbcxIn *r) {
-    uint8_t  sign   = 0;
+static Tcl_Obj* ReadLit_Bignum(TbcxIn* r)
+{
+    uint8_t sign = 0;
     uint32_t magLen = 0;
     if (!Tbcx_R_U8(r, &sign))
         return NULL;
     if (!Tbcx_R_U32(r, &magLen))
         return NULL;
-    if (magLen > (64u * 1024u * 1024u)) {
+    if (magLen > (64u * 1024u * 1024u))
+    {
         R_Error(r, "tbcx: bignum too large");
         return NULL;
     }
-    if ((sign == 0 && magLen != 0) ||
-        ((sign == 1 || sign == 2) && magLen == 0) ||
-        sign > 2) {
+    if ((sign == 0 && magLen != 0) || ((sign == 1 || sign == 2) && magLen == 0) || sign > 2)
+    {
         R_Error(r, "tbcx: invalid bignum sign/magnitude encoding");
         return NULL;
     }
-    Tcl_Obj *o = NULL;
-    if (sign == 0) {
+    Tcl_Obj* o = NULL;
+    if (sign == 0)
+    {
         o = Tcl_NewWideIntObj(0);
-    } else {
-        unsigned char *le = (unsigned char *)Tcl_AttemptAlloc(magLen);
-        if (!le) {
+    }
+    else
+    {
+        unsigned char* le = (unsigned char*)Tcl_AttemptAlloc(magLen);
+        if (!le)
+        {
             R_Error(r, "tbcx: allocation failed (bignum)");
             return NULL;
         }
-        if (!Tbcx_R_Bytes(r, le, magLen)) {
-            Tcl_Free((char *)le);
+        if (!Tbcx_R_Bytes(r, le, magLen))
+        {
+            Tcl_Free((char*)le);
             return NULL;
         }
         mp_int z;
         mp_err mrc = TclBN_mp_init(&z);
-        if (mrc != MP_OKAY) {
-            Tcl_Free((char *)le);
+        if (mrc != MP_OKAY)
+        {
+            Tcl_Free((char*)le);
             R_Error(r, "tbcx: bignum init");
             return NULL;
         }
         /* Import LE magnitude bytes into mp_int via repeated shift+add.
          * Tcl 9.1's stubs table does not expose mp_from_ubin, so we use
          * the portable TclBN_mp_mul_2d + TclBN_mp_add_d path. */
-        for (int i = (int)magLen - 1; i >= 0; i--) {
+        for (int i = (int)magLen - 1; i >= 0; i--)
+        {
             if ((mrc = TclBN_mp_mul_2d(&z, 8, &z)) != MP_OKAY)
                 break;
             if ((mrc = TclBN_mp_add_d(&z, le[i], &z)) != MP_OKAY)
                 break;
         }
-        if (mrc != MP_OKAY) {
-            Tcl_Free((char *)le);
+        if (mrc != MP_OKAY)
+        {
+            Tcl_Free((char*)le);
             TclBN_mp_clear(&z);
             R_Error(r, "tbcx: bignum import");
             return NULL;
         }
-        if (sign == 2) {
+        if (sign == 2)
+        {
             mrc = TclBN_mp_neg(&z, &z);
-            if (mrc != MP_OKAY) {
-                Tcl_Free((char *)le);
+            if (mrc != MP_OKAY)
+            {
+                Tcl_Free((char*)le);
                 TclBN_mp_clear(&z);
                 R_Error(r, "tbcx: bignum neg");
                 return NULL;
             }
         }
         o = Tcl_NewBignumObj(&z);
-        Tcl_Free((char *)le);
+        Tcl_Free((char*)le);
     }
     return o;
 }
 
-static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly) {
-    char    *nsStr = NULL;
+static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
+{
+    char* nsStr = NULL;
     uint32_t nsLen = 0;
     if (!Tbcx_R_LPString(r, &nsStr, &nsLen))
         return NULL;
-    Tcl_Obj *nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
+    Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
     Tcl_Free(nsStr);
     Tcl_IncrRefCount(nsObj);
 
     /* Validate namespace string: reject embedded NUL and require absolute form */
     {
-        Tcl_Size    nsObjLen = 0;
-        const char *nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
-        if (!nsObjStr || Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "lambda namespace", 1) != TCL_OK) {
+        Tcl_Size nsObjLen = 0;
+        const char* nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
+        if (!nsObjStr || Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "lambda namespace", 1) != TCL_OK)
+        {
             Tcl_DecrRefCount(nsObj);
             return NULL;
         }
     }
 
-    Namespace *nsPtr;
-    if (dumpOnly) {
-        nsPtr = (Namespace *)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
+    Namespace* nsPtr;
+    if (dumpOnly)
+    {
+        nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
         if (!nsPtr)
-            nsPtr = (Namespace *)Tcl_GetGlobalNamespace(ip);
-    } else {
-        nsPtr = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
-        if (!nsPtr) {
+            nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
+    }
+    else
+    {
+        nsPtr = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
+        if (!nsPtr)
+        {
             Tcl_DecrRefCount(nsObj);
             return NULL;
         }
@@ -4596,45 +4987,53 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
 
     /* Read argument specifications */
     uint32_t numArgs = 0;
-    if (!Tbcx_R_U32(r, &numArgs)) {
+    if (!Tbcx_R_U32(r, &numArgs))
+    {
         Tcl_DecrRefCount(nsObj);
         return NULL;
     }
-    if (numArgs > TBCX_MAX_LOCALS) {
+    if (numArgs > TBCX_MAX_LOCALS)
+    {
         R_Error(r, "tbcx: too many lambda arguments");
         Tcl_DecrRefCount(nsObj);
         return NULL;
     }
-    Tcl_Obj *argList = Tcl_NewListObj(0, NULL);
+    Tcl_Obj* argList = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(argList);
-    for (uint32_t i = 0; i < numArgs; i++) {
-        char    *argName    = NULL;
+    for (uint32_t i = 0; i < numArgs; i++)
+    {
+        char* argName = NULL;
         uint32_t argNameLen = 0;
-        if (!Tbcx_R_LPString(r, &argName, &argNameLen)) {
+        if (!Tbcx_R_LPString(r, &argName, &argNameLen))
+        {
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(argList);
             return NULL;
         }
-        Tcl_Obj *argNameObj = Tcl_NewStringObj(argName, (Tcl_Size)argNameLen);
+        Tcl_Obj* argNameObj = Tcl_NewStringObj(argName, (Tcl_Size)argNameLen);
         Tcl_IncrRefCount(argNameObj);
         Tcl_Free(argName);
         uint8_t hasDef = 0;
-        if (!Tbcx_R_U8(r, &hasDef)) {
+        if (!Tbcx_R_U8(r, &hasDef))
+        {
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(argNameObj);
             Tcl_DecrRefCount(argList);
             return NULL;
         }
-        if (hasDef > 1) {
+        if (hasDef > 1)
+        {
             R_Error(r, "tbcx: invalid lambda default-value flag");
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(argNameObj);
             Tcl_DecrRefCount(argList);
             return NULL;
         }
-        if (hasDef) {
-            Tcl_Obj *defVal = ReadLiteral(r, ip, depth + 1, dumpOnly);
-            if (!defVal) {
+        if (hasDef)
+        {
+            Tcl_Obj* defVal = ReadLiteral(r, ip, depth + 1, dumpOnly);
+            if (!defVal)
+            {
                 Tcl_DecrRefCount(nsObj);
                 Tcl_DecrRefCount(argNameObj);
                 Tcl_DecrRefCount(argList);
@@ -4643,9 +5042,12 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
             /* Own a reference so all error paths can release safely.
              * ReadLiteral returns refcount-0; incref → 1 (owned by this scope). */
             Tcl_IncrRefCount(defVal);
-            Tcl_Obj *argPair = Tcl_NewListObj(0, NULL);
+            Tcl_Obj* argPair = Tcl_NewListObj(0, NULL);
             Tcl_IncrRefCount(argPair);
-            if (Tcl_ListObjAppendElement(ip, argPair, argNameObj) != TCL_OK || Tcl_ListObjAppendElement(ip, argPair, defVal) != TCL_OK || Tcl_ListObjAppendElement(ip, argList, argPair) != TCL_OK) {
+            if (Tcl_ListObjAppendElement(ip, argPair, argNameObj) != TCL_OK ||
+                Tcl_ListObjAppendElement(ip, argPair, defVal) != TCL_OK ||
+                Tcl_ListObjAppendElement(ip, argList, argPair) != TCL_OK)
+            {
                 Tcl_DecrRefCount(argPair);
                 Tcl_DecrRefCount(defVal);
                 Tcl_DecrRefCount(argNameObj);
@@ -4656,8 +5058,11 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
             Tcl_DecrRefCount(argPair);
             Tcl_DecrRefCount(defVal); /* list now owns its reference */
             Tcl_DecrRefCount(argNameObj);
-        } else {
-            if (Tcl_ListObjAppendElement(ip, argList, argNameObj) != TCL_OK) {
+        }
+        else
+        {
+            if (Tcl_ListObjAppendElement(ip, argList, argNameObj) != TCL_OK)
+            {
                 Tcl_DecrRefCount(argNameObj);
                 Tcl_DecrRefCount(nsObj);
                 Tcl_DecrRefCount(argList);
@@ -4668,103 +5073,108 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
     }
 
     /* Build Proc with precompiled bytecode */
-    Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
+    Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     TBCX_BENCH_INC(procAllocations);
     memset(procPtr, 0, sizeof(Proc));
-    procPtr->iPtr     = (Interp *)ip;
+    procPtr->iPtr = (Interp*)ip;
     procPtr->refCount = 1;
     {
         CompiledLocal *first = NULL, *last = NULL;
-        Tcl_Size       numA = 0;
+        Tcl_Size numA = 0;
         TBCX_BENCH_INC(compiledLocalBuilds);
-        if (Tbcx_BuildLocals(ip, argList, &first, &last, &numA) != TCL_OK) {
+        if (Tbcx_BuildLocals(ip, argList, &first, &last, &numA) != TCL_OK)
+        {
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(argList);
-            Tcl_Free((char *)procPtr);
+            Tcl_Free((char*)procPtr);
             return NULL;
         }
-        procPtr->numArgs           = numA;
+        procPtr->numArgs = numA;
         procPtr->numCompiledLocals = numA;
-        procPtr->firstLocalPtr     = first;
-        procPtr->lastLocalPtr      = last;
+        procPtr->firstLocalPtr = first;
+        procPtr->lastLocalPtr = last;
     }
 
     uint32_t nLocalsBody = 0;
-    Tcl_Obj *bodyBC      = Tbcx_ReadBlock(r, ip, nsPtr, &nLocalsBody, 1,
-        dumpOnly, NULL);
-    if (!bodyBC) {
+    Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, ip, nsPtr, &nLocalsBody, 1, dumpOnly, NULL);
+    if (!bodyBC)
+    {
         Tcl_DecrRefCount(nsObj);
         Tcl_DecrRefCount(argList);
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
-        Tcl_Free((char *)procPtr);
+        Tcl_Free((char*)procPtr);
         return NULL;
     }
     Tcl_IncrRefCount(bodyBC); /* own immediately — don't leave at refcount 0 */
     procPtr->bodyPtr = bodyBC;
     Tcl_IncrRefCount(bodyBC); /* Proc's own reference */
     {
-        ByteCode *bc = TbcxGetByteCode(bodyBC);
+        ByteCode* bc = TbcxGetByteCode(bodyBC);
         if (bc)
             TbcxFixupByteCode(bc, procPtr, ip, nsPtr, TBCX_FIXUP_CACHE_KEEP);
     }
     CompiledLocals(procPtr, (Tcl_Size)nLocalsBody);
 
     /* Read original body source text */
-    char    *bodySrc    = NULL;
+    char* bodySrc = NULL;
     uint32_t bodySrcLen = 0;
-    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_LAMBDA,
-            &bodySrc, &bodySrcLen)) {
-        ByteCode *bc2 = NULL;
-        bc2           = TbcxGetByteCode(bodyBC);
+    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_LAMBDA, &bodySrc, &bodySrcLen))
+    {
+        ByteCode* bc2 = NULL;
+        bc2 = TbcxGetByteCode(bodyBC);
         if (bc2)
             bc2->procPtr = NULL;
         Tcl_DecrRefCount(bodyBC); /* Proc's reference */
         Tcl_DecrRefCount(bodyBC); /* local reference  */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
-        Tcl_Free((char *)procPtr);
+        Tcl_Free((char*)procPtr);
         Tcl_DecrRefCount(nsObj);
         Tcl_DecrRefCount(argList);
         return NULL;
     }
 
     /* Build lambda Tcl_Obj with original body source in string rep */
-    Tcl_Obj *lambda;
+    Tcl_Obj* lambda;
     {
-        const char *nsName   = Tbcx_GetStringSafe(nsObj);
-        int         isGlobal = (nsName[0] == ':' && nsName[1] == ':' && nsName[2] == '\0');
-        const char *bodyBytes = bodySrcLen > 0 ? bodySrc :
-            TBCX_STRIPPED_LAMBDA_SENTINEL;
-        Tcl_Size bodyLength = bodySrcLen > 0 ? (Tcl_Size)bodySrcLen :
-            (Tcl_Size)(sizeof(TBCX_STRIPPED_LAMBDA_SENTINEL) - 1u);
-        Tcl_Obj *bodyText = Tcl_NewStringObj(bodyBytes, bodyLength);
+        const char* nsName = Tbcx_GetStringSafe(nsObj);
+        int isGlobal = (nsName[0] == ':' && nsName[1] == ':' && nsName[2] == '\0');
+        const char* bodyBytes = bodySrcLen > 0 ? bodySrc : TBCX_STRIPPED_LAMBDA_SENTINEL;
+        Tcl_Size bodyLength = bodySrcLen > 0 ? (Tcl_Size)bodySrcLen : (Tcl_Size)(sizeof(TBCX_STRIPPED_LAMBDA_SENTINEL) - 1u);
+        Tcl_Obj* bodyText = Tcl_NewStringObj(bodyBytes, bodyLength);
         if (bodySrc)
             Tcl_Free(bodySrc);
-        if (isGlobal) {
-            Tcl_Obj *elems[2] = {argList, bodyText};
-            lambda            = Tcl_NewListObj(2, elems);
-        } else {
-            Tcl_Obj *elems[3] = {argList, bodyText, nsObj};
-            lambda            = Tcl_NewListObj(3, elems);
+        if (isGlobal)
+        {
+            Tcl_Obj* elems[2] = {argList, bodyText};
+            lambda = Tcl_NewListObj(2, elems);
+        }
+        else
+        {
+            Tcl_Obj* elems[3] = {argList, bodyText, nsObj};
+            lambda = Tcl_NewListObj(3, elems);
         }
         (void)Tbcx_GetStringSafe(lambda);
     }
 
     /* Register in ApplyShim for shimmer recovery (skip in dump mode) */
-    if (!dumpOnly) {
+    if (!dumpOnly)
+    {
         RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
         /* The registry now owns the Proc; release the construction ref. */
         assert(procPtr->refCount > 1);
         procPtr->refCount--;
         Tcl_DecrRefCount(bodyBC); /* local reference */
-    } else {
-        ByteCode *bc2 = NULL;
-        bc2           = TbcxGetByteCode(bodyBC);
+    }
+    else
+    {
+        ByteCode* bc2 = NULL;
+        bc2 = TbcxGetByteCode(bodyBC);
         if (bc2)
             bc2->procPtr = NULL;
         Tcl_DecrRefCount(bodyBC); /* Proc's reference */
         Tcl_DecrRefCount(bodyBC); /* local reference  */
         Tbcx_FreeLocals(procPtr->firstLocalPtr);
-        Tcl_Free((char *)procPtr);
+        Tcl_Free((char*)procPtr);
     }
 
     Tcl_DecrRefCount(argList);
@@ -4772,8 +5182,10 @@ static Tcl_Obj *ReadLit_LambdaBC(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpO
     return lambda;
 }
 
-static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly) {
-    if (depth > TBCX_MAX_LITERAL_DEPTH) {
+static Tcl_Obj* ReadLiteral(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpOnly)
+{
+    if (depth > TBCX_MAX_LITERAL_DEPTH)
+    {
         R_Error(r, "tbcx: literal nesting too deep");
         return NULL;
     }
@@ -4782,236 +5194,267 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly) 
     if (!Tbcx_R_U32(r, &tag))
         return NULL;
 
-    switch (tag) {
-    case TBCX_LIT_BIGNUM:
-        return ReadLit_Bignum(r);
-    case TBCX_LIT_BOOLEAN: {
-        uint8_t b = 0;
-        if (!Tbcx_R_U8(r, &b))
-            return NULL;
-        if (b > 1) {
-            R_Error(r, "tbcx: invalid boolean literal encoding");
-            return NULL;
-        }
-        return Tcl_NewBooleanObj((int)b);
-    }
-    case TBCX_LIT_BYTEARR: {
-        uint32_t n = 0;
-        if (!Tbcx_R_U32(r, &n))
-            return NULL;
-        if (n > TBCX_MAX_STR) {
-            R_Error(r, "tbcx: bytearray too large");
-            return NULL;
-        }
-        unsigned char *buf = (unsigned char *)Tcl_AttemptAlloc(n ? n : 1u);
-        if (!buf) {
-            R_Error(r, "tbcx: allocation failed (bytearray literal)");
-            return NULL;
-        }
-        if (n && !Tbcx_R_Bytes(r, buf, n)) {
-            Tcl_Free((char *)buf);
-            return NULL;
-        }
-        Tcl_Obj *o = Tcl_NewByteArrayObj(buf, n);
-        Tcl_Free((char *)buf);
-        return o;
-    }
-    case TBCX_LIT_DICT: {
-        uint32_t cnt = 0;
-        if (!Tbcx_R_U32(r, &cnt))
-            return NULL;
-        if (cnt > TBCX_MAX_CONTAINER_ELEMS) {
-            R_Error(r, "tbcx: dict too many pairs");
-            return NULL;
-        }
-        Tcl_Obj *d = Tcl_NewDictObj();
-        for (uint32_t i = 0; i < cnt; i++) {
-            Tcl_Obj *k = ReadLiteral(r, ip, depth + 1, dumpOnly);
-            if (!k) {
-                Tcl_IncrRefCount(d);
-                Tcl_DecrRefCount(d);
+    switch (tag)
+    {
+        case TBCX_LIT_BIGNUM:
+            return ReadLit_Bignum(r);
+        case TBCX_LIT_BOOLEAN:
+        {
+            uint8_t b = 0;
+            if (!Tbcx_R_U8(r, &b))
+                return NULL;
+            if (b > 1)
+            {
+                R_Error(r, "tbcx: invalid boolean literal encoding");
                 return NULL;
             }
-            Tcl_Obj *v = ReadLiteral(r, ip, depth + 1, dumpOnly);
-            if (!v) {
-                Tcl_IncrRefCount(k);
-                Tcl_DecrRefCount(k);
-                Tcl_IncrRefCount(d);
-                Tcl_DecrRefCount(d);
-                return NULL;
-            }
-            if (Tcl_DictObjPut(ip, d, k, v) != TCL_OK) {
-                Tcl_IncrRefCount(k);
-                Tcl_DecrRefCount(k);
-                Tcl_IncrRefCount(v);
-                Tcl_DecrRefCount(v);
-                Tcl_IncrRefCount(d);
-                Tcl_DecrRefCount(d);
-                return NULL;
-            }
+            return Tcl_NewBooleanObj((int)b);
         }
-        return d;
-    }
-    case TBCX_LIT_DOUBLE: {
-        uint64_t bits = 0;
-        if (!Tbcx_R_U64(r, &bits))
-            return NULL;
-        union {
-            uint64_t u;
-            double   d;
-        } u;
-        u.u = bits;
-        return Tcl_NewDoubleObj(u.d);
-    }
-    case TBCX_LIT_LIST: {
-        uint32_t n = 0;
-        if (!Tbcx_R_U32(r, &n))
-            return NULL;
-        if (n > TBCX_MAX_CONTAINER_ELEMS) {
-            R_Error(r, "tbcx: list too many elements");
-            return NULL;
-        }
-        Tcl_Obj *lst = Tcl_NewListObj(0, NULL);
-        for (uint32_t i = 0; i < n; i++) {
-            Tcl_Obj *e = ReadLiteral(r, ip, depth + 1, dumpOnly);
-            if (!e) {
-                Tcl_IncrRefCount(lst);
-                Tcl_DecrRefCount(lst);
+        case TBCX_LIT_BYTEARR:
+        {
+            uint32_t n = 0;
+            if (!Tbcx_R_U32(r, &n))
+                return NULL;
+            if (n > TBCX_MAX_STR)
+            {
+                R_Error(r, "tbcx: bytearray too large");
                 return NULL;
             }
-            if (Tcl_ListObjAppendElement(ip, lst, e) != TCL_OK) {
-                /* e has refCount 0 — free it before freeing lst. */
-                Tcl_IncrRefCount(e);
-                Tcl_DecrRefCount(e);
-                Tcl_IncrRefCount(lst);
-                Tcl_DecrRefCount(lst);
+            unsigned char* buf = (unsigned char*)Tcl_AttemptAlloc(n ? n : 1u);
+            if (!buf)
+            {
+                R_Error(r, "tbcx: allocation failed (bytearray literal)");
                 return NULL;
             }
-        }
-        return lst;
-    }
-    case TBCX_LIT_WIDEINT: {
-        uint64_t u = 0;
-        if (!Tbcx_R_U64(r, &u))
-            return NULL;
-        /* stored as 2's complement */
-        Tcl_WideInt wi = (Tcl_WideInt)u;
-        return Tcl_NewWideIntObj(wi);
-    }
-    case TBCX_LIT_WIDEUINT: {
-        uint64_t u = 0;
-        if (!Tbcx_R_U64(r, &u))
-            return NULL;
-        if (u <= (uint64_t)INT64_MAX) {
-            return Tcl_NewWideIntObj((Tcl_WideInt)u);
-        } else {
-            /* promote to bignum */
-            mp_int z;
-            mp_err mrc = TclBN_mp_init(&z);
-            if (mrc != MP_OKAY) {
-                R_Error(r, "tbcx: wideuint init");
+            if (n && !Tbcx_R_Bytes(r, buf, n))
+            {
+                Tcl_Free((char*)buf);
                 return NULL;
             }
-            /* Portable path: build from 8 bytes with shift/add so we can
-               keep checking mp_err on each TomMath call. */
-            for (int i = 7; i >= 0; i--) {
-                mrc = TclBN_mp_mul_2d(&z, 8, &z);
-                if (mrc != MP_OKAY)
-                    break;
-                mrc = TclBN_mp_add_d(&z, (unsigned int)((u >> (8 * i)) & 0xFFu), &z);
-                if (mrc != MP_OKAY)
-                    break;
-            }
-            if (mrc != MP_OKAY) {
-                TclBN_mp_clear(&z);
-                R_Error(r, "tbcx: wideuint import");
-                return NULL;
-            }
-            Tcl_Obj *o = Tcl_NewBignumObj(&z);
+            Tcl_Obj* o = Tcl_NewByteArrayObj(buf, n);
+            Tcl_Free((char*)buf);
             return o;
         }
-    }
-    case TBCX_LIT_BYTESRC: {
-        /* source text + nsFQN + compiled block.
-           The source text becomes the Tcl_Obj's string rep so Tcl can
-           recompile from source when evaluated in a different interpreter
-           (e.g. interp eval) or after a compile-epoch bump (ProcShim).
-           PRECOMPILED is NOT set — this allows Tcl to gracefully
-           recompile instead of erroring with "jumped interps". */
-        char    *srcStr = NULL;
-        uint32_t srcLen = 0;
-        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_BYTESRC,
-                &srcStr, &srcLen))
-            return NULL;
-        char    *nsStr = NULL;
-        uint32_t nsLen = 0;
-        if (!Tbcx_R_LPString(r, &nsStr, &nsLen)) {
+        case TBCX_LIT_DICT:
+        {
+            uint32_t cnt = 0;
+            if (!Tbcx_R_U32(r, &cnt))
+                return NULL;
+            if (cnt > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(r, "tbcx: dict too many pairs");
+                return NULL;
+            }
+            Tcl_Obj* d = Tcl_NewDictObj();
+            for (uint32_t i = 0; i < cnt; i++)
+            {
+                Tcl_Obj* k = ReadLiteral(r, ip, depth + 1, dumpOnly);
+                if (!k)
+                {
+                    Tcl_IncrRefCount(d);
+                    Tcl_DecrRefCount(d);
+                    return NULL;
+                }
+                Tcl_Obj* v = ReadLiteral(r, ip, depth + 1, dumpOnly);
+                if (!v)
+                {
+                    Tcl_IncrRefCount(k);
+                    Tcl_DecrRefCount(k);
+                    Tcl_IncrRefCount(d);
+                    Tcl_DecrRefCount(d);
+                    return NULL;
+                }
+                if (Tcl_DictObjPut(ip, d, k, v) != TCL_OK)
+                {
+                    Tcl_IncrRefCount(k);
+                    Tcl_DecrRefCount(k);
+                    Tcl_IncrRefCount(v);
+                    Tcl_DecrRefCount(v);
+                    Tcl_IncrRefCount(d);
+                    Tcl_DecrRefCount(d);
+                    return NULL;
+                }
+            }
+            return d;
+        }
+        case TBCX_LIT_DOUBLE:
+        {
+            uint64_t bits = 0;
+            if (!Tbcx_R_U64(r, &bits))
+                return NULL;
+            union
+            {
+                uint64_t u;
+                double d;
+            } u;
+            u.u = bits;
+            return Tcl_NewDoubleObj(u.d);
+        }
+        case TBCX_LIT_LIST:
+        {
+            uint32_t n = 0;
+            if (!Tbcx_R_U32(r, &n))
+                return NULL;
+            if (n > TBCX_MAX_CONTAINER_ELEMS)
+            {
+                R_Error(r, "tbcx: list too many elements");
+                return NULL;
+            }
+            Tcl_Obj* lst = Tcl_NewListObj(0, NULL);
+            for (uint32_t i = 0; i < n; i++)
+            {
+                Tcl_Obj* e = ReadLiteral(r, ip, depth + 1, dumpOnly);
+                if (!e)
+                {
+                    Tcl_IncrRefCount(lst);
+                    Tcl_DecrRefCount(lst);
+                    return NULL;
+                }
+                if (Tcl_ListObjAppendElement(ip, lst, e) != TCL_OK)
+                {
+                    /* e has refCount 0 — free it before freeing lst. */
+                    Tcl_IncrRefCount(e);
+                    Tcl_DecrRefCount(e);
+                    Tcl_IncrRefCount(lst);
+                    Tcl_DecrRefCount(lst);
+                    return NULL;
+                }
+            }
+            return lst;
+        }
+        case TBCX_LIT_WIDEINT:
+        {
+            uint64_t u = 0;
+            if (!Tbcx_R_U64(r, &u))
+                return NULL;
+            /* stored as 2's complement */
+            Tcl_WideInt wi = (Tcl_WideInt)u;
+            return Tcl_NewWideIntObj(wi);
+        }
+        case TBCX_LIT_WIDEUINT:
+        {
+            uint64_t u = 0;
+            if (!Tbcx_R_U64(r, &u))
+                return NULL;
+            if (u <= (uint64_t)INT64_MAX)
+            {
+                return Tcl_NewWideIntObj((Tcl_WideInt)u);
+            }
+            else
+            {
+                /* promote to bignum */
+                mp_int z;
+                mp_err mrc = TclBN_mp_init(&z);
+                if (mrc != MP_OKAY)
+                {
+                    R_Error(r, "tbcx: wideuint init");
+                    return NULL;
+                }
+                /* Portable path: build from 8 bytes with shift/add so we can
+                   keep checking mp_err on each TomMath call. */
+                for (int i = 7; i >= 0; i--)
+                {
+                    mrc = TclBN_mp_mul_2d(&z, 8, &z);
+                    if (mrc != MP_OKAY)
+                        break;
+                    mrc = TclBN_mp_add_d(&z, (unsigned int)((u >> (8 * i)) & 0xFFu), &z);
+                    if (mrc != MP_OKAY)
+                        break;
+                }
+                if (mrc != MP_OKAY)
+                {
+                    TclBN_mp_clear(&z);
+                    R_Error(r, "tbcx: wideuint import");
+                    return NULL;
+                }
+                Tcl_Obj* o = Tcl_NewBignumObj(&z);
+                return o;
+            }
+        }
+        case TBCX_LIT_BYTESRC:
+        {
+            /* source text + nsFQN + compiled block.
+               The source text becomes the Tcl_Obj's string rep so Tcl can
+               recompile from source when evaluated in a different interpreter
+               (e.g. interp eval) or after a compile-epoch bump (ProcShim).
+               PRECOMPILED is NOT set — this allows Tcl to gracefully
+               recompile instead of erroring with "jumped interps". */
+            char* srcStr = NULL;
+            uint32_t srcLen = 0;
+            if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_BYTESRC, &srcStr, &srcLen))
+                return NULL;
+            char* nsStr = NULL;
+            uint32_t nsLen = 0;
+            if (!Tbcx_R_LPString(r, &nsStr, &nsLen))
+            {
+                if (srcStr)
+                    Tcl_Free(srcStr);
+                return NULL;
+            }
+            Tcl_Obj* nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
+            Tcl_IncrRefCount(nsObj);
+            Tcl_Free(nsStr);
+            {
+                Tcl_Size nsObjLen = 0;
+                const char* nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
+                if (!nsObjStr || Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "bytesrc literal namespace", 1) != TCL_OK)
+                {
+                    Tcl_DecrRefCount(nsObj);
+                    if (srcStr)
+                        Tcl_Free(srcStr);
+                    return NULL;
+                }
+            }
+            Namespace* nsPtr;
+            if (dumpOnly)
+                nsPtr = (Namespace*)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
+            else
+                nsPtr = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
+            if (!nsPtr)
+            {
+                if (dumpOnly)
+                    nsPtr = (Namespace*)Tcl_GetGlobalNamespace(ip);
+                else
+                {
+                    R_Error(r, "tbcx: namespace creation failed for bytesrc literal");
+                    Tcl_DecrRefCount(nsObj);
+                    if (srcStr)
+                        Tcl_Free(srcStr);
+                    return NULL;
+                }
+            }
+            uint32_t dummyNL = 0;
+            /* Policy-zero BYTESRC literals permit source-backed execution.
+             * Nonzero policies are PRECOMPILED; include-source text is
+             * introspection data. */
+            int newPolicy = (r->sourcePolicy & TBCX_BLOCK_POLICY_MASK) != 0u;
+            Tcl_Obj* bc = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL, newPolicy, dumpOnly, NULL);
+            Tcl_DecrRefCount(nsObj);
+            if (bc && srcLen > 0)
+            {
+                /* Install the preserved text as the string representation. */
+                Tcl_InvalidateStringRep(bc);
+                Tcl_InitStringRep(bc, srcStr, (Tcl_Size)srcLen);
+            }
             if (srcStr)
                 Tcl_Free(srcStr);
-            return NULL;
+            return bc;
         }
-        Tcl_Obj *nsObj = Tcl_NewStringObj(nsStr, (Tcl_Size)nsLen);
-        Tcl_IncrRefCount(nsObj);
-        Tcl_Free(nsStr);
+        case TBCX_LIT_LAMBDA_BC:
+            return ReadLit_LambdaBC(r, ip, depth, dumpOnly);
+        case TBCX_LIT_STRING:
         {
-            Tcl_Size    nsObjLen = 0;
-            const char *nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
-            if (!nsObjStr || Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "bytesrc literal namespace", 1) != TCL_OK) {
-                Tcl_DecrRefCount(nsObj);
-                if (srcStr)
-                    Tcl_Free(srcStr);
+            char* s = NULL;
+            uint32_t n = 0;
+            if (!Tbcx_R_LPString(r, &s, &n))
                 return NULL;
-            }
+            Tcl_Obj* o = Tcl_NewStringObj(s, (Tcl_Size)n);
+            Tcl_Free(s);
+            return o;
         }
-        Namespace *nsPtr;
-        if (dumpOnly)
-            nsPtr = (Namespace *)Tcl_FindNamespace(ip, Tcl_GetString(nsObj), NULL, 0);
-        else
-            nsPtr = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
-        if (!nsPtr) {
-            if (dumpOnly)
-                nsPtr = (Namespace *)Tcl_GetGlobalNamespace(ip);
-            else {
-                R_Error(r, "tbcx: namespace creation failed for bytesrc literal");
-                Tcl_DecrRefCount(nsObj);
-                if (srcStr)
-                    Tcl_Free(srcStr);
-                return NULL;
-            }
-        }
-        uint32_t dummyNL = 0;
-        /* Legacy policy-zero BYTESRC literals retain the historical source
-           fallback.  New-policy literals are always PRECOMPILED: strict has
-           no source, while include-source retains it for introspection only. */
-        int newPolicy = (r->sourcePolicy & TBCX_BLOCK_POLICY_MASK) != 0u;
-        Tcl_Obj *bc      = Tbcx_ReadBlock(r, ip, nsPtr, &dummyNL,
-            newPolicy, dumpOnly, NULL);
-        Tcl_DecrRefCount(nsObj);
-        if (bc && srcLen > 0) {
-            /* Restore preserved text as the string representation.  For a
-               new-policy artifact this is introspection data only because
-               the internal ByteCode remains PRECOMPILED. */
-            Tcl_InvalidateStringRep(bc);
-            Tcl_InitStringRep(bc, srcStr, (Tcl_Size)srcLen);
-        }
-        if (srcStr)
-            Tcl_Free(srcStr);
-        return bc;
-    }
-    case TBCX_LIT_LAMBDA_BC:
-        return ReadLit_LambdaBC(r, ip, depth, dumpOnly);
-    case TBCX_LIT_STRING: {
-        char    *s = NULL;
-        uint32_t n = 0;
-        if (!Tbcx_R_LPString(r, &s, &n))
+        default:
+            R_Error(r, "tbcx: unknown literal tag");
             return NULL;
-        Tcl_Obj *o = Tcl_NewStringObj(s, (Tcl_Size)n);
-        Tcl_Free(s);
-        return o;
-    }
-    default:
-        R_Error(r, "tbcx: unknown literal tag");
-        return NULL;
     }
 }
 
@@ -5023,11 +5466,14 @@ static Tcl_Obj *ReadLiteral(TbcxIn *r, Tcl_Interp *ip, int depth, int dumpOnly) 
  * local-index arrays for DictUpdateInfo, ForeachInfo struct).  Use this
  * helper on every failure path BEFORE ownership transfers into the
  * packed ByteCode via ByteCodeObj(). */
-static void FreeAuxArrayOwned(AuxData *arr, uint32_t n) {
+static void FreeAuxArrayOwned(AuxData* arr, uint32_t n)
+{
     if (!arr)
         return;
-    for (uint32_t i = 0; i < n; i++) {
-        if (arr[i].type && arr[i].type->freeProc && arr[i].clientData) {
+    for (uint32_t i = 0; i < n; i++)
+    {
+        if (arr[i].type && arr[i].type->freeProc && arr[i].clientData)
+        {
             arr[i].type->freeProc(arr[i].clientData);
             arr[i].clientData = NULL;
         }
@@ -5035,68 +5481,81 @@ static void FreeAuxArrayOwned(AuxData *arr, uint32_t n) {
     Tcl_Free(arr);
 }
 
-static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
+static int ReadAuxArray(TbcxIn* r, AuxData** auxOut, uint32_t* numAuxOut)
+{
     uint32_t n = 0;
     if (!Tbcx_R_U32(r, &n))
         return 0;
-    if (n > TBCX_MAX_AUX) {
+    if (n > TBCX_MAX_AUX)
+    {
         R_Error(r, "tbcx: aux too many");
         return 0;
     }
-    AuxData *arr = NULL;
-    if (n) {
+    AuxData* arr = NULL;
+    if (n)
+    {
         size_t auxBytes = 0;
-        if (!tbcx_checked_mul(sizeof(AuxData), n, &auxBytes)) {
+        if (!tbcx_checked_mul(sizeof(AuxData), n, &auxBytes))
+        {
             R_Error(r, "tbcx: aux array size overflow");
             return 0;
         }
-        arr = (AuxData *)Tcl_AttemptAlloc(auxBytes);
-        if (!arr) {
+        arr = (AuxData*)Tcl_AttemptAlloc(auxBytes);
+        if (!arr)
+        {
             R_Error(r, "tbcx: allocation failed (aux array)");
             return 0;
         }
     }
 
     uint32_t i = 0; /* declared here so fail_aux can reference it */
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < n; i++)
+    {
         uint32_t tag = 0;
         if (!Tbcx_R_U32(r, &tag))
             goto fail_aux;
 
-        if (tag == TBCX_AUX_JT_STR) {
+        if (tag == TBCX_AUX_JT_STR)
+        {
             /* u32 cnt, then cnt × (LPString key, u32 pcOffset) */
             uint32_t cnt = 0;
             if (!Tbcx_R_U32(r, &cnt))
                 goto fail_aux;
-            if (cnt > TBCX_MAX_LITERALS) {
+            if (cnt > TBCX_MAX_LITERALS)
+            {
                 R_Error(r, "tbcx: jump table too large");
                 goto fail_aux;
             }
-            JumptableInfo *info = (JumptableInfo *)Tcl_AttemptAlloc(sizeof(*info));
-            if (!info) {
+            JumptableInfo* info = (JumptableInfo*)Tcl_AttemptAlloc(sizeof(*info));
+            if (!info)
+            {
                 R_Error(r, "tbcx: allocation failed (jumptable)");
                 goto fail_aux;
             }
             Tcl_InitHashTable(&info->hashTable, TCL_STRING_KEYS);
-            for (uint32_t k = 0; k < cnt; k++) {
-                char    *s  = NULL;
+            for (uint32_t k = 0; k < cnt; k++)
+            {
+                char* s = NULL;
                 uint32_t sl = 0;
-                if (!Tbcx_R_LPString(r, &s, &sl)) {
+                if (!Tbcx_R_LPString(r, &s, &sl))
+                {
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
                     goto fail_aux;
                 }
                 uint32_t off = 0;
-                if (!Tbcx_R_U32(r, &off)) {
+                if (!Tbcx_R_U32(r, &off))
+                {
                     Tcl_Free(s);
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
                     goto fail_aux;
                 }
                 /* For TCL_STRING_KEYS, Tcl duplicates the key we pass in. */
-                int            newEntry = 0;
-                Tcl_HashEntry *he       = Tcl_CreateHashEntry(&info->hashTable, s, &newEntry);
-                if (!newEntry) {
+                int newEntry = 0;
+                Tcl_HashEntry* he = Tcl_CreateHashEntry(&info->hashTable, s, &newEntry);
+                if (!newEntry)
+                {
                     Tcl_Free(s);
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
@@ -5106,27 +5565,33 @@ static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
                 Tcl_SetHashValue(he, INT2PTR((int)off));
                 Tcl_Free(s); /* safe: table holds its own duplicate */
             }
-            arr[i].type       = tbcxAuxJTStr;
+            arr[i].type = tbcxAuxJTStr;
             arr[i].clientData = info;
-        } else if (tag == TBCX_AUX_JT_NUM) {
+        }
+        else if (tag == TBCX_AUX_JT_NUM)
+        {
             uint32_t cnt = 0;
             if (!Tbcx_R_U32(r, &cnt))
                 goto fail_aux;
-            if (cnt > TBCX_MAX_LITERALS) {
+            if (cnt > TBCX_MAX_LITERALS)
+            {
                 R_Error(r, "tbcx: numeric jump table too large");
                 goto fail_aux;
             }
-            JumptableNumInfo *info = (JumptableNumInfo *)Tcl_AttemptAlloc(sizeof(*info));
-            if (!info) {
+            JumptableNumInfo* info = (JumptableNumInfo*)Tcl_AttemptAlloc(sizeof(*info));
+            if (!info)
+            {
                 R_Error(r, "tbcx: allocation failed (jumptable_num)");
                 goto fail_aux;
             }
             Tcl_InitHashTable(&info->hashTable, TCL_ONE_WORD_KEYS);
-            for (uint32_t k = 0; k < cnt; k++) {
+            for (uint32_t k = 0; k < cnt; k++)
+            {
                 uint64_t key = 0;
                 uint32_t off = 0;
 
-                if (!Tbcx_R_U64(r, &key) || !Tbcx_R_U32(r, &off)) {
+                if (!Tbcx_R_U64(r, &key) || !Tbcx_R_U32(r, &off))
+                {
                     /* cleanup on short read */
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
@@ -5134,17 +5599,18 @@ static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
                 }
                 int64_t signedKey = (int64_t)key;
 #if INTPTR_MAX < INT64_MAX
-                if (signedKey < (int64_t)INTPTR_MIN || signedKey > (int64_t)INTPTR_MAX) {
+                if (signedKey < (int64_t)INTPTR_MIN || signedKey > (int64_t)INTPTR_MAX)
+                {
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
                     R_Error(r, "tbcx: numeric jump-table key is not representable on this platform");
                     goto fail_aux;
                 }
 #endif
-                int            newE = 0;
-                Tcl_HashEntry *he = Tcl_CreateHashEntry(&info->hashTable,
-                    (const char *)(intptr_t)signedKey, &newE);
-                if (!newE) {
+                int newE = 0;
+                Tcl_HashEntry* he = Tcl_CreateHashEntry(&info->hashTable, (const char*)(intptr_t)signedKey, &newE);
+                if (!newE)
+                {
                     Tcl_DeleteHashTable(&info->hashTable);
                     Tcl_Free(info);
                     R_Error(r, "tbcx: duplicate numeric jump-table key");
@@ -5152,111 +5618,133 @@ static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
                 }
                 Tcl_SetHashValue(he, INT2PTR((int32_t)off));
             }
-            arr[i].type       = tbcxAuxJTNum;
+            arr[i].type = tbcxAuxJTNum;
             arr[i].clientData = info;
-        } else if (tag == TBCX_AUX_DICTUPD) {
+        }
+        else if (tag == TBCX_AUX_DICTUPD)
+        {
             uint32_t L = 0;
             if (!Tbcx_R_U32(r, &L))
                 goto fail_aux;
-            if (L > TBCX_MAX_LITERALS) {
+            if (L > TBCX_MAX_LITERALS)
+            {
                 R_Error(r, "tbcx: dict-update aux too large");
                 goto fail_aux;
             }
             size_t elemBytes = (size_t)L * sizeof(Tcl_Size);
             /* Overflow check: verify the multiplication didn't wrap */
-            if (L > 0 && elemBytes / L != sizeof(Tcl_Size)) {
+            if (L > 0 && elemBytes / L != sizeof(Tcl_Size))
+            {
                 R_Error(r, "tbcx: dict-update aux overflow");
                 goto fail_aux;
             }
-            size_t          bytes = offsetof(DictUpdateInfo, varIndices) + elemBytes;
-            DictUpdateInfo *info  = (DictUpdateInfo *)Tcl_AttemptAlloc(bytes);
-            if (!info) {
+            size_t bytes = offsetof(DictUpdateInfo, varIndices) + elemBytes;
+            DictUpdateInfo* info = (DictUpdateInfo*)Tcl_AttemptAlloc(bytes);
+            if (!info)
+            {
                 R_Error(r, "tbcx: allocation failed (dictupdate)");
                 goto fail_aux;
             }
             memset(info, 0, bytes);
             info->length = (Tcl_Size)L;
-            for (uint32_t k = 0; k < L; k++) {
+            for (uint32_t k = 0; k < L; k++)
+            {
                 uint32_t x = 0;
-                if (!Tbcx_R_U32(r, &x)) {
+                if (!Tbcx_R_U32(r, &x))
+                {
                     Tcl_Free(info);
                     goto fail_aux;
                 }
                 info->varIndices[k] = (Tcl_Size)x;
             }
-            arr[i].type       = tbcxAuxDictUpdate;
+            arr[i].type = tbcxAuxDictUpdate;
             arr[i].clientData = info;
-        } else if (tag == TBCX_AUX_NEWFORE) {
-            if (!tbcxAuxNewForeach) {
+        }
+        else if (tag == TBCX_AUX_NEWFORE)
+        {
+            if (!tbcxAuxNewForeach)
+            {
                 R_Error(r, "tbcx: NewForeachInfo AuxData type not available in this Tcl build");
                 goto fail_aux;
             }
 
             uint32_t numLists = 0, loopCtU = 0, firstValU = 0, dupNumLists = 0;
-            if (!Tbcx_R_U32(r, &numLists) || !Tbcx_R_U32(r, &loopCtU) || !Tbcx_R_U32(r, &firstValU) || !Tbcx_R_U32(r, &dupNumLists))
+            if (!Tbcx_R_U32(r, &numLists) || !Tbcx_R_U32(r, &loopCtU) || !Tbcx_R_U32(r, &firstValU) ||
+                !Tbcx_R_U32(r, &dupNumLists))
                 goto fail_aux;
-            if (dupNumLists != numLists) {
+            if (dupNumLists != numLists)
+            {
                 R_Error(r, "tbcx: foreach aux mismatch");
                 goto fail_aux;
             }
-            if (numLists > TBCX_MAX_LITERALS) {
+            if (numLists > TBCX_MAX_LITERALS)
+            {
                 R_Error(r, "tbcx: foreach aux too many lists");
                 goto fail_aux;
             }
-            size_t listBytes = (size_t)numLists * sizeof(ForeachVarList *);
-            if (numLists > 0 && listBytes / numLists != sizeof(ForeachVarList *)) {
+            size_t listBytes = (size_t)numLists * sizeof(ForeachVarList*);
+            if (numLists > 0 && listBytes / numLists != sizeof(ForeachVarList*))
+            {
                 R_Error(r, "tbcx: foreach aux overflow");
                 goto fail_aux;
             }
-            size_t       bytes = offsetof(ForeachInfo, varLists) + listBytes;
-            ForeachInfo *info  = (ForeachInfo *)Tcl_AttemptAlloc(bytes);
-            if (!info) {
+            size_t bytes = offsetof(ForeachInfo, varLists) + listBytes;
+            ForeachInfo* info = (ForeachInfo*)Tcl_AttemptAlloc(bytes);
+            if (!info)
+            {
                 R_Error(r, "tbcx: allocation failed (foreach)");
                 goto fail_aux;
             }
             memset(info, 0, bytes);
-            info->numLists       = (Tcl_Size)numLists;
+            info->numLists = (Tcl_Size)numLists;
             info->firstValueTemp = (Tcl_LVTIndex)(int32_t)firstValU;
-            info->loopCtTemp     = (Tcl_LVTIndex)(int32_t)loopCtU;
-            for (uint32_t iL = 0; iL < numLists; iL++) {
+            info->loopCtTemp = (Tcl_LVTIndex)(int32_t)loopCtU;
+            for (uint32_t iL = 0; iL < numLists; iL++)
+            {
                 uint32_t nv = 0;
-                if (!Tbcx_R_U32(r, &nv)) {
-                    arr[i].type       = tbcxAuxNewForeach;
+                if (!Tbcx_R_U32(r, &nv))
+                {
+                    arr[i].type = tbcxAuxNewForeach;
                     arr[i].clientData = info;
                     i++; /* count this entry so fail_aux frees it */
                     goto fail_aux;
                 }
-                if (nv > TBCX_MAX_LITERALS) {
+                if (nv > TBCX_MAX_LITERALS)
+                {
                     R_Error(r, "tbcx: foreach varlist too large");
-                    arr[i].type       = tbcxAuxNewForeach;
+                    arr[i].type = tbcxAuxNewForeach;
                     arr[i].clientData = info;
                     i++;
                     goto fail_aux;
                 }
                 size_t varIdxBytes = (size_t)nv * sizeof(Tcl_LVTIndex);
-                if (nv > 0 && varIdxBytes / nv != sizeof(Tcl_LVTIndex)) {
+                if (nv > 0 && varIdxBytes / nv != sizeof(Tcl_LVTIndex))
+                {
                     R_Error(r, "tbcx: foreach varlist overflow");
-                    arr[i].type       = tbcxAuxNewForeach;
+                    arr[i].type = tbcxAuxNewForeach;
                     arr[i].clientData = info;
                     i++;
                     goto fail_aux;
                 }
-                size_t          vlBytes = offsetof(ForeachVarList, varIndexes) + varIdxBytes;
-                ForeachVarList *vl      = (ForeachVarList *)Tcl_AttemptAlloc(vlBytes);
-                if (!vl) {
+                size_t vlBytes = offsetof(ForeachVarList, varIndexes) + varIdxBytes;
+                ForeachVarList* vl = (ForeachVarList*)Tcl_AttemptAlloc(vlBytes);
+                if (!vl)
+                {
                     R_Error(r, "tbcx: allocation failed (foreach varlist)");
-                    arr[i].type       = tbcxAuxNewForeach;
+                    arr[i].type = tbcxAuxNewForeach;
                     arr[i].clientData = info;
                     i++; /* count this entry so fail_aux frees it */
                     goto fail_aux;
                 }
                 memset(vl, 0, vlBytes);
                 vl->numVars = (Tcl_Size)nv;
-                for (uint32_t j = 0; j < nv; j++) {
+                for (uint32_t j = 0; j < nv; j++)
+                {
                     uint32_t idx = 0;
-                    if (!Tbcx_R_U32(r, &idx)) {
+                    if (!Tbcx_R_U32(r, &idx))
+                    {
                         Tcl_Free(vl);
-                        arr[i].type       = tbcxAuxNewForeach;
+                        arr[i].type = tbcxAuxNewForeach;
                         arr[i].clientData = info;
                         i++;
                         goto fail_aux;
@@ -5265,20 +5753,23 @@ static int ReadAuxArray(TbcxIn *r, AuxData **auxOut, uint32_t *numAuxOut) {
                 }
                 info->varLists[iL] = vl;
             }
-            arr[i].type       = tbcxAuxNewForeach;
+            arr[i].type = tbcxAuxNewForeach;
             arr[i].clientData = info;
-        } else {
+        }
+        else
+        {
             R_Error(r, "tbcx: unsupported AuxData tag");
             goto fail_aux;
         }
     }
-    *auxOut    = arr;
+    *auxOut = arr;
     *numAuxOut = n;
     return 1;
 
 fail_aux:
     /* Free already-completed AuxData entries [0..i) via their type's freeProc */
-    for (uint32_t j = 0; j < i; j++) {
+    for (uint32_t j = 0; j < i; j++)
+    {
         if (arr[j].type && arr[j].type->freeProc && arr[j].clientData)
             arr[j].type->freeProc(arr[j].clientData);
     }
@@ -5287,32 +5778,40 @@ fail_aux:
     return 0;
 }
 
-static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
+static int ReadExceptions(TbcxIn* r, ExceptionRange** exOut, uint32_t* numOut)
+{
     uint32_t n = 0;
     if (!Tbcx_R_U32(r, &n))
         return 0;
-    if (n > TBCX_MAX_EXCEPT) {
+    if (n > TBCX_MAX_EXCEPT)
+    {
         R_Error(r, "tbcx: too many exceptions");
         return 0;
     }
-    ExceptionRange *arr = NULL;
-    if (n) {
+    ExceptionRange* arr = NULL;
+    if (n)
+    {
         size_t exBytes = 0;
-        if (!tbcx_checked_mul(sizeof(ExceptionRange), n, &exBytes)) {
+        if (!tbcx_checked_mul(sizeof(ExceptionRange), n, &exBytes))
+        {
             R_Error(r, "tbcx: exception array size overflow");
             return 0;
         }
-        arr = (ExceptionRange *)Tcl_AttemptAlloc(exBytes);
-        if (!arr) {
+        arr = (ExceptionRange*)Tcl_AttemptAlloc(exBytes);
+        if (!arr)
+        {
             R_Error(r, "tbcx: allocation failed (exception array)");
             return 0;
         }
     }
-    for (uint32_t i = 0; i < n; i++) {
-        uint8_t  type8   = 0;
-        uint32_t len     = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        uint8_t type8 = 0;
+        uint32_t len = 0;
         uint32_t nesting = 0, from = 0, cont = 0, brk = 0, cat = 0;
-        if (!Tbcx_R_U8(r, &type8) || !Tbcx_R_U32(r, &nesting) || !Tbcx_R_U32(r, &from) || !Tbcx_R_U32(r, &len) || !Tbcx_R_U32(r, &cont) || !Tbcx_R_U32(r, &brk) || !Tbcx_R_U32(r, &cat)) {
+        if (!Tbcx_R_U8(r, &type8) || !Tbcx_R_U32(r, &nesting) || !Tbcx_R_U32(r, &from) || !Tbcx_R_U32(r, &len) ||
+            !Tbcx_R_U32(r, &cont) || !Tbcx_R_U32(r, &brk) || !Tbcx_R_U32(r, &cat))
+        {
             if (arr)
                 Tcl_Free(arr);
             return 0;
@@ -5322,34 +5821,38 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
          * loop-like control metadata, so a crafted `.tbcx` with e.g.
          * type8 = 99 could alter break/continue unwinding behaviour
          * even when offsets are in range. */
-        if (type8 != (uint8_t)LOOP_EXCEPTION_RANGE &&
-            type8 != (uint8_t)CATCH_EXCEPTION_RANGE) {
+        if (type8 != (uint8_t)LOOP_EXCEPTION_RANGE && type8 != (uint8_t)CATCH_EXCEPTION_RANGE)
+        {
             R_Error(r, "tbcx: invalid exception range type");
             if (arr)
                 Tcl_Free(arr);
             return 0;
         }
-        arr[i].type           = (ExceptionRangeType)type8;
+        arr[i].type = (ExceptionRangeType)type8;
         /* Store in Tcl_Size domain (matches Tcl 9.1 headers).
          * Preserve -1 sentinel encoded as 0xFFFFFFFF on the wire. */
-        arr[i].nestingLevel   = (Tcl_Size)nesting;
-        arr[i].codeOffset     = (Tcl_Size)from;
-        arr[i].numCodeBytes   = (Tcl_Size)len;
+        arr[i].nestingLevel = (Tcl_Size)nesting;
+        arr[i].codeOffset = (Tcl_Size)from;
+        arr[i].numCodeBytes = (Tcl_Size)len;
         arr[i].continueOffset = (cont == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cont;
-        arr[i].breakOffset    = (brk == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)brk;
-        arr[i].catchOffset    = (cat == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cat;
+        arr[i].breakOffset = (brk == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)brk;
+        arr[i].catchOffset = (cat == 0xFFFFFFFFu) ? (Tcl_Size)-1 : (Tcl_Size)cat;
         /* Tighten the metadata shape: LOOP ranges must not carry a catch
          * offset, CATCH ranges must not carry break/continue offsets. */
-        if (arr[i].type == LOOP_EXCEPTION_RANGE) {
-            if (arr[i].catchOffset != (Tcl_Size)-1) {
+        if (arr[i].type == LOOP_EXCEPTION_RANGE)
+        {
+            if (arr[i].catchOffset != (Tcl_Size)-1)
+            {
                 R_Error(r, "tbcx: LOOP exception range with non-sentinel catchOffset");
                 if (arr)
                     Tcl_Free(arr);
                 return 0;
             }
-        } else {
-            if (arr[i].breakOffset != (Tcl_Size)-1 ||
-                arr[i].continueOffset != (Tcl_Size)-1) {
+        }
+        else
+        {
+            if (arr[i].breakOffset != (Tcl_Size)-1 || arr[i].continueOffset != (Tcl_Size)-1)
+            {
                 R_Error(r, "tbcx: CATCH exception range with non-sentinel break/continueOffset");
                 if (arr)
                     Tcl_Free(arr);
@@ -5357,15 +5860,14 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
             }
         }
     }
-    *exOut  = arr;
+    *exOut = arr;
     *numOut = n;
     return 1;
 }
 
-/* ValidateBlockOperands — semantic validation pass over the raw instruction
- * stream from the wire.  Runs after the literal/aux/exception sections have
- * been parsed and sized, BEFORE TbcxByteCode() hands the block to Tcl's
- * evaluator.
+/* ValidateBlockOperands — semantic validation of the raw instruction stream.
+ * Runs after the literal, AuxData, and exception sections are sized and before
+ * ByteCode construction.
  *
  * Validates:
  *   1) opcode byte <= LAST_INST_OPCODE;
@@ -5377,33 +5879,32 @@ static int ReadExceptions(TbcxIn *r, ExceptionRange **exOut, uint32_t *numOut) {
  *      AND lands on a recorded instruction boundary;
  *   7) every JumptableInfo/JumptableNumInfo hash entry's stored offset
  *      satisfies the same in-range + on-boundary constraint.
- *
- * Without this pass, a crafted .tbcx with e.g. INST_PUSH <huge> can cause
- * an out-of-bounds read of codePtr->objArrayPtr at runtime inside Tcl's
- * evaluator.  The evaluator itself does not revalidate operands (by
- * design — the compiler is trusted), so revalidation MUST happen at
- * load time for untrusted artifacts.
- *
  * Returns TCL_OK on success; on failure, sets an interpreter result
  * describing the offending instruction and returns TCL_ERROR. */
-static int ValidateBlockOperands(
-    Tcl_Interp *ip,
-    const unsigned char *code, uint32_t codeLen,
-    uint32_t numLits, uint32_t numAux, uint32_t numLocals,
-    AuxData *auxArr, ExceptionRange *exArr, uint32_t numEx)
+static int ValidateBlockOperands(Tcl_Interp* ip,
+                                 const unsigned char* code,
+                                 uint32_t codeLen,
+                                 uint32_t numLits,
+                                 uint32_t numAux,
+                                 uint32_t numLocals,
+                                 AuxData* auxArr,
+                                 ExceptionRange* exArr,
+                                 uint32_t numEx)
 {
-    const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
-    unsigned char *boundary = NULL;
+    const InstructionDesc* instTable = (const InstructionDesc*)TclGetInstructionTable();
+    unsigned char* boundary = NULL;
 
     /* Tcl's evaluator immediately fetches an opcode; an empty code array has
        no valid entry point.  The compiler always emits at least INST_DONE. */
-    if (codeLen == 0) {
+    if (codeLen == 0)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: empty bytecode block", -1));
         return TCL_ERROR;
     }
 
-    boundary = (unsigned char *)Tcl_AttemptAlloc((size_t)codeLen);
-    if (!boundary) {
+    boundary = (unsigned char*)Tcl_AttemptAlloc((size_t)codeLen);
+    if (!boundary)
+    {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (boundary map)", -1));
         return TCL_ERROR;
     }
@@ -5412,21 +5913,21 @@ static int ValidateBlockOperands(
     /* Pass 1: walk instruction stream, validate opcode and length,
      * populate boundary map. */
     uint32_t pc = 0, lastPc = 0;
-    while (pc < codeLen) {
+    while (pc < codeLen)
+    {
         unsigned int op = code[pc];
-        if (op > LAST_INST_OPCODE) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                "tbcx: invalid opcode 0x%02x at pc %u", op, pc));
+        if (op > LAST_INST_OPCODE)
+        {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid opcode 0x%02x at pc %u", op, pc));
             Tcl_Free(boundary);
             return TCL_ERROR;
         }
-        const InstructionDesc *desc = &instTable[op];
-        if (desc->numBytes <= 0 ||
-            (uint32_t)desc->numBytes > codeLen ||
-            pc + (uint32_t)desc->numBytes > codeLen) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                "tbcx: truncated instruction %s (opcode 0x%02x) at pc %u",
-                desc->name ? desc->name : "?", op, pc));
+        const InstructionDesc* desc = &instTable[op];
+        if (desc->numBytes <= 0 || (uint32_t)desc->numBytes > codeLen || pc + (uint32_t)desc->numBytes > codeLen)
+        {
+            Tcl_SetObjResult(
+                ip,
+                Tcl_ObjPrintf("tbcx: truncated instruction %s (opcode 0x%02x) at pc %u", desc->name ? desc->name : "?", op, pc));
             Tcl_Free(boundary);
             return TCL_ERROR;
         }
@@ -5434,16 +5935,17 @@ static int ValidateBlockOperands(
         lastPc = pc;
         pc += (uint32_t)desc->numBytes;
     }
-    if (pc != codeLen) {
+    if (pc != codeLen)
+    {
         /* Final instruction ran past end; already reported above, but
          * guard defensively. */
         Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: code stream does not end on instruction boundary", -1));
         Tcl_Free(boundary);
         return TCL_ERROR;
     }
-    if (strcmp(instTable[code[lastPc]].name, "done") != 0) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: bytecode block does not end with done", -1));
+    if (strcmp(instTable[code[lastPc]].name, "done") != 0)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: bytecode block does not end with done", -1));
         Tcl_Free(boundary);
         return TCL_ERROR;
     }
@@ -5452,39 +5954,37 @@ static int ValidateBlockOperands(
        both the protected span and every handler target against instruction
        boundaries; an in-range byte in the middle of an instruction is not a
        valid program counter. */
-    for (uint32_t i = 0; i < numEx; i++) {
-        ExceptionRange *er = &exArr[i];
+    for (uint32_t i = 0; i < numEx; i++)
+    {
+        ExceptionRange* er = &exArr[i];
         uint64_t start = (uint64_t)er->codeOffset;
-        uint64_t span  = (uint64_t)er->numCodeBytes;
-        uint64_t end   = start + span;
+        uint64_t span = (uint64_t)er->numCodeBytes;
+        uint64_t end = start + span;
 
-        if (span == 0 || start >= codeLen || end > codeLen ||
-            !boundary[start] || (end < codeLen && !boundary[end])) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                "tbcx: exception range %u has an invalid instruction boundary", i));
+        if (span == 0 || start >= codeLen || end > codeLen || !boundary[start] || (end < codeLen && !boundary[end]))
+        {
+            Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u has an invalid instruction boundary", i));
             Tcl_Free(boundary);
             return TCL_ERROR;
         }
-        if ((uint64_t)er->nestingLevel >= numEx) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                "tbcx: exception range %u has invalid nesting level %" TCL_SIZE_MODIFIER "d",
-                i, er->nestingLevel));
+        if ((uint64_t)er->nestingLevel >= numEx)
+        {
+            Tcl_SetObjResult(
+                ip,
+                Tcl_ObjPrintf("tbcx: exception range %u has invalid nesting level %" TCL_SIZE_MODIFIER "d", i, er->nestingLevel));
             Tcl_Free(boundary);
             return TCL_ERROR;
         }
 
-        const Tcl_Size targets[3] = {
-            er->continueOffset, er->breakOffset, er->catchOffset
-        };
-        const char *targetNames[3] = {"continue", "break", "catch"};
-        for (int t = 0; t < 3; t++) {
+        const Tcl_Size targets[3] = {er->continueOffset, er->breakOffset, er->catchOffset};
+        const char* targetNames[3] = {"continue", "break", "catch"};
+        for (int t = 0; t < 3; t++)
+        {
             if (targets[t] == TCL_INDEX_NONE)
                 continue;
-            if (targets[t] < 0 || (uint64_t)targets[t] >= codeLen ||
-                !boundary[targets[t]]) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: exception range %u has invalid %s target",
-                    i, targetNames[t]));
+            if (targets[t] < 0 || (uint64_t)targets[t] >= codeLen || !boundary[targets[t]])
+            {
+                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: exception range %u has invalid %s target", i, targetNames[t]));
                 Tcl_Free(boundary);
                 return TCL_ERROR;
             }
@@ -5496,190 +5996,207 @@ static int ValidateBlockOperands(
      * rather than opcode-name matching so new opcodes are handled
      * automatically. */
     pc = 0;
-    while (pc < codeLen) {
+    while (pc < codeLen)
+    {
         unsigned int op = code[pc];
-        const InstructionDesc *desc = &instTable[op];
+        const InstructionDesc* desc = &instTable[op];
         uint32_t off = 1; /* skip the opcode byte */
-        for (int oi = 0; oi < desc->numOperands; oi++) {
+        for (int oi = 0; oi < desc->numOperands; oi++)
+        {
             InstOperandType ot = desc->opTypes[oi];
             uint32_t operandBytes;
-            switch (ot) {
-            case OPERAND_NONE:
-                operandBytes = 0;
-                break;
-            case OPERAND_INT1:
-            case OPERAND_UINT1:
-            case OPERAND_LVT1:
-            case OPERAND_OFFSET1:
-            case OPERAND_LIT1:
-            case OPERAND_SCLS1:
-            case OPERAND_UNSF1:
-            case OPERAND_CLK1:
-            case OPERAND_LRPL1:
-                operandBytes = 1;
-                break;
-            case OPERAND_INT4:
-            case OPERAND_UINT4:
-            case OPERAND_IDX4:
-            case OPERAND_LVT4:
-            case OPERAND_AUX4:
-            case OPERAND_OFFSET4:
-            case OPERAND_LIT4:
-                operandBytes = 4;
-                break;
-            default:
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: %s: unknown operand type %d at pc %u (update validator)",
-                    desc->name, (int)ot, pc));
+            switch (ot)
+            {
+                case OPERAND_NONE:
+                    operandBytes = 0;
+                    break;
+                case OPERAND_INT1:
+                case OPERAND_UINT1:
+                case OPERAND_LVT1:
+                case OPERAND_OFFSET1:
+                case OPERAND_LIT1:
+                case OPERAND_SCLS1:
+                case OPERAND_UNSF1:
+                case OPERAND_CLK1:
+                case OPERAND_LRPL1:
+                    operandBytes = 1;
+                    break;
+                case OPERAND_INT4:
+                case OPERAND_UINT4:
+                case OPERAND_IDX4:
+                case OPERAND_LVT4:
+                case OPERAND_AUX4:
+                case OPERAND_OFFSET4:
+                case OPERAND_LIT4:
+                    operandBytes = 4;
+                    break;
+                default:
+                    Tcl_SetObjResult(
+                        ip,
+                        Tcl_ObjPrintf("tbcx: %s: unknown operand type %d at pc %u (update validator)", desc->name, (int)ot, pc));
+                    Tcl_Free(boundary);
+                    return TCL_ERROR;
+            }
+            if (off > (uint32_t)desc->numBytes || operandBytes > (uint32_t)desc->numBytes - off)
+            {
+                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s: operand layout exceeds instruction at pc %u", desc->name, pc));
                 Tcl_Free(boundary);
                 return TCL_ERROR;
             }
-            if (off > (uint32_t)desc->numBytes ||
-                operandBytes > (uint32_t)desc->numBytes - off) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: %s: operand layout exceeds instruction at pc %u",
-                    desc->name, pc));
-                Tcl_Free(boundary);
-                return TCL_ERROR;
-            }
-            switch (ot) {
-            case OPERAND_NONE:
-                break;
-            case OPERAND_INT1:
-            case OPERAND_UINT1:
-            case OPERAND_SCLS1:
-            case OPERAND_UNSF1:
-            case OPERAND_CLK1:
-            case OPERAND_LRPL1:
-                /* 1-byte immediate / flag / small-table-index operands.
-                 * No range check needed — the payload is just a bit
-                 * pattern interpreted by the opcode itself. */
-                off += 1;
-                break;
-            case OPERAND_LVT1: {
-                unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
-                if (idx >= numLocals) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: local index %u >= %u at pc %u",
-                        desc->name, idx, numLocals, pc));
+            switch (ot)
+            {
+                case OPERAND_NONE:
+                    break;
+                case OPERAND_INT1:
+                case OPERAND_UINT1:
+                case OPERAND_SCLS1:
+                case OPERAND_UNSF1:
+                case OPERAND_CLK1:
+                case OPERAND_LRPL1:
+                    /* 1-byte immediate / flag / small-table-index operands.
+                     * No range check needed — the payload is just a bit
+                     * pattern interpreted by the opcode itself. */
+                    off += 1;
+                    break;
+                case OPERAND_LVT1:
+                {
+                    unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
+                    if (idx >= numLocals)
+                    {
+                        Tcl_SetObjResult(
+                            ip, Tcl_ObjPrintf("tbcx: %s: local index %u >= %u at pc %u", desc->name, idx, numLocals, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 1;
+                    break;
+                }
+                case OPERAND_LIT1:
+                {
+                    unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
+                    if (idx >= numLits)
+                    {
+                        Tcl_SetObjResult(
+                            ip, Tcl_ObjPrintf("tbcx: %s: literal index %u >= %u at pc %u", desc->name, idx, numLits, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 1;
+                    break;
+                }
+                case OPERAND_OFFSET1:
+                {
+                    int rel = TclGetInt1AtPtr(code + pc + off);
+                    int64_t tgt = (int64_t)pc + rel;
+                    if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt])
+                    {
+                        Tcl_SetObjResult(ip,
+                                         Tcl_ObjPrintf("tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64
+                                                       ")",
+                                                       desc->name,
+                                                       rel,
+                                                       pc,
+                                                       tgt));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 1;
+                    break;
+                }
+                case OPERAND_INT4:
+                case OPERAND_UINT4:
+                case OPERAND_IDX4:
+                    off += 4;
+                    break;
+                case OPERAND_LVT4:
+                {
+                    unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                    if (idx >= numLocals)
+                    {
+                        Tcl_SetObjResult(
+                            ip, Tcl_ObjPrintf("tbcx: %s: local index %u >= %u at pc %u", desc->name, idx, numLocals, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 4;
+                    break;
+                }
+                case OPERAND_LIT4:
+                {
+                    unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                    if (idx >= numLits)
+                    {
+                        Tcl_SetObjResult(
+                            ip, Tcl_ObjPrintf("tbcx: %s: literal index %u >= %u at pc %u", desc->name, idx, numLits, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 4;
+                    break;
+                }
+                case OPERAND_AUX4:
+                {
+                    unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
+                    if (idx >= numAux)
+                    {
+                        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s: aux index %u >= %u at pc %u", desc->name, idx, numAux, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    const AuxDataType* expected = NULL;
+                    if (strcmp(desc->name, "jumpTable") == 0)
+                        expected = tbcxAuxJTStr;
+                    else if (strcmp(desc->name, "jumpTableNum") == 0)
+                        expected = tbcxAuxJTNum;
+                    else if (strcmp(desc->name, "dictUpdateStart") == 0 || strcmp(desc->name, "dictUpdateEnd") == 0)
+                        expected = tbcxAuxDictUpdate;
+                    else if (strcmp(desc->name, "foreach_start") == 0)
+                        expected = tbcxAuxNewForeach;
+                    if (!expected || auxArr[idx].type != expected || auxArr[idx].clientData == NULL)
+                    {
+                        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s: incompatible aux data %u at pc %u", desc->name, idx, pc));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 4;
+                    break;
+                }
+                case OPERAND_OFFSET4:
+                {
+                    int rel = TclGetInt4AtPtr(code + pc + off);
+                    int64_t tgt = (int64_t)pc + rel;
+                    if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt])
+                    {
+                        Tcl_SetObjResult(ip,
+                                         Tcl_ObjPrintf("tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64
+                                                       ")",
+                                                       desc->name,
+                                                       rel,
+                                                       pc,
+                                                       tgt));
+                        Tcl_Free(boundary);
+                        return TCL_ERROR;
+                    }
+                    off += 4;
+                    break;
+                }
+                default:
+                    /* Unknown operand type — bail out safely rather than
+                     * silently accept.  Tcl may add new operand kinds in
+                     * future; this coerces us to revisit the validator. */
+                    Tcl_SetObjResult(
+                        ip,
+                        Tcl_ObjPrintf("tbcx: %s: unknown operand type %d at pc %u (update validator)", desc->name, (int)ot, pc));
                     Tcl_Free(boundary);
                     return TCL_ERROR;
-                }
-                off += 1;
-                break;
-            }
-            case OPERAND_LIT1: {
-                unsigned int idx = TclGetUInt1AtPtr(code + pc + off);
-                if (idx >= numLits) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: literal index %u >= %u at pc %u",
-                        desc->name, idx, numLits, pc));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 1;
-                break;
-            }
-            case OPERAND_OFFSET1: {
-                int rel = TclGetInt1AtPtr(code + pc + off);
-                int64_t tgt = (int64_t)pc + rel;
-                if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64 ")",
-                        desc->name, rel, pc, tgt));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 1;
-                break;
-            }
-            case OPERAND_INT4:
-            case OPERAND_UINT4:
-            case OPERAND_IDX4:
-                off += 4;
-                break;
-            case OPERAND_LVT4: {
-                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
-                if (idx >= numLocals) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: local index %u >= %u at pc %u",
-                        desc->name, idx, numLocals, pc));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 4;
-                break;
-            }
-            case OPERAND_LIT4: {
-                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
-                if (idx >= numLits) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: literal index %u >= %u at pc %u",
-                        desc->name, idx, numLits, pc));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 4;
-                break;
-            }
-            case OPERAND_AUX4: {
-                unsigned int idx = TclGetUInt4AtPtr(code + pc + off);
-                if (idx >= numAux) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: aux index %u >= %u at pc %u",
-                        desc->name, idx, numAux, pc));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                const AuxDataType *expected = NULL;
-                if (strcmp(desc->name, "jumpTable") == 0)
-                    expected = tbcxAuxJTStr;
-                else if (strcmp(desc->name, "jumpTableNum") == 0)
-                    expected = tbcxAuxJTNum;
-                else if (strcmp(desc->name, "dictUpdateStart") == 0 ||
-                         strcmp(desc->name, "dictUpdateEnd") == 0)
-                    expected = tbcxAuxDictUpdate;
-                else if (strcmp(desc->name, "foreach_start") == 0)
-                    expected = tbcxAuxNewForeach;
-                if (!expected || auxArr[idx].type != expected ||
-                    auxArr[idx].clientData == NULL) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: incompatible aux data %u at pc %u",
-                        desc->name, idx, pc));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 4;
-                break;
-            }
-            case OPERAND_OFFSET4: {
-                int rel = TclGetInt4AtPtr(code + pc + off);
-                int64_t tgt = (int64_t)pc + rel;
-                if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: %s: jump offset %d from pc %u lands off-boundary (target %" PRId64 ")",
-                        desc->name, rel, pc, tgt));
-                    Tcl_Free(boundary);
-                    return TCL_ERROR;
-                }
-                off += 4;
-                break;
-            }
-            default:
-                /* Unknown operand type — bail out safely rather than
-                 * silently accept.  Tcl may add new operand kinds in
-                 * future; this coerces us to revisit the validator. */
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: %s: unknown operand type %d at pc %u (update validator)",
-                    desc->name, (int)ot, pc));
-                Tcl_Free(boundary);
-                return TCL_ERROR;
             }
         }
-        if (off != (uint32_t)desc->numBytes) {
-            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                "tbcx: %s: operand layout length %u != instruction length %d at pc %u",
-                desc->name, off, desc->numBytes, pc));
+        if (off != (uint32_t)desc->numBytes)
+        {
+            Tcl_SetObjResult(
+                ip,
+                Tcl_ObjPrintf(
+                    "tbcx: %s: operand layout length %u != instruction length %d at pc %u", desc->name, off, desc->numBytes, pc));
             Tcl_Free(boundary);
             return TCL_ERROR;
         }
@@ -5694,36 +6211,45 @@ static int ValidateBlockOperands(
      * hash entries against THAT opcode's PC, not against 0.  Any aux
      * index appearing more than once in the code stream (in the weird
      * case of shared aux) is validated against each occurrence. */
-    for (uint32_t i = 0; i < numAux; i++) {
+    for (uint32_t i = 0; i < numAux; i++)
+    {
         if (auxArr[i].type != tbcxAuxJTStr && auxArr[i].type != tbcxAuxJTNum)
             continue;
-        Tcl_HashTable *ht = (Tcl_HashTable *)auxArr[i].clientData;
+        Tcl_HashTable* ht = (Tcl_HashTable*)auxArr[i].clientData;
 
         /* Find every jumpTable / jumpTableNum opcode pointing at this
          * aux entry, and validate each hash entry's target against
          * its PC. */
         int validated = 0;
         pc = 0;
-        while (pc < codeLen) {
+        while (pc < codeLen)
+        {
             unsigned int op = code[pc];
-            const InstructionDesc *desc = &instTable[op];
-            const char *nm = desc->name;
-            if (nm && (strcmp(nm, "jumpTable") == 0 || strcmp(nm, "jumpTableNum") == 0)) {
+            const InstructionDesc* desc = &instTable[op];
+            const char* nm = desc->name;
+            if (nm && (strcmp(nm, "jumpTable") == 0 || strcmp(nm, "jumpTableNum") == 0))
+            {
                 /* Single AUX4 operand at pc+1. */
                 unsigned int auxIdx = TclGetUInt4AtPtr(code + pc + 1);
-                if (auxIdx == i) {
+                if (auxIdx == i)
+                {
                     Tcl_HashSearch hs;
-                    Tcl_HashEntry *he;
-                    for (he = Tcl_FirstHashEntry(ht, &hs); he;
-                         he = Tcl_NextHashEntry(&hs)) {
+                    Tcl_HashEntry* he;
+                    for (he = Tcl_FirstHashEntry(ht, &hs); he; he = Tcl_NextHashEntry(&hs))
+                    {
                         intptr_t rel = (intptr_t)PTR2INT(Tcl_GetHashValue(he));
-                        int64_t  tgt = (int64_t)pc + rel;
-                        if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt]) {
-                            Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                                "tbcx: jump-table aux %u: target pc+%" PRIdPTR
-                                " = %" PRId64 " out of range or off-boundary"
-                                " (jumpTable at pc %u, codeLen %u)",
-                                i, (intptr_t)rel, tgt, pc, codeLen));
+                        int64_t tgt = (int64_t)pc + rel;
+                        if (tgt < 0 || tgt >= (int64_t)codeLen || !boundary[tgt])
+                        {
+                            Tcl_SetObjResult(ip,
+                                             Tcl_ObjPrintf("tbcx: jump-table aux %u: target pc+%" PRIdPTR " = %" PRId64
+                                                           " out of range or off-boundary"
+                                                           " (jumpTable at pc %u, codeLen %u)",
+                                                           i,
+                                                           (intptr_t)rel,
+                                                           tgt,
+                                                           pc,
+                                                           codeLen));
                             Tcl_Free(boundary);
                             return TCL_ERROR;
                         }
@@ -5741,51 +6267,54 @@ static int ValidateBlockOperands(
 
     /* Aux records that carry local-variable indices are consumed without
        bounds checks by their opcodes. */
-    for (uint32_t i = 0; i < numAux; i++) {
-        if (auxArr[i].type == tbcxAuxDictUpdate) {
-            DictUpdateInfo *info = (DictUpdateInfo *)auxArr[i].clientData;
-            if (!info || info->length < 0) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: invalid dict-update aux %u", i));
+    for (uint32_t i = 0; i < numAux; i++)
+    {
+        if (auxArr[i].type == tbcxAuxDictUpdate)
+        {
+            DictUpdateInfo* info = (DictUpdateInfo*)auxArr[i].clientData;
+            if (!info || info->length < 0)
+            {
+                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid dict-update aux %u", i));
                 Tcl_Free(boundary);
                 return TCL_ERROR;
             }
-            for (Tcl_Size k = 0; k < info->length; k++) {
-                if (info->varIndices[k] < 0 ||
-                    (uint64_t)info->varIndices[k] >= numLocals) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: dict-update aux %u has invalid local index", i));
+            for (Tcl_Size k = 0; k < info->length; k++)
+            {
+                if (info->varIndices[k] < 0 || (uint64_t)info->varIndices[k] >= numLocals)
+                {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: dict-update aux %u has invalid local index", i));
                     Tcl_Free(boundary);
                     return TCL_ERROR;
                 }
             }
-        } else if (auxArr[i].type == tbcxAuxNewForeach) {
-            ForeachInfo *info = (ForeachInfo *)auxArr[i].clientData;
+        }
+        else if (auxArr[i].type == tbcxAuxNewForeach)
+        {
+            ForeachInfo* info = (ForeachInfo*)auxArr[i].clientData;
             /* Tcl 9.1 newForeachInfoType leaves firstValueTemp unused and
                repurposes loopCtTemp as the negative jump from foreach_step
                to the loop body.  They are not local-variable indices. */
             int64_t jump = info ? (int64_t)info->loopCtTemp : 0;
-            if (!info || info->numLists <= 0 ||
-                info->firstValueTemp != 0 || jump >= 0 ||
-                -jump > (int64_t)codeLen) {
-                Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                    "tbcx: invalid foreach aux %u metadata", i));
+            if (!info || info->numLists <= 0 || info->firstValueTemp != 0 || jump >= 0 || -jump > (int64_t)codeLen)
+            {
+                Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid foreach aux %u metadata", i));
                 Tcl_Free(boundary);
                 return TCL_ERROR;
             }
-            for (Tcl_Size list = 0; list < info->numLists; list++) {
-                ForeachVarList *vars = info->varLists[list];
-                if (!vars || vars->numVars < 0) {
-                    Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                        "tbcx: invalid foreach aux %u variable list", i));
+            for (Tcl_Size list = 0; list < info->numLists; list++)
+            {
+                ForeachVarList* vars = info->varLists[list];
+                if (!vars || vars->numVars < 0)
+                {
+                    Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: invalid foreach aux %u variable list", i));
                     Tcl_Free(boundary);
                     return TCL_ERROR;
                 }
-                for (Tcl_Size k = 0; k < vars->numVars; k++) {
-                    if (vars->varIndexes[k] < 0 ||
-                        (uint64_t)vars->varIndexes[k] >= numLocals) {
-                        Tcl_SetObjResult(ip, Tcl_ObjPrintf(
-                            "tbcx: foreach aux %u has invalid local index", i));
+                for (Tcl_Size k = 0; k < vars->numVars; k++)
+                {
+                    if (vars->varIndexes[k] < 0 || (uint64_t)vars->varIndexes[k] >= numLocals)
+                    {
+                        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: foreach aux %u has invalid local index", i));
                         Tcl_Free(boundary);
                         return TCL_ERROR;
                     }
@@ -5798,73 +6327,89 @@ static int ValidateBlockOperands(
     return TCL_OK;
 }
 
-Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
-                        Namespace *nsForDefault,
-                        uint32_t *numLocalsOut,
+Tcl_Obj* Tbcx_ReadBlock(TbcxIn* r,
+                        Tcl_Interp* ip,
+                        Namespace* nsForDefault,
+                        uint32_t* numLocalsOut,
                         int setPrecompiled,
                         int dumpOnly,
-                        uint32_t *topPolicyOut) {
+                        uint32_t* topPolicyOut)
+{
     /* 1) code */
     uint32_t codeLen = 0;
     if (!Tbcx_R_U32(r, &codeLen))
         return NULL;
-    if (codeLen > TBCX_MAX_CODE) {
+    if (codeLen > TBCX_MAX_CODE)
+    {
         R_Error(r, "tbcx: code too large");
         return NULL;
     }
-    unsigned char *code = (unsigned char *)Tcl_AttemptAlloc(codeLen ? codeLen : 1u);
-    if (!code) {
+    unsigned char* code = (unsigned char*)Tcl_AttemptAlloc(codeLen ? codeLen : 1u);
+    if (!code)
+    {
         R_Error(r, "tbcx: allocation failed (code)");
         return NULL;
     }
-    if (codeLen && !Tbcx_R_Bytes(r, code, codeLen)) {
-        Tcl_Free((char *)code);
+    if (codeLen && !Tbcx_R_Bytes(r, code, codeLen))
+    {
+        Tcl_Free((char*)code);
         return NULL;
     }
 
     /* 2) literals */
     uint32_t numLits = 0;
-    if (!Tbcx_R_U32(r, &numLits)) {
-        Tcl_Free((char *)code);
+    if (!Tbcx_R_U32(r, &numLits))
+    {
+        Tcl_Free((char*)code);
         return NULL;
     }
-    if (numLits > TBCX_MAX_LITERALS) {
+    if (numLits > TBCX_MAX_LITERALS)
+    {
         R_Error(r, "tbcx: too many literals");
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
     /* stack-allocate for small literal counts */
-    Tcl_Obj  *litStack[64];
-    Tcl_Obj **lits       = NULL;
-    int       litsOnHeap = 0;
-    if (numLits) {
-        if (numLits <= 64) {
+    Tcl_Obj* litStack[64];
+    Tcl_Obj** lits = NULL;
+    int litsOnHeap = 0;
+    if (numLits)
+    {
+        if (numLits <= 64)
+        {
             lits = litStack;
-        } else {
+        }
+        else
+        {
             size_t litBytes = 0;
-            if (!tbcx_checked_mul(sizeof(Tcl_Obj *), numLits, &litBytes)) {
+            if (!tbcx_checked_mul(sizeof(Tcl_Obj*), numLits, &litBytes))
+            {
                 R_Error(r, "tbcx: literal array size overflow");
-                Tcl_Free((char *)code);
+                Tcl_Free((char*)code);
                 return NULL;
             }
-            lits = (Tcl_Obj **)Tcl_AttemptAlloc(litBytes);
-            if (!lits) {
+            lits = (Tcl_Obj**)Tcl_AttemptAlloc(litBytes);
+            if (!lits)
+            {
                 R_Error(r, "tbcx: allocation failed (literals)");
-                Tcl_Free((char *)code);
+                Tcl_Free((char*)code);
                 return NULL;
             }
             litsOnHeap = 1;
         }
     }
-    for (uint32_t i = 0; i < numLits; i++) {
-        Tcl_Obj *lit = ReadLiteral(r, ip, 0, dumpOnly);
-        if (!lit) {
-            for (uint32_t j = 0; j < i; j++) {
+    for (uint32_t i = 0; i < numLits; i++)
+    {
+        Tcl_Obj* lit = ReadLiteral(r, ip, 0, dumpOnly);
+        if (!lit)
+        {
+            for (uint32_t j = 0; j < i; j++)
+            {
                 Tcl_DecrRefCount(lits[j]);
             }
             if (litsOnHeap)
                 Tcl_Free(lits);
-            Tcl_Free((char *)code);
+            Tcl_Free((char*)code);
             return NULL;
         }
         Tcl_IncrRefCount(lit); /* Protect immediately — refcount 0→1 */
@@ -5872,33 +6417,36 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
     }
 
     /* 3) AuxData */
-    AuxData *auxArr = NULL;
+    AuxData* auxArr = NULL;
     uint32_t numAux = 0;
-    if (!ReadAuxArray(r, &auxArr, &numAux)) {
+    if (!ReadAuxArray(r, &auxArr, &numAux))
+    {
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]); /* refcount 1→0, freed */
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
     /* 4) Exceptions */
-    ExceptionRange *exArr = NULL;
-    uint32_t        numEx = 0;
-    if (!ReadExceptions(r, &exArr, &numEx)) {
+    ExceptionRange* exArr = NULL;
+    uint32_t numEx = 0;
+    if (!ReadExceptions(r, &exArr, &numEx))
+    {
         FreeAuxArrayOwned(auxArr, numAux);
         for (uint32_t j = 0; j < numLits; j++)
             Tcl_DecrRefCount(lits[j]); /* refcount 1→0, freed */
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
     /* 5) Epilogue: maxStack, reserved, numLocals */
     uint32_t maxStack = 0, reserved = 0, numLocals = 0;
-    if (!Tbcx_R_U32(r, &maxStack) || !Tbcx_R_U32(r, &reserved) || !Tbcx_R_U32(r, &numLocals)) {
+    if (!Tbcx_R_U32(r, &maxStack) || !Tbcx_R_U32(r, &reserved) || !Tbcx_R_U32(r, &numLocals))
+    {
         if (exArr)
             Tcl_Free(exArr);
         FreeAuxArrayOwned(auxArr, numAux);
@@ -5906,28 +6454,34 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
             Tcl_DecrRefCount(lits[j]); /* refcount 1→0, freed */
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
-    if (topPolicyOut) {
-        if (Tbcx_ValidateBlockPolicy(ip, reserved) != TCL_OK) {
+    if (topPolicyOut)
+    {
+        if (Tbcx_ValidateBlockPolicy(ip, reserved) != TCL_OK)
+        {
             r->err = TCL_ERROR;
-        } else {
+        }
+        else
+        {
             *topPolicyOut = reserved;
-            if (r->sourcePolicy != reserved) {
-                Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                    "tbcx: preflight/materialization policy mismatch", -1));
+            if (r->sourcePolicy != reserved)
+            {
+                Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: preflight/materialization policy mismatch", -1));
                 Tcl_SetErrorCode(ip, "TBCX", "LOAD", "POLICY", NULL);
                 r->err = TCL_ERROR;
             }
         }
-    } else if (reserved != 0) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: nonzero nested block policy field", -1));
+    }
+    else if (reserved != 0)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: nonzero nested block policy field", -1));
         r->err = TCL_ERROR;
     }
-    if (r->err) {
+    if (r->err)
+    {
         if (exArr)
             Tcl_Free(exArr);
         FreeAuxArrayOwned(auxArr, numAux);
@@ -5935,14 +6489,15 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
     /* Hard caps on untrusted values from the .tbcx stream to prevent
      * huge allocations, integer wrap, or allocator panic.  These limits
      * are generous for legitimate bytecode but reject pathological inputs. */
-    if (maxStack > TBCX_MAX_STACK) {
+    if (maxStack > TBCX_MAX_STACK)
+    {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: maxStack %u exceeds limit %u", maxStack, TBCX_MAX_STACK));
         if (exArr)
             Tcl_Free(exArr);
@@ -5951,10 +6506,11 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
-    if (numLocals > TBCX_MAX_LOCALS) {
+    if (numLocals > TBCX_MAX_LOCALS)
+    {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: numLocals %u exceeds limit %u", numLocals, TBCX_MAX_LOCALS));
         if (exArr)
             Tcl_Free(exArr);
@@ -5963,7 +6519,7 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
@@ -5971,19 +6527,18 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
     Tcl_Time validationStart, validationEnd;
     Tcl_GetTime(&validationStart);
 #endif
-    int validationRc = ValidateBlockOperands(ip, code, codeLen, numLits,
-        numAux, numLocals, auxArr, exArr, numEx);
+    int validationRc = ValidateBlockOperands(ip, code, codeLen, numLits, numAux, numLocals, auxArr, exArr, numEx);
 #ifdef TBCX_BENCH_COUNTERS
     Tcl_GetTime(&validationEnd);
     int64_t validationElapsed =
-        (int64_t)(validationEnd.sec - validationStart.sec) * 1000000 +
-        (int64_t)(validationEnd.usec - validationStart.usec);
+        (int64_t)(validationEnd.sec - validationStart.sec) * 1000000 + (int64_t)(validationEnd.usec - validationStart.usec);
     TBCX_BENCH_INC(validationCalls);
     TBCX_BENCH_ADD(validationCodeBytes, codeLen);
     if (validationElapsed >= 0)
         TBCX_BENCH_ADD(validationMicros, (uint64_t)validationElapsed);
 #endif
-    if (validationRc != TCL_OK) {
+    if (validationRc != TCL_OK)
+    {
         if (exArr)
             Tcl_Free(exArr);
         FreeAuxArrayOwned(auxArr, numAux);
@@ -5991,22 +6546,27 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
             Tcl_DecrRefCount(lits[j]);
         if (litsOnHeap)
             Tcl_Free(lits);
-        Tcl_Free((char *)code);
+        Tcl_Free((char*)code);
         return NULL;
     }
 
     if (numLocalsOut)
         *numLocalsOut = numLocals;
 
-    Tcl_Obj  *nameObjsStack[64];
-    Tcl_Obj **nameObjs   = NULL;
-    int       nameOnHeap = 0;
-    if (numLocals > 0) {
-        if (numLocals <= 64) {
+    Tcl_Obj* nameObjsStack[64];
+    Tcl_Obj** nameObjs = NULL;
+    int nameOnHeap = 0;
+    if (numLocals > 0)
+    {
+        if (numLocals <= 64)
+        {
             nameObjs = nameObjsStack;
-        } else {
-            nameObjs = (Tcl_Obj **)Tcl_AttemptAlloc(sizeof(Tcl_Obj *) * (size_t)numLocals);
-            if (!nameObjs) {
+        }
+        else
+        {
+            nameObjs = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * (size_t)numLocals);
+            if (!nameObjs)
+            {
                 R_Error(r, "tbcx: allocation failed (local names)");
                 if (exArr)
                     Tcl_Free(exArr);
@@ -6015,16 +6575,19 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
                     Tcl_DecrRefCount(lits[j]);
                 if (litsOnHeap)
                     Tcl_Free(lits);
-                Tcl_Free((char *)code);
+                Tcl_Free((char*)code);
                 return NULL;
             }
             nameOnHeap = 1;
         }
-        for (uint32_t i = 0; i < numLocals; i++) {
-            char    *s   = NULL;
+        for (uint32_t i = 0; i < numLocals; i++)
+        {
+            char* s = NULL;
             uint32_t len = 0;
-            if (!Tbcx_R_LPString(r, &s, &len)) {
-                if (nameObjs) {
+            if (!Tbcx_R_LPString(r, &s, &len))
+            {
+                if (nameObjs)
+                {
                     for (uint32_t k = 0; k < i; k++)
                         Tcl_DecrRefCount(nameObjs[k]);
                     if (nameOnHeap)
@@ -6039,17 +6602,18 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
                     Tcl_DecrRefCount(lits[j]);
                 if (litsOnHeap)
                     Tcl_Free(lits);
-                Tcl_Free((char *)code);
+                Tcl_Free((char*)code);
                 return NULL;
             }
-            Tcl_Obj *o = Tcl_NewStringObj(s, (Tcl_Size)len);
+            Tcl_Obj* o = Tcl_NewStringObj(s, (Tcl_Size)len);
             Tcl_Free(s);
             nameObjs[i] = o; /* refcount 0 for now */
         }
     }
 
     /* Build bytecode object */
-    Tcl_Obj *bc = ByteCodeObj(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack, setPrecompiled);
+    Tcl_Obj* bc =
+        ByteCodeObj(ip, nsForDefault, code, codeLen, lits, numLits, auxArr, numAux, exArr, numEx, (int)maxStack, setPrecompiled);
 
     if (exArr)
         Tcl_Free(exArr);
@@ -6059,10 +6623,13 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
      * ByteCode will call each aux type's freeProc at destruction time.
      * On failure no ownership transferred; deep-free the payloads here
      * to avoid leaking them. */
-    if (bc) {
+    if (bc)
+    {
         if (auxArr)
             Tcl_Free(auxArr);
-    } else {
+    }
+    else
+    {
         FreeAuxArrayOwned(auxArr, numAux);
     }
     /* Drop our protective refcount on literals — ByteCodeObj has its own */
@@ -6073,15 +6640,21 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
     if (code)
         Tcl_Free(code);
 
-    if (bc && numLocals > 0 && nameObjs) {
-        ByteCode *bcPtr = NULL;
-        bcPtr           = TbcxGetByteCode(bc);
-        if (bcPtr) {
+    if (bc && numLocals > 0 && nameObjs)
+    {
+        ByteCode* bcPtr = NULL;
+        bcPtr = TbcxGetByteCode(bc);
+        if (bcPtr)
+        {
             size_t varBytes = 0;
-            if (!tbcx_checked_mul((size_t)numLocals, sizeof(Tcl_Obj *), &varBytes) || varBytes > SIZE_MAX - offsetof(LocalCache, varName0)) {
+            if (!tbcx_checked_mul((size_t)numLocals, sizeof(Tcl_Obj*), &varBytes) ||
+                varBytes > SIZE_MAX - offsetof(LocalCache, varName0))
+            {
                 R_Error(r, "tbcx: local cache size overflow");
-                for (uint32_t k = 0; k < numLocals; k++) {
-                    if (nameObjs[k]) {
+                for (uint32_t k = 0; k < numLocals; k++)
+                {
+                    if (nameObjs[k])
+                    {
                         Tcl_IncrRefCount(nameObjs[k]);
                         Tcl_DecrRefCount(nameObjs[k]);
                     }
@@ -6092,13 +6665,16 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
                 Tcl_DecrRefCount(bc);
                 return NULL;
             }
-            size_t      bytes = offsetof(LocalCache, varName0) + varBytes;
-            LocalCache *lc    = (LocalCache *)Tcl_AttemptAlloc(bytes);
-            if (!lc) {
+            size_t bytes = offsetof(LocalCache, varName0) + varBytes;
+            LocalCache* lc = (LocalCache*)Tcl_AttemptAlloc(bytes);
+            if (!lc)
+            {
                 R_Error(r, "tbcx: allocation failed (local cache)");
                 /* Bounce refcount-0 nameObjs */
-                for (uint32_t k = 0; k < numLocals; k++) {
-                    if (nameObjs[k]) {
+                for (uint32_t k = 0; k < numLocals; k++)
+                {
+                    if (nameObjs[k])
+                    {
                         Tcl_IncrRefCount(nameObjs[k]);
                         Tcl_DecrRefCount(nameObjs[k]);
                     }
@@ -6110,19 +6686,24 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
                 Tcl_DecrRefCount(bc);
                 return NULL;
             }
-            lc->refCount  = 1;
-            lc->numVars   = (Tcl_Size)numLocals;
-            Tcl_Obj **dst = (Tcl_Obj **)&lc->varName0;
-            for (uint32_t i = 0; i < numLocals; i++) {
+            lc->refCount = 1;
+            lc->numVars = (Tcl_Size)numLocals;
+            Tcl_Obj** dst = (Tcl_Obj**)&lc->varName0;
+            for (uint32_t i = 0; i < numLocals; i++)
+            {
                 dst[i] = nameObjs[i];
                 Tcl_IncrRefCount(dst[i]);
             }
             bcPtr->localCachePtr = lc;
-        } else {
+        }
+        else
+        {
             /* bcPtr is NULL — nameObjs entries are at refcount 0 and
                will not be transferred to a LocalCache.  Release them. */
-            for (uint32_t i = 0; i < numLocals; i++) {
-                if (nameObjs[i]) {
+            for (uint32_t i = 0; i < numLocals; i++)
+            {
+                if (nameObjs[i])
+                {
                     Tcl_IncrRefCount(nameObjs[i]);
                     Tcl_DecrRefCount(nameObjs[i]);
                 }
@@ -6130,11 +6711,15 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
         }
         if (nameOnHeap)
             Tcl_Free(nameObjs);
-    } else if (numLocals > 0 && nameObjs) {
+    }
+    else if (numLocals > 0 && nameObjs)
+    {
         /* bc is NULL — ByteCodeObj failed.  Release the refcount-0
            nameObjs entries and free the heap array to avoid leaks. */
-        for (uint32_t i = 0; i < numLocals; i++) {
-            if (nameObjs[i]) {
+        for (uint32_t i = 0; i < numLocals; i++)
+        {
+            if (nameObjs[i])
+            {
                 Tcl_IncrRefCount(nameObjs[i]);
                 Tcl_DecrRefCount(nameObjs[i]);
             }
@@ -6158,70 +6743,83 @@ Tcl_Obj *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip,
  * lets the shim verify and refresh the installed precompiled Proc before the
  * top-level load continues. */
 
-static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+static int CmdProcShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    ProcShim *ps = (ProcShim *)cd;
+    ProcShim* ps = (ProcShim*)cd;
 
-    if (objc != 4) {
+    if (objc != 4)
+    {
         /* Forward to the original "proc" handler (synchronous entry). */
         return ps->savedObjProc2(ps->savedClientData2, ip, objc, objv);
     }
 
-    Tcl_Obj    *nameObj = objv[1], *argsObj = objv[2];
-    const char *nm  = Tbcx_GetStringSafe(nameObj);
-    Tcl_Obj    *fqn = NULL;
-    if (nm[0] == ':' && nm[1] == ':') {
+    Tcl_Obj *nameObj = objv[1], *argsObj = objv[2];
+    const char* nm = Tbcx_GetStringSafe(nameObj);
+    Tcl_Obj* fqn = NULL;
+    if (nm[0] == ':' && nm[1] == ':')
+    {
         fqn = nameObj;
-    } else {
-        Tcl_Namespace *cur     = Tcl_GetCurrentNamespace(ip);
-        const char    *curName = cur ? cur->fullName : "::";
-        fqn                    = Tcl_NewStringObj(curName, -1);
+    }
+    else
+    {
+        Tcl_Namespace* cur = Tcl_GetCurrentNamespace(ip);
+        const char* curName = cur ? cur->fullName : "::";
+        fqn = Tcl_NewStringObj(curName, -1);
         Tcl_IncrRefCount(fqn); /* own one ref so DecrRefCount on exit is safe */
-        if (!(curName[0] == ':' && curName[1] == ':' && curName[2] == '\0')) {
+        if (!(curName[0] == ':' && curName[1] == ':' && curName[2] == '\0'))
+        {
             Tcl_AppendToObj(fqn, "::", 2);
         }
         Tcl_AppendObjToObj(fqn, nameObj);
     }
 
-    Tcl_HashEntry *he         = Tcl_FindHashEntry(&ps->procsByFqn, Tcl_GetString(fqn));
+    Tcl_HashEntry* he = Tcl_FindHashEntry(&ps->procsByFqn, Tcl_GetString(fqn));
 
     /* Indexed marker override: if the body argument starts with
        TBCX_PROC_MARKER_PFX, use the encoded index to select the
        pair directly from procsByIdx.  This handles conflicting
        proc definitions across if/else branches, where the same
        FQN appears multiple times with different compiled bodies. */
-    Tcl_Obj       *markerPair = NULL;
+    Tcl_Obj* markerPair = NULL;
     {
-        Tcl_Size    bLen = 0;
-        const char *bStr = Tbcx_GetStringFromObjSafe(objv[3], &bLen);
-        if (bLen >= TBCX_PROC_MARKER_PFX_LEN && memcmp(bStr, TBCX_PROC_MARKER_PFX, TBCX_PROC_MARKER_PFX_LEN) == 0 && ps->procsByIdx) {
+        Tcl_Size bLen = 0;
+        const char* bStr = Tbcx_GetStringFromObjSafe(objv[3], &bLen);
+        if (bLen >= TBCX_PROC_MARKER_PFX_LEN && memcmp(bStr, TBCX_PROC_MARKER_PFX, TBCX_PROC_MARKER_PFX_LEN) == 0 &&
+            ps->procsByIdx)
+        {
             /* Parse decimal index after the prefix */
-            unsigned    idx      = 0;
-            const char *dp       = bStr + TBCX_PROC_MARKER_PFX_LEN;
-            int         hasDigit = 0;
-            while (*dp >= '0' && *dp <= '9') {
+            unsigned idx = 0;
+            const char* dp = bStr + TBCX_PROC_MARKER_PFX_LEN;
+            int hasDigit = 0;
+            while (*dp >= '0' && *dp <= '9')
+            {
                 idx = idx * 10u + (unsigned)(*dp - '0');
                 dp++;
                 hasDigit = 1;
             }
-            if (hasDigit && *dp == '\0' && idx < ps->numProcsIdx && ps->procsByIdx[idx]) {
+            if (hasDigit && *dp == '\0' && idx < ps->numProcsIdx && ps->procsByIdx[idx])
+            {
                 markerPair = ps->procsByIdx[idx];
             }
         }
     }
 
-    if (he || markerPair) {
-        Tcl_Obj *pair      = markerPair ? markerPair : (Tcl_Obj *)Tcl_GetHashValue(he);
+    if (he || markerPair)
+    {
+        Tcl_Obj* pair = markerPair ? markerPair : (Tcl_Obj*)Tcl_GetHashValue(he);
         Tcl_Obj *savedArgs = NULL, *procBody = NULL;
         {
-            Tcl_Size  pairLen   = 0;
-            Tcl_Obj **pairElems = NULL;
-            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) == TCL_OK && pairLen >= 2) {
+            Tcl_Size pairLen = 0;
+            Tcl_Obj** pairElems = NULL;
+            if (Tcl_ListObjGetElements(ip, pair, &pairLen, &pairElems) == TCL_OK && pairLen >= 2)
+            {
                 savedArgs = pairElems[0];
-                procBody  = pairElems[1];
+                procBody = pairElems[1];
             }
         }
-        if (savedArgs && procBody) {
+        if (savedArgs && procBody)
+        {
             Tcl_Size _d = 0;
             /* Force list-shimmering for canonical string rep before
                byte-wise comparison; if conversion fails, clear the interp
@@ -6230,15 +6828,17 @@ static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const o
                 Tcl_ResetResult(ip);
             if (Tcl_ListObjLength(ip, savedArgs, &_d) != TCL_OK)
                 Tcl_ResetResult(ip);
-            Tcl_Size    aLen = 0, bLen = 0;
-            const char *a = Tbcx_GetStringFromObjSafe(argsObj, &aLen);
-            const char *b = Tbcx_GetStringFromObjSafe(savedArgs, &bLen);
+            Tcl_Size aLen = 0, bLen = 0;
+            const char* a = Tbcx_GetStringFromObjSafe(argsObj, &aLen);
+            const char* b = Tbcx_GetStringFromObjSafe(savedArgs, &bLen);
 
-            if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0) {
+            if (aLen == bLen && memcmp(a, b, (size_t)aLen) == 0)
+            {
                 /* Get our precompiled Proc from the registry. */
-                const Tcl_ObjInternalRep *pbIR    = Tcl_FetchInternalRep(procBody, tbcxTyProcBody);
-                Proc                     *preProc = pbIR ? (Proc *)pbIR->twoPtrValue.ptr1 : NULL;
-                if (!preProc || !preProc->bodyPtr) {
+                const Tcl_ObjInternalRep* pbIR = Tcl_FetchInternalRep(procBody, tbcxTyProcBody);
+                Proc* preProc = pbIR ? (Proc*)pbIR->twoPtrValue.ptr1 : NULL;
+                if (!preProc || !preProc->bodyPtr)
+                {
                     if (fqn != nameObj)
                         Tcl_DecrRefCount(fqn);
                     return ps->savedObjProc2(ps->savedClientData2, ip, objc, objv);
@@ -6254,38 +6854,38 @@ static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const o
                  * replacement, command traces, namespace/export/import
                  * behavior, TIP 280 bookkeeping, and standard dispatch. */
                 {
-                    Tcl_Obj *callv[4] = {objv[0], objv[1], objv[2], procBody};
+                    Tcl_Obj* callv[4] = {objv[0], objv[1], objv[2], procBody};
                     Tcl_IncrRefCount(procBody);
                     TBCX_BENCH_INC(ordinaryProcMarkerInstalls);
-                    int rc = ps->savedObjProc2(ps->savedClientData2, ip,
-                                               objc, callv);
+                    int rc = ps->savedObjProc2(ps->savedClientData2, ip, objc, callv);
                     Tcl_DecrRefCount(procBody);
-                    if (rc != TCL_OK) {
+                    if (rc != TCL_OK)
+                    {
                         if (fqn != nameObj)
                             Tcl_DecrRefCount(fqn);
                         return rc;
                     }
                     Tcl_Command cmd = Tcl_FindCommand(ip, Tbcx_GetStringSafe(fqn), NULL, TCL_GLOBAL_ONLY);
-                    if (!cmd) {
+                    if (!cmd)
+                    {
                         if (fqn != nameObj)
                             Tcl_DecrRefCount(fqn);
                         return rc;
                     }
-                    Command *cmdPtr  = (Command *)cmd;
-                    Proc    *installedProc = (Proc *)cmdPtr->objClientData2;
-                    if (installedProc != preProc) {
-                        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                            "tbcx: Tcl did not install the precompiled procedure body",
-                            -1));
+                    Command* cmdPtr = (Command*)cmd;
+                    Proc* installedProc = (Proc*)cmdPtr->objClientData2;
+                    if (installedProc != preProc)
+                    {
+                        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: Tcl did not install the precompiled procedure body", -1));
                         if (fqn != nameObj)
                             Tcl_DecrRefCount(fqn);
                         return TCL_ERROR;
                     }
                     {
-                        ByteCode *bc = TbcxGetByteCode(preProc->bodyPtr);
-                        if (bc) {
-                            TbcxFixupByteCode(bc, preProc, ip, cmdPtr->nsPtr,
-                                              TBCX_FIXUP_CACHE_NONE);
+                        ByteCode* bc = TbcxGetByteCode(preProc->bodyPtr);
+                        if (bc)
+                        {
+                            TbcxFixupByteCode(bc, preProc, ip, cmdPtr->nsPtr, TBCX_FIXUP_CACHE_NONE);
                         }
                     }
 
@@ -6304,51 +6904,32 @@ static int CmdProcShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const o
     return rc;
 }
 
-/* ProcCmdDeleteTrace — called when the "proc" command is renamed or deleted.
- *
- * The DELETE case is simple: the Command struct is about to be freed; we
- * just null our cached pointer so DelProcShim skips the restore.
- *
- * The RENAME case is subtler and is a use-after-return hazard:
- * Tcl keeps the Command struct alive across a rename (it just re-keys the
- * hash-table entry).  The struct's objProc2 field still holds
- * CmdProcShim, and its objClientData2 still points at *our* ProcShim —
- * which is stack-allocated inside LoadTbcxStream and disappears when
- * LoadTbcxStream returns.
- *
- * Nulling only ps->procCmdPtr here would make DelProcShim see the NULL
- * and skip the in-place restore.  The renamed command would then be left
- * with a dangling clientData pointer; invoking it after tbcx::load
- * returns produces a stack-use-after-return that typically crashes with
- * "called Tcl_FindHashEntry on deleted table / illegal instruction" or
- * worse.
- *
- * The correct RENAME handling is to do the in-place restore *now*,
- * while ps->procCmdPtr is still valid, and THEN null it so DelProcShim
- * knows the work is done. */
-static void ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
-    ProcShim *ps = (ProcShim *)cd;
+/* Restore a renamed proc command while its Command struct is live, then clear
+ * the shim's cached pointer. Deletion only clears the cached pointer. */
+static void ProcCmdDeleteTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags)
+{
+    ProcShim* ps = (ProcShim*)cd;
     (void)oldName;
-    if (flags & TCL_TRACE_RENAME) {
-        /* Restore original handlers while the Command struct is still
-         * accessible — the rename keeps the struct alive but moves it
-         * to a new name, and our shim's client data (ps) is about to
-         * become invalid once LoadTbcxStream returns. */
-        if (ps->procCmdPtr) {
-            ps->procCmdPtr->objProc2       = ps->savedObjProc2;
+    if (flags & TCL_TRACE_RENAME)
+    {
+        /* A renamed command retains its Command struct and handlers. */
+        if (ps->procCmdPtr)
+        {
+            ps->procCmdPtr->objProc2 = ps->savedObjProc2;
             ps->procCmdPtr->objClientData2 = ps->savedClientData2;
-            if (ps->savedNreProc2) {
+            if (ps->savedNreProc2)
+            {
                 ps->procCmdPtr->nreProc2 = ps->savedNreProc2;
             }
         }
-        if (ps->traceInstalled && newName && newName[0]) {
-            Tcl_UntraceCommand(interp, newName,
-                TCL_TRACE_RENAME | TCL_TRACE_DELETE,
-                ProcCmdDeleteTrace, ps);
+        if (ps->traceInstalled && newName && newName[0])
+        {
+            Tcl_UntraceCommand(interp, newName, TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps);
         }
     }
-    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
-        ps->procCmdPtr     = NULL;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE))
+    {
+        ps->procCmdPtr = NULL;
         ps->traceInstalled = 0; /* trace auto-removed on delete */
     }
 }
@@ -6360,31 +6941,31 @@ static void ProcCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName
  *   Tcl_TraceCommand, both of which may acquire Tcl-internal mutexes.
  *   No TBCX mutex is held during this call.  Callers must ensure this
  *   function is only called from the interp-owning thread. */
-static int AddProcShim(Tcl_Interp *ip, ProcShim *ps) {
+static int AddProcShim(Tcl_Interp* ip, ProcShim* ps)
+{
     memset(ps, 0, sizeof(*ps));
     Tcl_InitHashTable(&ps->procsByFqn, TCL_STRING_KEYS);
 
     Tcl_Command token = Tcl_FindCommand(ip, "proc", NULL, 0);
-    if (!token) {
+    if (!token)
+    {
         Tcl_DeleteHashTable(&ps->procsByFqn);
         return TCL_ERROR;
     }
 
-    ps->interp           = ip;
-    ps->procCmdPtr       = (Command *)token;
-    ps->savedObjProc2    = ps->procCmdPtr->objProc2;
-    ps->savedNreProc2    = ps->procCmdPtr->nreProc2;
+    ps->interp = ip;
+    ps->procCmdPtr = (Command*)token;
+    ps->savedObjProc2 = ps->procCmdPtr->objProc2;
+    ps->savedNreProc2 = ps->procCmdPtr->nreProc2;
     ps->savedClientData2 = ps->procCmdPtr->objClientData2;
 
-    /* Install a command trace so we know if "proc" is renamed or deleted
-       while the loaded script is executing.
-       Defensive: FindCommand above guarantees "proc" exists, so this
-       cannot fail in single-threaded use, but check anyway. */
-    if (Tcl_TraceCommand(ip, "proc", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps) != TCL_OK) {
+    /* Track rename and deletion while the loaded script executes. */
+    if (Tcl_TraceCommand(ip, "proc", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps) != TCL_OK)
+    {
         Tcl_DeleteHashTable(&ps->procsByFqn);
         return TCL_ERROR;
     }
-    ps->traceInstalled             = 1;
+    ps->traceInstalled = 1;
 
     /* Intercept BOTH objProc2 AND nreProc2.
        Tcl 9.1's "proc" is registered via Tcl_NRCreateCommand, which
@@ -6396,47 +6977,55 @@ static int AddProcShim(Tcl_Interp *ip, ProcShim *ps) {
        proc's handler (TclNRProcObjCmd) creates the proc synchronously
        and does NOT enqueue NRE callbacks, so it is safe for our shim
        to call it directly and verify/fix the installed procbody afterward. */
-    ps->procCmdPtr->objProc2       = CmdProcShim;
+    ps->procCmdPtr->objProc2 = CmdProcShim;
     ps->procCmdPtr->objClientData2 = ps;
-    if (ps->procCmdPtr->nreProc2) {
+    if (ps->procCmdPtr->nreProc2)
+    {
         ps->procCmdPtr->nreProc2 = CmdProcShim;
     }
 
     return TCL_OK;
 }
 
-static void DelProcShim(Tcl_Interp *ip, ProcShim *ps) {
+static void DelProcShim(Tcl_Interp* ip, ProcShim* ps)
+{
     /* Remove command trace before attempting any restore.
        If the command was already deleted, the trace fired and set
        procCmdPtr = NULL and traceInstalled = 0. */
-    if (ps->traceInstalled) {
+    if (ps->traceInstalled)
+    {
         Tcl_UntraceCommand(ip, "proc", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ProcCmdDeleteTrace, ps);
         ps->traceInstalled = 0;
     }
 
     /* Only restore handlers if the Command struct is still alive. */
-    if (ps->procCmdPtr) {
-        ps->procCmdPtr->objProc2       = ps->savedObjProc2;
+    if (ps->procCmdPtr)
+    {
+        ps->procCmdPtr->objProc2 = ps->savedObjProc2;
         ps->procCmdPtr->objClientData2 = ps->savedClientData2;
-        if (ps->savedNreProc2) {
+        if (ps->savedNreProc2)
+        {
             ps->procCmdPtr->nreProc2 = ps->savedNreProc2;
         }
     }
     Tcl_HashSearch s;
-    Tcl_HashEntry *e;
-    for (e = Tcl_FirstHashEntry(&ps->procsByFqn, &s); e; e = Tcl_NextHashEntry(&s)) {
-        Tcl_Obj *val = (Tcl_Obj *)Tcl_GetHashValue(e);
+    Tcl_HashEntry* e;
+    for (e = Tcl_FirstHashEntry(&ps->procsByFqn, &s); e; e = Tcl_NextHashEntry(&s))
+    {
+        Tcl_Obj* val = (Tcl_Obj*)Tcl_GetHashValue(e);
         if (val)
             Tcl_DecrRefCount(val);
     }
     Tcl_DeleteHashTable(&ps->procsByFqn);
     /* Free indexed array */
-    if (ps->procsByIdx) {
-        for (uint32_t i = 0; i < ps->numProcsIdx; i++) {
+    if (ps->procsByIdx)
+    {
+        for (uint32_t i = 0; i < ps->numProcsIdx; i++)
+        {
             if (ps->procsByIdx[i])
                 Tcl_DecrRefCount(ps->procsByIdx[i]);
         }
-        Tcl_Free((char *)ps->procsByIdx);
+        Tcl_Free((char*)ps->procsByIdx);
         ps->procsByIdx = NULL;
     }
 }
@@ -6444,10 +7033,8 @@ static void DelProcShim(Tcl_Interp *ip, ProcShim *ps) {
 /* ==========================================================================
  * ApplyShim — persistent [apply] interceptor for shimmer-proof lambdas
  *
- * Unlike ProcShim/OOShim which are scoped to LoadTbcxStream, ApplyShim
- * persists for the interpreter's lifetime via Tcl_SetAssocData.  This is
- * necessary because precompiled lambdas may be called from procs long
- * after tbcx::load returns.
+ * ApplyShim persists for the interpreter's lifetime via Tcl_SetAssocData and
+ * covers registered precompiled lambdas after tbcx::load returns.
  *
  * Fast path (no shimmer): apply sees lambdaExpr internal rep → uses it.
  *   The shim just forwards to the original handler.  Cost: one
@@ -6458,19 +7045,23 @@ static void DelProcShim(Tcl_Interp *ip, ProcShim *ps) {
  *   the precompiled Proc*, then forwards.
  * ========================================================================== */
 
-static int CmdApplyShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+static int CmdApplyShim(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    ApplyShim *as = (ApplyShim *)cd;
+    ApplyShim* as = (ApplyShim*)cd;
 
-    if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda) {
-        Tcl_Obj *lambda = objv[1];
+    if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda)
+    {
+        Tcl_Obj* lambda = objv[1];
 
         /* Fast path: lambdaExpr internal rep is still present — Tcl handles it */
-        if (!Tcl_FetchInternalRep(lambda, tbcxTyLambda)) {
+        if (!Tcl_FetchInternalRep(lambda, tbcxTyLambda))
+        {
             /* lambdaExpr rep missing (shimmer happened) — try to recover */
-            Tcl_HashEntry *he = Tcl_FindHashEntry(&as->lambdaRegistry, (const char *)lambda);
-            if (he) {
-                ApplyLambdaEntry  *le = (ApplyLambdaEntry *)Tcl_GetHashValue(he);
+            Tcl_HashEntry* he = Tcl_FindHashEntry(&as->lambdaRegistry, (const char*)lambda);
+            if (he)
+            {
+                ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_GetHashValue(he);
                 /* Re-install the precompiled lambdaExpr internal rep */
                 Tcl_ObjInternalRep ir;
                 ir.twoPtrValue.ptr1 = le->procPtr;
@@ -6491,17 +7082,21 @@ static int CmdApplyShim(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const 
  * Identical shimmer-recovery logic, but dispatches through the
  * original savedApplyNre so that the NRE trampoline is preserved
  * for deeply recursive lambda calls. */
-static int CmdApplyShimNre(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *const objv[]) {
+static int CmdApplyShimNre(void* cd, Tcl_Interp* ip, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    ApplyShim *as = (ApplyShim *)cd;
+    ApplyShim* as = (ApplyShim*)cd;
 
-    if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda) {
-        Tcl_Obj *lambda = objv[1];
+    if (as->numRegistered > 0 && objc >= 2 && tbcxTyLambda)
+    {
+        Tcl_Obj* lambda = objv[1];
 
-        if (!Tcl_FetchInternalRep(lambda, tbcxTyLambda)) {
-            Tcl_HashEntry *he = Tcl_FindHashEntry(&as->lambdaRegistry, (const char *)lambda);
-            if (he) {
-                ApplyLambdaEntry  *le = (ApplyLambdaEntry *)Tcl_GetHashValue(he);
+        if (!Tcl_FetchInternalRep(lambda, tbcxTyLambda))
+        {
+            Tcl_HashEntry* he = Tcl_FindHashEntry(&as->lambdaRegistry, (const char*)lambda);
+            if (he)
+            {
+                ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_GetHashValue(he);
                 Tcl_ObjInternalRep ir;
                 ir.twoPtrValue.ptr1 = le->procPtr;
                 ir.twoPtrValue.ptr2 = le->nsObj;
@@ -6515,44 +7110,33 @@ static int CmdApplyShimNre(void *cd, Tcl_Interp *ip, Tcl_Size objc, Tcl_Obj *con
     return as->savedApplyNre(as->savedApplyCD, ip, objc, objv);
 }
 
-/* ApplyCmdDeleteTrace — called when the "apply" command is renamed or deleted.
- * Invalidates the cached Command* to prevent stale-pointer writes in
- * ApplyShimTeardown.  Without this trace, if "apply" is deleted or renamed
- * before interpreter destruction, ApplyShimTeardown would write through a
- * freed Command struct (use-after-free / process crash). */
-static void ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldName, const char *newName, int flags) {
-    ApplyShim *as = (ApplyShim *)cd;
+/* Restore a renamed apply command and clear the shim's cached pointer on
+ * rename or deletion. */
+static void ApplyCmdDeleteTrace(void* cd, Tcl_Interp* interp, const char* oldName, const char* newName, int flags)
+{
+    ApplyShim* as = (ApplyShim*)cd;
     (void)oldName;
-    if (flags & TCL_TRACE_RENAME) {
-        /* Same in-place restore pattern as ProcCmdDeleteTrace: the
-         * Command struct survives the rename and must be restored
-         * while we still have a valid pointer to it.  ApplyShim is
-         * heap-allocated in TbcxInterpState (unlike ProcShim/OOShim
-         * which are stack-allocated in LoadTbcxStream), so the
-         * UAF severity here is lower — the worst case is the
-         * renamed command continuing to dispatch through CmdApplyShim
-         * with *stale but live* state.  Restoring the handlers here
-         * also stops the shim from intercepting calls to the renamed
-         * command, which matches the user's intent when they rename
-         * [apply]. */
-        if (as->applyCmdPtr) {
-            as->applyCmdPtr->objProc2       = as->savedApplyProc;
+    if (flags & TCL_TRACE_RENAME)
+    {
+        /* A renamed command retains its Command struct and handlers. */
+        if (as->applyCmdPtr)
+        {
+            as->applyCmdPtr->objProc2 = as->savedApplyProc;
             as->applyCmdPtr->objClientData2 = as->savedApplyCD;
-            if (as->savedApplyNre) {
+            if (as->savedApplyNre)
+            {
                 as->applyCmdPtr->nreProc2 = as->savedApplyNre;
             }
         }
-        /* Command traces follow a renamed command.  Detach this one from the
-           new name so a later reinstall can trace the replacement [apply]
-           without leaving stale callbacks on the renamed command. */
-        if (as->traceInstalled && newName && newName[0]) {
-            Tcl_UntraceCommand(interp, newName,
-                TCL_TRACE_RENAME | TCL_TRACE_DELETE,
-                ApplyCmdDeleteTrace, as);
+        /* Command traces follow a renamed command; detach from its new name. */
+        if (as->traceInstalled && newName && newName[0])
+        {
+            Tcl_UntraceCommand(interp, newName, TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as);
         }
     }
-    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE)) {
-        as->applyCmdPtr    = NULL;
+    if (flags & (TCL_TRACE_RENAME | TCL_TRACE_DELETE))
+    {
+        as->applyCmdPtr = NULL;
         as->traceInstalled = 0; /* trace auto-removed on delete */
     }
 }
@@ -6561,36 +7145,43 @@ static void ApplyCmdDeleteTrace(void *cd, Tcl_Interp *interp, const char *oldNam
  * original command handlers, free registry entries and hash table).
  * Does NOT free the ApplyShim struct itself — it is embedded in
  * TbcxInterpState and freed by TbcxInterpStateCleanup. */
-static void ApplyShimTeardown(ApplyShim *as, Tcl_Interp *ip) {
+static void ApplyShimTeardown(ApplyShim* as, Tcl_Interp* ip)
+{
     /* Remove command trace before attempting any restore.
        If the command was already deleted, the trace fired and set
        applyCmdPtr = NULL and traceInstalled = 0. */
-    if (as->traceInstalled) {
+    if (as->traceInstalled)
+    {
         Tcl_UntraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as);
         as->traceInstalled = 0;
     }
 
     /* Only restore original [apply] handlers if the Command struct is still alive */
-    if (as->applyCmdPtr) {
-        as->applyCmdPtr->objProc2       = as->savedApplyProc;
+    if (as->applyCmdPtr)
+    {
+        as->applyCmdPtr->objProc2 = as->savedApplyProc;
         as->applyCmdPtr->objClientData2 = as->savedApplyCD;
-        if (as->savedApplyNre) {
+        if (as->savedApplyNre)
+        {
             as->applyCmdPtr->nreProc2 = as->savedApplyNre;
         }
     }
 
     /* Free registry entries */
     Tcl_HashSearch s;
-    Tcl_HashEntry *e;
-    for (e = Tcl_FirstHashEntry(&as->lambdaRegistry, &s); e; e = Tcl_NextHashEntry(&s)) {
+    Tcl_HashEntry* e;
+    for (e = Tcl_FirstHashEntry(&as->lambdaRegistry, &s); e; e = Tcl_NextHashEntry(&s))
+    {
         /* Release the lambda reference held by RegisterPrecompiledLambda */
-        Tcl_Obj *lambdaKey = (Tcl_Obj *)Tcl_GetHashKey(&as->lambdaRegistry, e);
+        Tcl_Obj* lambdaKey = (Tcl_Obj*)Tcl_GetHashKey(&as->lambdaRegistry, e);
         if (lambdaKey)
             Tcl_DecrRefCount(lambdaKey);
 
-        ApplyLambdaEntry *le = (ApplyLambdaEntry *)Tcl_GetHashValue(e);
-        if (le) {
-            if (le->procPtr && --le->procPtr->refCount <= 0) {
+        ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_GetHashValue(e);
+        if (le)
+        {
+            if (le->procPtr && --le->procPtr->refCount <= 0)
+            {
                 TclProcCleanupProc(le->procPtr);
             }
             if (le->nsObj)
@@ -6604,12 +7195,16 @@ static void ApplyShimTeardown(ApplyShim *as, Tcl_Interp *ip) {
 /* TbcxInterpStateCleanup — Tcl_SetAssocData delete callback.
  * Called when the interpreter is being destroyed.  Tears down the
  * apply shim (if active) and frees the consolidated state struct. */
-static void TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip) {
-    TbcxInterpState *st = (TbcxInterpState *)cd;
-    if (st->applyActive) {
+static void TbcxInterpStateCleanup(void* cd, Tcl_Interp* ip)
+{
+    TbcxInterpState* st = (TbcxInterpState*)cd;
+    if (st->applyActive)
+    {
         ApplyShimTeardown(&st->apply, ip);
         st->applyActive = 0;
-    } else {
+    }
+    else
+    {
         /* Hash table was initialized in TbcxGetInterpState but the
            apply shim was never activated — just delete the empty table. */
         Tcl_DeleteHashTable(&st->apply.lambdaRegistry);
@@ -6621,12 +7216,13 @@ static void TbcxInterpStateCleanup(void *cd, Tcl_Interp *ip) {
  * On first call, allocates and registers the state under
  * TBCX_INTERP_STATE_KEY with TbcxInterpStateCleanup as the
  * delete callback.  Subsequent calls return the existing state. */
-static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip) {
-    TbcxInterpState *st = (TbcxInterpState *)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
+static TbcxInterpState* TbcxGetInterpState(Tcl_Interp* ip)
+{
+    TbcxInterpState* st = (TbcxInterpState*)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
     if (st)
         return st;
 
-    st = (TbcxInterpState *)Tcl_Alloc(sizeof(TbcxInterpState));
+    st = (TbcxInterpState*)Tcl_Alloc(sizeof(TbcxInterpState));
     memset(st, 0, sizeof(*st));
     st->interp = ip;
     Tcl_InitHashTable(&st->apply.lambdaRegistry, TCL_ONE_WORD_KEYS);
@@ -6642,43 +7238,50 @@ static TbcxInterpState *TbcxGetInterpState(Tcl_Interp *ip) {
  * in long-running interpreters that load many .tbcx files.
  *
  * Called lazily from EnsureApplyShim on subsequent tbcx::load calls. */
-static void ApplyShimPurgeStale(ApplyShim *as) {
+static void ApplyShimPurgeStale(ApplyShim* as)
+{
     if (!as)
         return;
 
     /* Collect keys to remove (can't modify hash during iteration). */
-    Tcl_Obj       *staleStack[32];
-    Tcl_Obj      **stale  = staleStack;
-    Tcl_Size       nStale = 0, staleCap = 32;
-    int            onHeap = 0;
+    Tcl_Obj* staleStack[32];
+    Tcl_Obj** stale = staleStack;
+    Tcl_Size nStale = 0, staleCap = 32;
+    int onHeap = 0;
 
     Tcl_HashSearch s;
-    Tcl_HashEntry *e;
-    for (e = Tcl_FirstHashEntry(&as->lambdaRegistry, &s); e; e = Tcl_NextHashEntry(&s)) {
-        Tcl_Obj *lambda = (Tcl_Obj *)Tcl_GetHashKey(&as->lambdaRegistry, e);
-        /* Direct refCount access: depends on Tcl internal struct layout.
-         * Safe because the interpreter is single-threaded and we intentionally
-         * use Tcl internal headers.  refCount <= 1 means only our registry
-         * holds a reference — the lambda is no longer live in user code. */
-        if (lambda && lambda->refCount <= 1) {
+    Tcl_HashEntry* e;
+    for (e = Tcl_FirstHashEntry(&as->lambdaRegistry, &s); e; e = Tcl_NextHashEntry(&s))
+    {
+        Tcl_Obj* lambda = (Tcl_Obj*)Tcl_GetHashKey(&as->lambdaRegistry, e);
+        /* refCount is read through Tcl's internal object layout. A value at or
+         * below one means only this registry holds the lambda. */
+        if (lambda && lambda->refCount <= 1)
+        {
             /* Only our registry holds a reference — this lambda is stale */
-            if (nStale >= staleCap) {
+            if (nStale >= staleCap)
+            {
                 Tcl_Size newCap = staleCap * 2;
-                if (newCap < staleCap || newCap > (Tcl_Size)(SIZE_MAX / sizeof(Tcl_Obj *)))
+                if (newCap < staleCap || newCap > (Tcl_Size)(SIZE_MAX / sizeof(Tcl_Obj*)))
                     break; /* cap overflow — stop collecting, purge what we have */
                 staleCap = newCap;
-                if (!onHeap) {
-                    Tcl_Obj **tmp = (Tcl_Obj **)Tcl_AttemptAlloc(sizeof(Tcl_Obj *) * (size_t)staleCap);
-                    if (!tmp) {
+                if (!onHeap)
+                {
+                    Tcl_Obj** tmp = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    if (!tmp)
+                    {
                         /* OOM: stop collecting; purge what we have */
                         break;
                     }
-                    memcpy(tmp, stale, sizeof(Tcl_Obj *) * (size_t)nStale);
-                    stale  = tmp;
+                    memcpy(tmp, stale, sizeof(Tcl_Obj*) * (size_t)nStale);
+                    stale = tmp;
                     onHeap = 1;
-                } else {
-                    Tcl_Obj **tmp = (Tcl_Obj **)Tcl_AttemptRealloc(stale, sizeof(Tcl_Obj *) * (size_t)staleCap);
-                    if (!tmp) {
+                }
+                else
+                {
+                    Tcl_Obj** tmp = (Tcl_Obj**)Tcl_AttemptRealloc(stale, sizeof(Tcl_Obj*) * (size_t)staleCap);
+                    if (!tmp)
+                    {
                         /* OOM: stop collecting; purge what we have */
                         break;
                     }
@@ -6690,13 +7293,17 @@ static void ApplyShimPurgeStale(ApplyShim *as) {
     }
 
     /* Remove stale entries */
-    for (Tcl_Size i = 0; i < nStale; i++) {
-        Tcl_Obj *lambda = stale[i];
-        e               = Tcl_FindHashEntry(&as->lambdaRegistry, (const char *)lambda);
-        if (e) {
-            ApplyLambdaEntry *le = (ApplyLambdaEntry *)Tcl_GetHashValue(e);
-            if (le) {
-                if (le->procPtr && --le->procPtr->refCount <= 0) {
+    for (Tcl_Size i = 0; i < nStale; i++)
+    {
+        Tcl_Obj* lambda = stale[i];
+        e = Tcl_FindHashEntry(&as->lambdaRegistry, (const char*)lambda);
+        if (e)
+        {
+            ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_GetHashValue(e);
+            if (le)
+            {
+                if (le->procPtr && --le->procPtr->refCount <= 0)
+                {
                     TclProcCleanupProc(le->procPtr);
                 }
                 if (le->nsObj)
@@ -6720,9 +7327,10 @@ static void ApplyShimPurgeStale(ApplyShim *as) {
  * Safe to call even when no ApplyShim has been installed (no-op).
  * ========================================================================== */
 
-void TbcxApplyShimPurgeAll(Tcl_Interp *ip) {
+void TbcxApplyShimPurgeAll(Tcl_Interp* ip)
+{
     TBCX_ASSERT_INTERP_THREAD(ip);
-    TbcxInterpState *st = (TbcxInterpState *)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
+    TbcxInterpState* st = (TbcxInterpState*)Tcl_GetAssocData(ip, TBCX_INTERP_STATE_KEY, NULL);
     if (st && st->applyActive)
         ApplyShimPurgeStale(&st->apply);
 }
@@ -6731,16 +7339,20 @@ void TbcxApplyShimPurgeAll(Tcl_Interp *ip) {
  * First call installs the shim on [apply] within the TbcxInterpState.
  * Subsequent calls (from additional tbcx::load invocations) return the
  * existing shim — new lambda entries are simply added to the registry. */
-static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
-    TbcxInterpState *st = TbcxGetInterpState(ip);
-    ApplyShim       *as = &st->apply;
+static ApplyShim* EnsureApplyShim(Tcl_Interp* ip)
+{
+    TbcxInterpState* st = TbcxGetInterpState(ip);
+    ApplyShim* as = &st->apply;
 
-    if (st->applyActive) {
+    if (st->applyActive)
+    {
         /* Subsequent load: purge stale entries before adding new ones. */
         ApplyShimPurgeStale(as);
         if (as->applyCmdPtr)
             return as;
-    } else {
+    }
+    else
+    {
         /* Keep the registry alive even when [apply] is temporarily absent;
            later loads will retry shim installation. */
         st->applyActive = 1;
@@ -6750,28 +7362,24 @@ static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
     if (!token)
         return as;
 
-    as->applyCmdPtr    = (Command *)token;
+    as->applyCmdPtr = (Command*)token;
     as->savedApplyProc = as->applyCmdPtr->objProc2;
-    as->savedApplyNre  = as->applyCmdPtr->nreProc2;
-    as->savedApplyCD   = as->applyCmdPtr->objClientData2;
+    as->savedApplyNre = as->applyCmdPtr->nreProc2;
+    as->savedApplyCD = as->applyCmdPtr->objClientData2;
 
-    /* Install a command trace so we know if "apply" is renamed or deleted
-       before cleanup runs.  Without this, TbcxInterpStateCleanup would write
-       through a stale Command* — a crash-class UAF bug. */
-    if (Tcl_TraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as) != TCL_OK) {
+    /* Track rename and deletion for handler restoration and cleanup. */
+    if (Tcl_TraceCommand(ip, "apply", TCL_TRACE_RENAME | TCL_TRACE_DELETE, ApplyCmdDeleteTrace, as) != TCL_OK)
+    {
         as->applyCmdPtr = NULL;
         return as;
     }
-    as->traceInstalled              = 1;
+    as->traceInstalled = 1;
 
-    /* Intercept BOTH objProc2 AND nreProc2, matching the ProcShim pattern.
-       In Tcl 9.1, [apply] is NRE-enabled (nreProc2 != NULL), so the bytecode
-       engine dispatches through nreProc2 — bypassing objProc2 entirely.
-       Without intercepting nreProc2, shimmer recovery for precompiled lambdas
-       would silently fail when called from compiled code. */
-    as->applyCmdPtr->objProc2       = CmdApplyShim;
+    /* Intercept both objProc2 and Tcl 9.1's NRE handler. */
+    as->applyCmdPtr->objProc2 = CmdApplyShim;
     as->applyCmdPtr->objClientData2 = as;
-    if (as->applyCmdPtr->nreProc2) {
+    if (as->applyCmdPtr->nreProc2)
+    {
         as->applyCmdPtr->nreProc2 = CmdApplyShimNre;
     }
 
@@ -6780,24 +7388,25 @@ static ApplyShim *EnsureApplyShim(Tcl_Interp *ip) {
 
 /* RegisterPrecompiledLambda — record a lambda in the ApplyShim registry
  * so that shimmer recovery can re-install the lambdaExpr internal rep. */
-static void RegisterPrecompiledLambda(Tcl_Interp *ip, Tcl_Obj *lambda, Proc *procPtr, Tcl_Obj *nsObj) {
-    ApplyShim *as = EnsureApplyShim(ip);
+static void RegisterPrecompiledLambda(Tcl_Interp* ip, Tcl_Obj* lambda, Proc* procPtr, Tcl_Obj* nsObj)
+{
+    ApplyShim* as = EnsureApplyShim(ip);
     if (!as)
         return;
 
-    /* Hold a reference on the lambda object so that if the ByteCode's
-       literal pool releases it, the registry entry remains valid.
-       Without this, the ONE_WORD_KEYS hash (keyed by Tcl_Obj pointer)
-       could match a stale entry if the address is reused. */
+    /* The pointer-keyed registry owns a reference to the lambda object. */
     Tcl_IncrRefCount(lambda);
 
-    int            isNew = 0;
-    Tcl_HashEntry *he    = Tcl_CreateHashEntry(&as->lambdaRegistry, (const char *)lambda, &isNew);
-    if (!isNew) {
+    int isNew = 0;
+    Tcl_HashEntry* he = Tcl_CreateHashEntry(&as->lambdaRegistry, (const char*)lambda, &isNew);
+    if (!isNew)
+    {
         /* Lambda pointer reused (shouldn't happen, but be safe) */
-        ApplyLambdaEntry *old = (ApplyLambdaEntry *)Tcl_GetHashValue(he);
-        if (old) {
-            if (old->procPtr && --old->procPtr->refCount <= 0) {
+        ApplyLambdaEntry* old = (ApplyLambdaEntry*)Tcl_GetHashValue(he);
+        if (old)
+        {
+            if (old->procPtr && --old->procPtr->refCount <= 0)
+            {
                 TclProcCleanupProc(old->procPtr);
             }
             if (old->nsObj)
@@ -6807,8 +7416,8 @@ static void RegisterPrecompiledLambda(Tcl_Interp *ip, Tcl_Obj *lambda, Proc *pro
         Tcl_DecrRefCount(lambda); /* drop extra ref from duplicate registration */
     }
 
-    ApplyLambdaEntry *le = (ApplyLambdaEntry *)Tcl_Alloc(sizeof(ApplyLambdaEntry));
-    le->procPtr          = procPtr;
+    ApplyLambdaEntry* le = (ApplyLambdaEntry*)Tcl_Alloc(sizeof(ApplyLambdaEntry));
+    le->procPtr = procPtr;
     le->procPtr->refCount++; /* registry holds its own reference */
     le->nsObj = nsObj;
     Tcl_IncrRefCount(le->nsObj);
@@ -6817,7 +7426,8 @@ static void RegisterPrecompiledLambda(Tcl_Interp *ip, Tcl_Obj *lambda, Proc *pro
         as->numRegistered++;
 }
 
-int Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H) {
+int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H)
+{
     if (!Tbcx_R_U32(r, &H->magic))
         return 0;
     if (!Tbcx_R_U32(r, &H->format))
@@ -6843,43 +7453,49 @@ int Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H) {
      * iPtr->scriptFile to this during top-level eval so `info script`
      * returns the authored source path. */
     {
-        char    *srcP = NULL;
+        char* srcP = NULL;
         uint32_t srcL = 0;
         if (!Tbcx_R_LPString(r, &srcP, &srcL))
             return 0;
-        if (srcL > 0) {
+        if (srcL > 0)
+        {
             H->sourcePath = Tcl_NewStringObj(srcP, (Tcl_Size)srcL);
             Tcl_IncrRefCount(H->sourcePath);
-        } else {
+        }
+        else
+        {
             H->sourcePath = NULL;
         }
         Tcl_Free(srcP);
     }
 
-    if (H->magic != TBCX_MAGIC || H->format != TBCX_FORMAT) {
+    if (H->magic != TBCX_MAGIC || H->format != TBCX_FORMAT)
+    {
         R_Error(r, "tbcx: bad header (unknown magic or format)");
         return 0;
     }
     /* TBCX reconstructs private Tcl structures and executes raw opcodes.
        Patch and release type (alpha/beta/final) are therefore part of the
        compatibility boundary just as much as major and minor. */
-    if (H->tcl_version != Tbcx_PackTclVersion()) {
+    if (H->tcl_version != Tbcx_PackTclVersion())
+    {
         R_Error(r, "tbcx: incompatible Tcl version");
         return 0;
     }
     return 1;
 }
 
-static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx) {
-    int      result = TCL_ERROR;
+static int ReadProc(TbcxIn* r, Tcl_Interp* ip, ProcShim* shim, uint32_t procIdx)
+{
+    int result = TCL_ERROR;
 
     /* ---- Stage 1: read wire strings ---- */
-    char    *nameC  = NULL;
-    uint32_t nameL  = 0;
-    char    *nsC    = NULL;
-    uint32_t nsL    = 0;
-    char    *argsC  = NULL;
-    uint32_t argsL  = 0;
+    char* nameC = NULL;
+    uint32_t nameL = 0;
+    char* nsC = NULL;
+    uint32_t nsL = 0;
+    char* argsC = NULL;
+    uint32_t argsL = 0;
 
     if (!Tbcx_R_LPString(r, &nameC, &nameL))
         goto cleanup_strings;
@@ -6889,11 +7505,11 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
         goto cleanup_strings;
 
     /* ---- Stage 2: build Tcl_Obj wrappers ---- */
-    Tcl_Obj *nameFqn = Tcl_NewStringObj(nameC, (Tcl_Size)nameL);
+    Tcl_Obj* nameFqn = Tcl_NewStringObj(nameC, (Tcl_Size)nameL);
     Tcl_IncrRefCount(nameFqn);
-    Tcl_Obj *nsObj = Tcl_NewStringObj(nsC, (Tcl_Size)nsL);
+    Tcl_Obj* nsObj = Tcl_NewStringObj(nsC, (Tcl_Size)nsL);
     Tcl_IncrRefCount(nsObj);
-    Tcl_Obj *argsObj = Tcl_NewStringObj(argsC, (Tcl_Size)argsL);
+    Tcl_Obj* argsObj = Tcl_NewStringObj(argsC, (Tcl_Size)argsL);
     Tcl_IncrRefCount(argsObj);
     /* Wire strings no longer needed */
     Tcl_Free(nameC);
@@ -6905,14 +7521,14 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
 
     /* ---- Stage 3: validate ---- */
     {
-        Tcl_Size    nsObjLen = 0;
-        const char *nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
+        Tcl_Size nsObjLen = 0;
+        const char* nsObjStr = Tbcx_GetStringFromObjStrict(ip, nsObj, &nsObjLen);
         if (!nsObjStr || Tbcx_ValidateKeyString(ip, nsObjStr, nsObjLen, "proc namespace", 1) != TCL_OK)
             goto cleanup_objs;
     }
     {
-        Tcl_Size    nameObjLen = 0;
-        const char *nameObjStr = Tbcx_GetStringFromObjStrict(ip, nameFqn, &nameObjLen);
+        Tcl_Size nameObjLen = 0;
+        const char* nameObjStr = Tbcx_GetStringFromObjStrict(ip, nameFqn, &nameObjLen);
         if (!nameObjStr || Tbcx_ValidateKeyString(ip, nameObjStr, nameObjLen, "proc name", 0) != TCL_OK)
             goto cleanup_objs;
     }
@@ -6924,22 +7540,23 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
      * default, matching tclcompiler/tbcload); the loader then
      * installs a diagnostic sentinel so `info body` is loud rather
      * than silently empty. */
-    char    *bodySrc    = NULL;
+    char* bodySrc = NULL;
     uint32_t bodySrcLen = 0;
-    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_PROC,
-            &bodySrc, &bodySrcLen))
+    if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_PROC, &bodySrc, &bodySrcLen))
         goto cleanup_objs;
 
     /* ---- Stage 4: read body bytecode ---- */
-    Namespace *nsPtr  = (Namespace *)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
-    if (!nsPtr) {
+    Namespace* nsPtr = (Namespace*)Tbcx_EnsureNamespace(ip, Tcl_GetString(nsObj));
+    if (!nsPtr)
+    {
         if (bodySrc)
             Tcl_Free(bodySrc);
         goto cleanup_objs;
     }
-    uint32_t   nLoc   = 0;
-    Tcl_Obj   *bodyBC = Tbcx_ReadBlock(r, ip, nsPtr, &nLoc, 1, 0, NULL);
-    if (!bodyBC) {
+    uint32_t nLoc = 0;
+    Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, ip, nsPtr, &nLoc, 1, 0, NULL);
+    if (!bodyBC)
+    {
         if (bodySrc)
             Tcl_Free(bodySrc);
         goto cleanup_objs;
@@ -6960,79 +7577,83 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
      * Tcl_InitStringRep which follows the allocate-and-copy branch.
      * Neither call touches the internal rep. */
     Tcl_InvalidateStringRep(bodyBC);
-    if (bodySrcLen > 0) {
+    if (bodySrcLen > 0)
+    {
         Tcl_InitStringRep(bodyBC, bodySrc, (size_t)bodySrcLen);
-    } else {
-        Tcl_InitStringRep(bodyBC,
-            TBCX_STRIPPED_SOURCE_SENTINEL,
-            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
-        TBCX_BENCH_ADD(sentinelBytes,
-            sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+    }
+    else
+    {
+        Tcl_InitStringRep(bodyBC, TBCX_STRIPPED_SOURCE_SENTINEL, sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
+        TBCX_BENCH_ADD(sentinelBytes, sizeof(TBCX_STRIPPED_SOURCE_SENTINEL) - 1u);
     }
     if (bodySrc)
         Tcl_Free(bodySrc);
     bodySrc = NULL;
 
     /* ---- Stage 5: build FQN key ---- */
-    Tcl_Obj    *fqnKey = NULL;
-    const char *nm     = Tcl_GetString(nameFqn);
-    if (nm[0] == ':' && nm[1] == ':') {
+    Tcl_Obj* fqnKey = NULL;
+    const char* nm = Tcl_GetString(nameFqn);
+    if (nm[0] == ':' && nm[1] == ':')
+    {
         fqnKey = nameFqn;
-    } else {
-        Tcl_Size    nsLen = 0;
-        const char *nsStr = Tcl_GetStringFromObj(nsObj, &nsLen);
-        fqnKey            = Tcl_NewStringObj(nsStr, nsLen);
+    }
+    else
+    {
+        Tcl_Size nsLen = 0;
+        const char* nsStr = Tcl_GetStringFromObj(nsObj, &nsLen);
+        fqnKey = Tcl_NewStringObj(nsStr, nsLen);
         if (!(nsLen == 2 && nsStr[0] == ':' && nsStr[1] == ':'))
             Tcl_AppendToObj(fqnKey, "::", 2);
         Tcl_AppendObjToObj(fqnKey, nameFqn);
     }
     Tcl_IncrRefCount(fqnKey);
     Tcl_DecrRefCount(nameFqn);
-    nameFqn       = NULL; /* consumed — fqnKey owns the reference */
+    nameFqn = NULL; /* consumed — fqnKey owns the reference */
 
     /* ---- Stage 6: build Proc ---- */
-    Proc *procPtr = (Proc *)Tcl_Alloc(sizeof(Proc));
+    Proc* procPtr = (Proc*)Tcl_Alloc(sizeof(Proc));
     TBCX_BENCH_INC(procAllocations);
     memset(procPtr, 0, sizeof(Proc));
-    procPtr->iPtr     = (Interp *)ip;
+    procPtr->iPtr = (Interp*)ip;
     procPtr->refCount = 1;
-    procPtr->bodyPtr  = bodyBC;
+    procPtr->bodyPtr = bodyBC;
     Tcl_IncrRefCount(bodyBC);
     {
         CompiledLocal *first = NULL, *last = NULL;
-        Tcl_Size       numA = 0;
+        Tcl_Size numA = 0;
         TBCX_BENCH_INC(compiledLocalBuilds);
-        if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK) {
+        if (Tbcx_BuildLocals(ip, argsObj, &first, &last, &numA) != TCL_OK)
+        {
             Tcl_DecrRefCount(bodyBC);
-            Tcl_Free((char *)procPtr);
+            Tcl_Free((char*)procPtr);
             goto cleanup_fqn;
         }
-        procPtr->numArgs           = numA;
+        procPtr->numArgs = numA;
         procPtr->numCompiledLocals = numA;
-        procPtr->firstLocalPtr     = first;
-        procPtr->lastLocalPtr      = last;
+        procPtr->firstLocalPtr = first;
+        procPtr->lastLocalPtr = last;
     }
     CompiledLocals(procPtr, (Tcl_Size)nLoc);
 
     /* Link ByteCode back to this Proc and refresh epochs */
     {
-        ByteCode *bcPtr = TbcxGetByteCode(bodyBC);
+        ByteCode* bcPtr = TbcxGetByteCode(bodyBC);
         if (bcPtr)
-            TbcxFixupByteCode(bcPtr, procPtr, ip, nsPtr,
-                              TBCX_FIXUP_CACHE_KEEP);
+            TbcxFixupByteCode(bcPtr, procPtr, ip, nsPtr, TBCX_FIXUP_CACHE_KEEP);
     }
 
     /* ---- Stage 7: build procbody and register ---- */
     {
-        Tcl_Obj           *procBodyObj = Tcl_NewObj();
+        Tcl_Obj* procBodyObj = Tcl_NewObj();
         Tcl_ObjInternalRep ir;
         ir.twoPtrValue.ptr1 = procPtr;
         ir.twoPtrValue.ptr2 = NULL;
         Tcl_StoreInternalRep(procBodyObj, tbcxTyProcBody, &ir);
         procPtr->refCount++;
 
-        Tcl_Obj *pair = Tcl_NewListObj(0, NULL);
-        if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK) {
+        Tcl_Obj* pair = Tcl_NewListObj(0, NULL);
+        if (Tcl_ListObjAppendElement(ip, pair, argsObj) != TCL_OK || Tcl_ListObjAppendElement(ip, pair, procBodyObj) != TCL_OK)
+        {
             Tcl_IncrRefCount(pair);
             Tcl_DecrRefCount(pair);
             Tcl_IncrRefCount(procBodyObj);
@@ -7045,16 +7666,18 @@ static int ReadProc(TbcxIn *r, Tcl_Interp *ip, ProcShim *shim, uint32_t procIdx)
         }
         Tcl_IncrRefCount(pair);
 
-        int            isNew = 0;
-        Tcl_HashEntry *he    = Tcl_CreateHashEntry(&shim->procsByFqn, Tcl_GetString(fqnKey), &isNew);
-        if (!isNew) {
-            Tcl_Obj *oldPair = (Tcl_Obj *)Tcl_GetHashValue(he);
+        int isNew = 0;
+        Tcl_HashEntry* he = Tcl_CreateHashEntry(&shim->procsByFqn, Tcl_GetString(fqnKey), &isNew);
+        if (!isNew)
+        {
+            Tcl_Obj* oldPair = (Tcl_Obj*)Tcl_GetHashValue(he);
             if (oldPair)
                 Tcl_DecrRefCount(oldPair);
         }
         Tcl_SetHashValue(he, pair);
 
-        if (procIdx < shim->numProcsIdx && shim->procsByIdx) {
+        if (procIdx < shim->numProcsIdx && shim->procsByIdx)
+        {
             shim->procsByIdx[procIdx] = pair;
             Tcl_IncrRefCount(pair);
         }
@@ -7069,7 +7692,7 @@ cleanup_fqn:
     if (fqnKey)
         Tcl_DecrRefCount(fqnKey);
     if (bodyBC)
-        Tcl_DecrRefCount(bodyBC); /* release our local reference (F4) */
+        Tcl_DecrRefCount(bodyBC); /* release the local body reference */
 cleanup_objs:
     if (nameFqn)
         Tcl_DecrRefCount(nameFqn);
@@ -7087,21 +7710,13 @@ cleanup_strings:
     return result;
 }
 
-static int TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv) {
-    Interp    *iPtr = (Interp *)ip;
+static int TopLocals_Begin(Tcl_Interp* ip, ByteCode* bcPtr, TbcxTopFrameSave* sv)
+{
+    Interp* iPtr = (Interp*)ip;
 
-    /* The top-level bytecode is evaluated without TCL_EVAL_GLOBAL (so it
-     * matches plain-source `source` semantics: runs in the caller's
-     * namespace), which means the engine uses iPtr->varFramePtr — the
-     * active frame at eval time — not iPtr->rootFramePtr.  We must
-     * install compiled locals on that same frame, otherwise the
-     * bytecode's slot-based variable ops find an empty LocalCache and
-     * the fall-through to namespace resolution never happens the way
-     * the compiler expected.
-     *
-     * varFramePtr is correct regardless of whether tbcx::load was called
-     * from global, namespace-eval, or proc-body context. */
-    CallFrame *f    = iPtr->varFramePtr;
+    /* Top-level evaluation uses the active variable frame. Named compiled
+     * locals are overlaid on that frame. */
+    CallFrame* f = iPtr->varFramePtr;
     if (!f)
         f = iPtr->rootFramePtr; /* very-early-init defensive fallback */
 
@@ -7114,9 +7729,9 @@ static int TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv
        common case, leave the active call frame completely untouched so
        generic variable instructions resolve against the caller's compiled
        and dynamic locals exactly as an eval/source would. */
-    Tcl_Size n = (bcPtr && bcPtr->localCachePtr)
-        ? bcPtr->localCachePtr->numVars : 0;
-    if (n <= 0) {
+    Tcl_Size n = (bcPtr && bcPtr->localCachePtr) ? bcPtr->localCachePtr->numVars : 0;
+    if (n <= 0)
+    {
         return TCL_OK;
     }
 
@@ -7124,42 +7739,53 @@ static int TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv
        still active.  TclObjLookupVar handles compiled locals, dynamic locals,
        upvar links, arrays, qualified namespace variables, and traced-but-
        undefined variables using Tcl's normal lookup rules. */
-    Var *overlay = NULL;
+    Var* overlay = NULL;
     {
         size_t varBytes;
-        if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes)) {
-            Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                "tbcx: top-level local overlay size overflow", -1));
+        if (!tbcx_checked_mul(sizeof(Var), (size_t)n, &varBytes))
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: top-level local overlay size overflow", -1));
             return TCL_ERROR;
         }
-        overlay = (Var *)Tcl_AttemptAlloc(varBytes);
-        if (!overlay) {
-            Tcl_SetObjResult(ip, Tcl_NewStringObj(
-                "tbcx: allocation failed (top-level local overlay)", -1));
+        overlay = (Var*)Tcl_AttemptAlloc(varBytes);
+        if (!overlay)
+        {
+            Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (top-level local overlay)", -1));
             return TCL_ERROR;
         }
         memset(overlay, 0, varBytes);
     }
 
-    Tcl_Obj *const *names = (Tcl_Obj *const *)&bcPtr->localCachePtr->varName0;
-    for (Tcl_Size i = 0; i < n; i++) {
-        Tcl_Obj *nm = names[i];
+    Tcl_Obj* const* names = (Tcl_Obj* const*)&bcPtr->localCachePtr->varName0;
+    for (Tcl_Size i = 0; i < n; i++)
+    {
+        Tcl_Obj* nm = names[i];
         Tcl_Size len = 0;
-        const char *s = nm ? Tbcx_GetStringFromObjSafe(nm, &len) : NULL;
+        const char* s = nm ? Tbcx_GetStringFromObjSafe(nm, &len) : NULL;
         if (!nm || len == 0)
             continue; /* compiler temporary / unnamed slot */
 
-        Tcl_Obj *lookupName = Tcl_NewStringObj(s, len);
+        Tcl_Obj* lookupName = Tcl_NewStringObj(s, len);
         Tcl_IncrRefCount(lookupName);
-        Var *arrayPtr = NULL;
-        Var *target = TclObjLookupVar(ip, lookupName, NULL, 0, "access",
-            /*createPart1*/ 1, /*createPart2*/ 1, &arrayPtr);
+        Var* arrayPtr = NULL;
+        Var* target = TclObjLookupVar(ip,
+                                      lookupName,
+                                      NULL,
+                                      0,
+                                      "access",
+                                      /*createPart1*/ 1,
+                                      /*createPart2*/ 1,
+                                      &arrayPtr);
         Tcl_DecrRefCount(lookupName);
-        if (!target) {
-            for (Tcl_Size j = 0; j < n; j++) {
-                if (TclIsVarLink(&overlay[j])) {
-                    Var *oldTarget = overlay[j].value.linkPtr;
-                    if (TclIsVarInHash(oldTarget)) {
+        if (!target)
+        {
+            for (Tcl_Size j = 0; j < n; j++)
+            {
+                if (TclIsVarLink(&overlay[j]))
+                {
+                    Var* oldTarget = overlay[j].value.linkPtr;
+                    if (TclIsVarInHash(oldTarget))
+                    {
                         VarHashRefCount(oldTarget)--;
                         if (TclIsVarUndefined(oldTarget))
                             TclCleanupVar(oldTarget, NULL);
@@ -7176,67 +7802,71 @@ static int TopLocals_Begin(Tcl_Interp *ip, ByteCode *bcPtr, TbcxTopFrameSave *sv
     }
 
     sv->oldLocals = f->compiledLocals;
-    sv->oldNum    = f->numCompiledLocals;
-    sv->oldCache  = f->localCachePtr;
+    sv->oldNum = f->numCompiledLocals;
+    sv->oldCache = f->localCachePtr;
     sv->allocated = overlay;
 
     f->localCachePtr = bcPtr->localCachePtr;
     f->localCachePtr->refCount++;
-    f->compiledLocals    = overlay;
+    f->compiledLocals = overlay;
     f->numCompiledLocals = n;
-    sv->installed        = 1;
+    sv->installed = 1;
     return TCL_OK;
 }
 
-static void TopLocals_End(Tcl_Interp *ip, TbcxTopFrameSave *sv) {
+static void TopLocals_End(Tcl_Interp* ip, TbcxTopFrameSave* sv)
+{
     (void)ip;
-    /* Restore the exact same frame that TopLocals_Begin modified
-     * (recorded in sv->frame at Begin time).  Using iPtr->varFramePtr
-     * here would be wrong if the eval pushed/popped frames in between. */
-    CallFrame *f    = sv->frame;
+    /* Restore the frame recorded by TopLocals_Begin. */
+    CallFrame* f = sv->frame;
     if (!f || !sv->installed)
         return; /* defensive */
 
     /* Clean overlay values, arrays, traces, and link references using Tcl's
        normal compiled-frame teardown before restoring the caller frame. */
-    TclDeleteCompiledLocalVars((Interp *)ip, f);
-    if (f->localCachePtr) {
+    TclDeleteCompiledLocalVars((Interp*)ip, f);
+    if (f->localCachePtr)
+    {
         f->localCachePtr->refCount--;
-        /* Do NOT free the cache here even if refCount reaches 0.
-           The ByteCode's cleanup (TclCleanupByteCode) is responsible for
-           freeing the LocalCache when the ByteCode is destroyed. Freeing
-           it here would cause a use-after-free. */
+        /* TclCleanupByteCode owns LocalCache deallocation. */
     }
     if (sv->allocated)
-        Tcl_Free((char *)sv->allocated);
+        Tcl_Free((char*)sv->allocated);
 
     /* Restore previous state */
-    f->compiledLocals    = sv->oldLocals;
+    f->compiledLocals = sv->oldLocals;
     f->numCompiledLocals = sv->oldNum;
-    f->localCachePtr     = sv->oldCache;
-    sv->installed        = 0;
+    f->localCachePtr = sv->oldCache;
+    sv->installed = 0;
 }
 
 #define TBCX_MAX_LOAD_DEPTH 8
 
-static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePath) {
-    TbcxArtifactImage *image = NULL;
+static int LoadTbcxStream(Tcl_Interp* ip, Tcl_Channel ch, Tcl_Obj* scriptFilePath)
+{
+    TbcxArtifactImage* image = NULL;
 
-    if (Tbcx_CheckBinaryChan(ip, ch) != TCL_OK) {
+    if (Tbcx_CheckBinaryChan(ip, ch) != TCL_OK)
+    {
         return TCL_ERROR;
     }
     if (Tbcx_ReadArtifactImage(ip, ch, &image) != TCL_OK)
         return TCL_ERROR;
-    if (Tbcx_PreflightArtifact(ip, image) != TCL_OK) {
+    if (Tbcx_PreflightArtifact(ip, image) != TCL_OK)
+    {
         Tbcx_ArtifactImageRelease(image);
         return TCL_ERROR;
     }
 
     /* No persistent registry or namespace exists before the complete neutral
      * image has passed validation. */
-    TbcxInterpState *st = TbcxGetInterpState(ip);
-    if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH) {
-        Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d", st->loadDepth, TBCX_MAX_LOAD_DEPTH));
+    TbcxInterpState* st = TbcxGetInterpState(ip);
+    if (st->loadDepth >= TBCX_MAX_LOAD_DEPTH)
+    {
+        Tcl_SetObjResult(ip,
+                         Tcl_ObjPrintf("tbcx::load: reentrancy depth %" TCL_SIZE_MODIFIER "d exceeds limit %d",
+                                       st->loadDepth,
+                                       TBCX_MAX_LOAD_DEPTH));
         Tbcx_ArtifactImageRelease(image);
         return TCL_ERROR;
     }
@@ -7245,10 +7875,12 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     TbcxIn r;
     Tbcx_R_InitImage(&r, ip, image);
     TbcxHeader H;
-    memset(&H, 0, sizeof(H));  /* zero H.sourcePath for the early-exit path */
+    memset(&H, 0, sizeof(H)); /* zero H.sourcePath for the early-exit path */
 
-    if (!Tbcx_ReadHeader(&r, &H) || r.err) {
-        if (H.sourcePath) {
+    if (!Tbcx_ReadHeader(&r, &H) || r.err)
+    {
+        if (H.sourcePath)
+        {
             Tcl_DecrRefCount(H.sourcePath);
         }
         st->loadDepth--;
@@ -7256,45 +7888,18 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
         return TCL_ERROR;
     }
 
-    /* Resolve the namespace where the top-level block should run.
-     *
-     * Plain-source equivalence: the canonical `moduleLoad`-style wrapper
-     * for tbcx looks like
-     *     uplevel 1 [list source $path]    ;# plain-source branch
-     *     tbcx::load $path                  ;# tbcx branch
-     * and callers expect the two branches to be semantically identical.
-     * Tcl's `source` evaluates the file's top-level commands in the
-     * caller's current namespace — a bare `$dir` inside the sourced
-     * file resolves against that namespace, not against ::.
-     *
-     * For the tbcx branch to match, LoadTbcxStream must:
-     *   (a) associate the top-level ByteCode with the caller's current
-     *       namespace (so codePtr->nsPtr reflects the scope the code
-     *       will actually run in — important for the recompile-check
-     *       in TclProcCompileProc et al., and for lookupNsPtr resolution
-     *       of variables and commands), and
-     *   (b) evaluate the top-level block without TCL_EVAL_GLOBAL, so
-     *       the engine does not switch to global scope before running
-     *       the first opcode.
-     *
-     * Hard-coding `::` here and passing TCL_EVAL_GLOBAL below would force
-     * every top-level block to execute at `::` regardless of the caller's
-     * namespace, so any tbcx-loaded script with a bare `$var` or
-     * `variable x` at its top — or a `namespace eval ::ns {...}` block —
-     * would resolve those against the wrong namespace and fail with
-     * `can't read "<name>": no such variable`. */
-    Namespace *curNs   = (Namespace *)Tcl_GetCurrentNamespace(ip);
-    uint32_t   dummyNL = 0;
+    /* Bind and evaluate the top-level block in the caller's current
+     * namespace. */
+    Namespace* curNs = (Namespace*)Tcl_GetCurrentNamespace(ip);
+    uint32_t dummyNL = 0;
 
-    uint32_t   topPolicy = TBCX_BLOCK_POLICY_LEGACY;
-    Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, ip, curNs, &dummyNL, 1, 0,
-        &topPolicy);
-    if (!topBC) {
-        /* Release H.sourcePath — it was IncrRefCount'd by Tbcx_ReadHeader
-         * on the success path; without this guard it leaks on every
-         * failed load after a successful header read.  The dumper's
-         * `cleanup_no_topbc:` label shows the correct pattern. */
-        if (H.sourcePath) {
+    uint32_t topPolicy = TBCX_BLOCK_POLICY_LEGACY;
+    Tcl_Obj* topBC = Tbcx_ReadBlock(&r, ip, curNs, &dummyNL, 1, 0, &topPolicy);
+    if (!topBC)
+    {
+        /* Release the source-path reference acquired by Tbcx_ReadHeader. */
+        if (H.sourcePath)
+        {
             Tcl_DecrRefCount(H.sourcePath);
         }
         st->loadDepth--;
@@ -7303,16 +7908,13 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     }
     Tcl_IncrRefCount(topBC); /* protect against all early-return paths */
 
-    ByteCode *parsedTop = TbcxGetByteCode(topBC);
+    ByteCode* parsedTop = TbcxGetByteCode(topBC);
     if (!parsedTop || H.codeLenTop != (uint64_t)parsedTop->numCodeBytes ||
-        H.numExceptTop != (uint32_t)parsedTop->numExceptRanges ||
-        H.numLitsTop != (uint32_t)parsedTop->numLitObjects ||
-        H.numAuxTop != (uint32_t)parsedTop->numAuxDataItems ||
-        H.numLocalsTop != dummyNL ||
-        H.maxStackTop != (uint32_t)parsedTop->maxStackDepth ||
-        topPolicy != image->sourcePolicy) {
-        Tcl_SetObjResult(ip, Tcl_NewStringObj(
-            "tbcx: top-level header/block metadata mismatch", -1));
+        H.numExceptTop != (uint32_t)parsedTop->numExceptRanges || H.numLitsTop != (uint32_t)parsedTop->numLitObjects ||
+        H.numAuxTop != (uint32_t)parsedTop->numAuxDataItems || H.numLocalsTop != dummyNL ||
+        H.maxStackTop != (uint32_t)parsedTop->maxStackDepth || topPolicy != image->sourcePolicy)
+    {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: top-level header/block metadata mismatch", -1));
         Tcl_DecrRefCount(topBC);
         if (H.sourcePath)
             Tcl_DecrRefCount(H.sourcePath);
@@ -7321,9 +7923,9 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
         return TCL_ERROR;
     }
 
-    int      rc           = TCL_ERROR;
-    int      shimInited   = 0; /* 1 once AddProcShim succeeded */
-    int      ooshimInited = 0; /* 1 once AddOOShim succeeded */
+    int rc = TCL_ERROR;
+    int shimInited = 0;   /* 1 once AddProcShim succeeded */
+    int ooshimInited = 0; /* 1 once AddOOShim succeeded */
 
     ProcShim shim;
     memset(&shim, 0, sizeof(shim)); /* zero up front so DelProcShim is safe */
@@ -7334,26 +7936,30 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     uint32_t numProcs = 0;
     if (!Tbcx_R_U32(&r, &numProcs))
         goto cleanup;
-    if (numProcs > TBCX_MAX_PROCS) {
+    if (numProcs > TBCX_MAX_PROCS)
+    {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: numProcs %u exceeds limit %u", numProcs, TBCX_MAX_PROCS));
         goto cleanup;
     }
 
     /* Build proc shim registry and fill from section */
-    if (numProcs) {
+    if (numProcs)
+    {
         if (AddProcShim(ip, &shim) != TCL_OK)
             goto cleanup;
-        shimInited      = 1;
-        shim.procsByIdx = (Tcl_Obj **)Tcl_AttemptAlloc(sizeof(Tcl_Obj *) * numProcs);
-        if (!shim.procsByIdx) {
+        shimInited = 1;
+        shim.procsByIdx = (Tcl_Obj**)Tcl_AttemptAlloc(sizeof(Tcl_Obj*) * numProcs);
+        if (!shim.procsByIdx)
+        {
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: allocation failed (proc index)", -1));
             goto cleanup;
         }
-        memset(shim.procsByIdx, 0, sizeof(Tcl_Obj *) * numProcs);
+        memset(shim.procsByIdx, 0, sizeof(Tcl_Obj*) * numProcs);
         shim.numProcsIdx = numProcs;
     }
 
-    for (uint32_t i = 0; i < numProcs; i++) {
+    for (uint32_t i = 0; i < numProcs; i++)
+    {
         if (ReadProc(&r, ip, &shim, i) != TCL_OK)
             goto cleanup;
     }
@@ -7362,26 +7968,30 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     uint32_t numClasses = 0;
     if (!Tbcx_R_U32(&r, &numClasses))
         goto cleanup;
-    if (numClasses > TBCX_MAX_CLASSES) {
+    if (numClasses > TBCX_MAX_CLASSES)
+    {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: numClasses %u exceeds limit %u", numClasses, TBCX_MAX_CLASSES));
         goto cleanup;
     }
-    for (uint32_t c = 0; c < numClasses; c++) {
+    for (uint32_t c = 0; c < numClasses; c++)
+    {
         /* classFqn + nSupers + supers… — saver writes 0; ignore here */
-        char    *cls = NULL;
-        uint32_t cl  = 0;
+        char* cls = NULL;
+        uint32_t cl = 0;
         if (!Tbcx_R_LPString(&r, &cls, &cl))
             goto cleanup;
         Tcl_Free(cls);
         uint32_t nSup = 0;
         if (!Tbcx_R_U32(&r, &nSup))
             goto cleanup;
-        if (nSup > 1024u) {
+        if (nSup > 1024u)
+        {
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: nSuperclasses %u exceeds limit 1024", nSup));
             goto cleanup;
         }
-        for (uint32_t s = 0; s < nSup; s++) {
-            char    *su = NULL;
+        for (uint32_t s = 0; s < nSup; s++)
+        {
+            char* su = NULL;
             uint32_t sl = 0;
             if (!Tbcx_R_LPString(&r, &su, &sl))
                 goto cleanup;
@@ -7391,16 +8001,19 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     uint32_t numMethods = 0;
     if (!Tbcx_R_U32(&r, &numMethods))
         goto cleanup;
-    if (numMethods > TBCX_MAX_METHODS) {
+    if (numMethods > TBCX_MAX_METHODS)
+    {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: numMethods %u exceeds limit %u", numMethods, TBCX_MAX_METHODS));
         goto cleanup;
     }
-    if (numMethods) {
+    if (numMethods)
+    {
         if (AddOOShim(ip, &ooshim) != TCL_OK)
             goto cleanup;
         ooshimInited = 1;
     }
-    for (uint32_t m = 0; m < numMethods; m++) {
+    for (uint32_t m = 0; m < numMethods; m++)
+    {
         if (ReadMethod(&r, ip, &ooshim) != TCL_OK)
             goto cleanup;
     }
@@ -7411,24 +8024,25 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
     {
         TbcxTopFrameSave _sv;
 
-        ByteCode        *top     = TbcxGetByteCode(topBC);
+        ByteCode* top = TbcxGetByteCode(topBC);
 
         /* Create a minimal Proc and attach to the top-level ByteCode so
            that codePtr->procPtr is never NULL during TEBCresume.
            Also propagate via FixLiteralPoolProcPtr to any precompiled
            literal-pool bytecodes (TBCX_LIT_BYTESRC). */
-        Proc            *topProc = NULL;
-        if (top && !top->procPtr) {
-            topProc = (Proc *)Tcl_Alloc(sizeof(Proc));
+        Proc* topProc = NULL;
+        if (top && !top->procPtr)
+        {
+            topProc = (Proc*)Tcl_Alloc(sizeof(Proc));
             TBCX_BENCH_INC(procAllocations);
             memset(topProc, 0, sizeof(Proc));
-            topProc->iPtr     = (Interp *)ip;
+            topProc->iPtr = (Interp*)ip;
             topProc->refCount = 1;
-            topProc->bodyPtr  = topBC;
+            topProc->bodyPtr = topBC;
             Tcl_IncrRefCount(topProc->bodyPtr);
-            topProc->numArgs           = 0;
+            topProc->numArgs = 0;
             topProc->numCompiledLocals = (top->localCachePtr) ? top->localCachePtr->numVars : 0;
-            top->procPtr               = topProc;
+            top->procPtr = topProc;
             TbcxFixupByteCode(top, topProc, ip, curNs, TBCX_FIXUP_CACHE_NONE);
         }
 
@@ -7437,37 +8051,25 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
 
         int topLocalsReady = (TopLocals_Begin(ip, top, &_sv) == TCL_OK);
 
-        /* Save and set iPtr->scriptFile around the top-level eval so
-         * that `info script` inside the loaded bytecode returns the
-         * authored source path — matching Tcl's Tcl_FSEvalFileEx
-         * behavior (tclIOUtil.c:1806-1807) for sourced scripts.
-         *
-         * Priority: use H.sourcePath (the path the artifact was built
-         * from) when the save side recorded one, because that's what
-         * `source` would have returned.  Only if the artifact has no
-         * recorded source path (empty LPString — built from inline
-         * script or channel) do we fall back to the tbcx artifact path
-         * passed in as scriptFilePath; this still satisfies the
-         * self-invocation guard idiom `[info script] eq $::argv0`
-         * because the .tbcx path differs from the outer argv0.
-         *
-         * Both common idioms then work for tbcx-loaded modules:
-         *     set dir [file dirname [info script]]      ;# asset-relative
-         *     if {[info script] eq $::argv0} { ... }    ;# self-guard
-         */
-        Interp  *iPtrLocal    = (Interp *)ip;
-        Tcl_Obj *oldScript    = iPtrLocal->scriptFile;
-        Tcl_Obj *effectivePath = H.sourcePath ? H.sourcePath : scriptFilePath;
-        if (topLocalsReady) {
-            if (effectivePath) {
+        /* During evaluation, info script reports the recorded source path or,
+         * when absent, the artifact path supplied by the caller. */
+        Interp* iPtrLocal = (Interp*)ip;
+        Tcl_Obj* oldScript = iPtrLocal->scriptFile;
+        Tcl_Obj* effectivePath = H.sourcePath ? H.sourcePath : scriptFilePath;
+        if (topLocalsReady)
+        {
+            if (effectivePath)
+            {
                 iPtrLocal->scriptFile = effectivePath;
                 Tcl_IncrRefCount(iPtrLocal->scriptFile);
             }
 
             rc = Tcl_EvalObjEx(ip, topBC, 0);
 
-            if (effectivePath) {
-                if (iPtrLocal->scriptFile) {
+            if (effectivePath)
+            {
+                if (iPtrLocal->scriptFile)
+                {
                     Tcl_DecrRefCount(iPtrLocal->scriptFile);
                 }
                 iPtrLocal->scriptFile = oldScript;
@@ -7476,7 +8078,8 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
 
         TopLocals_End(ip, &_sv);
 
-        if (topProc) {
+        if (topProc)
+        {
             /* Recursively null out non-owning procPtr backpointers in
                literal pool bytecodes before freeing topProc.  This
                covers the full descendant tree, not just immediate
@@ -7490,18 +8093,20 @@ static int LoadTbcxStream(Tcl_Interp *ip, Tcl_Channel ch, Tcl_Obj *scriptFilePat
             topProc->bodyPtr = NULL;
             assert(topProc->refCount > 0 && "topProc refCount underflow before free");
             topProc->refCount--;
-            Tcl_Free((char *)topProc);
+            Tcl_Free((char*)topProc);
         }
 
         /* Handle TCL_RETURN the same way Tcl's 'source' command
            (Tcl_FSEvalFileEx) does. */
-        if (rc == TCL_RETURN) {
-            rc = TclUpdateReturnInfo((Interp *)ip);
+        if (rc == TCL_RETURN)
+        {
+            rc = TclUpdateReturnInfo((Interp*)ip);
         }
     }
 
 cleanup:
-    if (H.sourcePath) {
+    if (H.sourcePath)
+    {
         Tcl_DecrRefCount(H.sourcePath);
         H.sourcePath = NULL;
     }
@@ -7530,17 +8135,20 @@ cleanup:
  *             on all exit paths (success or error).
  * ========================================================================== */
 
-int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
+int Tbcx_LoadObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_CHECK_INTERP_THREAD(interp);
-    if (objc != 2) {
+    if (objc != 2)
+    {
         Tcl_WrongNumArgs(interp, 1, objv, "in");
         return TCL_ERROR;
     }
 
-    Tcl_Obj    *inObj = objv[1];
-    Tcl_Channel inCh  = NULL;
+    Tcl_Obj* inObj = objv[1];
+    Tcl_Channel inCh = NULL;
 
-    if (Tbcx_ProbeOpenChannel(interp, inObj, &inCh)) {
+    if (Tbcx_ProbeOpenChannel(interp, inObj, &inCh))
+    {
         /* Channel branch: no reliable path to use for iPtr->scriptFile;
          * pass NULL so LoadTbcxStream leaves scriptFile alone.  Callers
          * that use an already-open channel typically don't care about
@@ -7548,9 +8156,11 @@ int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         return LoadTbcxStream(interp, inCh, NULL);
     }
 
-    if (Tbcx_ProbeReadableFile(interp, inObj)) {
+    if (Tbcx_ProbeReadableFile(interp, inObj))
+    {
         Tcl_Channel ch = Tcl_FSOpenFileChannel(interp, inObj, "r", 0);
-        if (!ch) {
+        if (!ch)
+        {
             return TCL_ERROR;
         }
         /* File branch: pass the .tbcx path so `info script` inside
@@ -7561,7 +8171,8 @@ int Tbcx_LoadObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
          * a self-invocation guard (standard Tcl idiom) depends on
          * that value being distinct from the outer script's path. */
         int rc = LoadTbcxStream(interp, ch, inObj);
-        if (Tcl_Close(interp, ch) != TCL_OK) {
+        if (Tcl_Close(interp, ch) != TCL_OK)
+        {
             rc = TCL_ERROR;
         }
         return rc;

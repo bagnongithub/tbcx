@@ -611,11 +611,8 @@ test mt.stress.3 {stress: threads creating child interps with OO+lambda loads} \
 # ========================================================================
 
 # --- 5.1  Concurrent package require + immediate save ---
-#     Tests the P0 fix directly: multiple threads do [package require -exact tbcx 1.2.1]
-#     concurrently (racing through TbcxInitTypes / TbcxSaveInitOpcodesLocked),
-#     then immediately exercise tbcx::save with a script complex enough to
-#     hit opcode scanning and retained startCommand sequences.  No serial
-#     pre-initialization.
+#     Multiple threads initialize independent interpreters and immediately
+#     exercise opcode scanning and retained startCommand sequences.
 
 test mt.init.1 {concurrent package require + save (P0 init race)} \
     -constraints haveThread -body {

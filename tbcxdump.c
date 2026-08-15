@@ -8,32 +8,34 @@
  * Forward Declarations
  * ========================================================================== */
 
-static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n);
-static void AppendLitPreview(Tcl_Obj *dst, Tcl_Obj *lit, Tcl_Size maxChars);
-static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len);
-static void AppendExecutableSource(Tcl_Obj *out, uint32_t policy,
-                                   const char *src, uint32_t len);
-static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title);
-static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst);
-static void DumpBCDetails(Tcl_Obj *bcObj, Tcl_Obj *dst);
-static void DumpExceptions(ExceptionRange *exArr, uint32_t numEx, Tcl_Obj *dst);
-static int  DumpLiteralValue(Tcl_Obj *lit, Tcl_Obj *dst);
-static void DumpLocals(ByteCode *bc, Tcl_Obj *dst);
-static int  DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out);
-static int  DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out);
-static int  DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out);
-int         Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]);
+static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n);
+static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, Tcl_Size maxChars);
+static void AppendBodySource(Tcl_Obj* out, const char* src, uint32_t len);
+static void AppendExecutableSource(Tcl_Obj* out, uint32_t policy, const char* src, uint32_t len);
+static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title);
+static void DumpAuxArray(AuxData* auxArr, uint32_t numAux, Tcl_Obj* dst);
+static void DumpBCDetails(Tcl_Obj* bcObj, Tcl_Obj* dst);
+static void DumpExceptions(ExceptionRange* exArr, uint32_t numEx, Tcl_Obj* dst);
+static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst);
+static void DumpLocals(ByteCode* bc, Tcl_Obj* dst);
+static int DumpProcsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out);
+static int DumpClassesSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out);
+static int DumpMethodsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out);
+int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[]);
 
 /* ==========================================================================
  * Dump Helpers
  * ========================================================================== */
 
-static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n) {
+static void AppendEscaped(Tcl_Obj* dst, const char* s, Tcl_Size n)
+{
     Tcl_DString ds;
     Tcl_DStringInit(&ds);
-    for (Tcl_Size i = 0; i < n; i++) {
+    for (Tcl_Size i = 0; i < n; i++)
+    {
         unsigned char c = (unsigned char)s[i];
-        if (c < 0x20 || c == '\\' || c == '"') {
+        if (c < 0x20 || c == '\\' || c == '"')
+        {
             char esc[5];
             esc[0] = '\\';
             esc[1] = 'x';
@@ -41,62 +43,59 @@ static void AppendEscaped(Tcl_Obj *dst, const char *s, Tcl_Size n) {
             esc[3] = "0123456789ABCDEF"[c & 0xF];
             esc[4] = '\0';
             Tcl_DStringAppend(&ds, esc, 4);
-        } else {
-            Tcl_DStringAppend(&ds, (const char *)&s[i], 1);
+        }
+        else
+        {
+            Tcl_DStringAppend(&ds, (const char*)&s[i], 1);
         }
     }
     Tcl_AppendToObj(dst, Tcl_DStringValue(&ds), Tcl_DStringLength(&ds));
     Tcl_DStringFree(&ds);
 }
 
-/* Append a proc or method body's source text to the dump output, indented
- * consistently and with a trailing newline.  Called from DumpProcsSection
- * and DumpMethodsSection when the srcText LPString is non-empty (i.e.
- * when the artifact retains source (include-source or legacy policy).
- *
- * Each source line is prefixed with a fixed six-space indent ("      ")
- * so the text visually nests under the "source: (N bytes)" summary line.
- * No truncation — the body is emitted in full because (a) it's only
- * present when the author deliberately asked for -include-source, and
- * (b) having the actual body visible in dumps is the whole point of
- * preserving it.
- *
- * The six-space indent is applied by scanning the input for '\n' and
- * inserting the indent after each newline (except for a trailing one).
- * A final '\n' is always emitted so the following output starts on a
- * fresh line. */
-static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len) {
-    static const char kIndent[]    = "      ";
+/* Append a complete, nonempty proc or method source field to the dump.
+ * Every line has a six-space indent, and the output ends with a newline. */
+static void AppendBodySource(Tcl_Obj* out, const char* src, uint32_t len)
+{
+    static const char kIndent[] = "      ";
     static const size_t kIndentLen = sizeof(kIndent) - 1;
 
     /* Leading indent for the first line. */
     Tcl_AppendToObj(out, kIndent, (Tcl_Size)kIndentLen);
     uint32_t i = 0;
-    while (i < len) {
+    while (i < len)
+    {
         /* Find the next newline (or end of buffer). */
         uint32_t j = i;
-        while (j < len && src[j] != '\n') {
+        while (j < len && src[j] != '\n')
+        {
             j++;
         }
         /* Emit [i, j) — the line contents without its trailing '\n'. */
-        if (j > i) {
+        if (j > i)
+        {
             Tcl_AppendToObj(out, src + i, (Tcl_Size)(j - i));
         }
-        if (j < len) {
+        if (j < len)
+        {
             /* Hit a newline: emit it, then indent the next line unless
              * this was the final byte (avoid a trailing indent + blank). */
             Tcl_AppendToObj(out, "\n", 1);
-            if (j + 1 < len) {
+            if (j + 1 < len)
+            {
                 Tcl_AppendToObj(out, kIndent, (Tcl_Size)kIndentLen);
             }
             i = j + 1;
-        } else {
+        }
+        else
+        {
             i = j; /* end of input */
         }
     }
     /* Ensure output ends with a newline regardless of whether the
      * source text itself had a final newline. */
-    if (len == 0 || src[len - 1] != '\n') {
+    if (len == 0 || src[len - 1] != '\n')
+    {
         Tcl_AppendToObj(out, "\n", 1);
     }
 }
@@ -104,15 +103,11 @@ static void AppendBodySource(Tcl_Obj *out, const char *src, uint32_t len) {
 /* A zero-length source field has policy-dependent meaning.  Strict artifacts
  * deliberately strip every executable-source field, whereas include-source
  * and legacy artifacts can contain an exact, genuinely empty body. */
-static void AppendExecutableSource(
-    Tcl_Obj *out,
-    uint32_t policy,
-    const char *src,
-    uint32_t len)
+static void AppendExecutableSource(Tcl_Obj* out, uint32_t policy, const char* src, uint32_t len)
 {
-    if ((policy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u) {
-        Tcl_AppendToObj(out,
-            "    source: <stripped at save time>\n", -1);
+    if ((policy & TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY) != 0u)
+    {
+        Tcl_AppendToObj(out, "    source: <stripped at save time>\n", -1);
         return;
     }
     Tcl_AppendPrintfToObj(out, "    source: (%u bytes)\n", len);
@@ -122,37 +117,46 @@ static void AppendExecutableSource(
 
 /* Append a short preview of a literal value for inline annotation.
    Output is capped at maxChars to keep disassembly readable. */
-static void AppendLitPreview(Tcl_Obj *dst, Tcl_Obj *lit, Tcl_Size maxChars) {
-    if (!lit) {
+static void AppendLitPreview(Tcl_Obj* dst, Tcl_Obj* lit, Tcl_Size maxChars)
+{
+    if (!lit)
+    {
         Tcl_AppendToObj(dst, "(null)", -1);
         return;
     }
-    const Tcl_ObjType *ty = lit->typePtr;
-    if (ty == tbcxTyBytecode) {
+    const Tcl_ObjType* ty = lit->typePtr;
+    if (ty == tbcxTyBytecode)
+    {
         Tcl_AppendToObj(dst, "(bytecode)", -1);
         return;
     }
-    if (ty == tbcxTyByteArray) {
-        Tcl_Size       n  = 0;
-        unsigned char *bp = Tbcx_GetByteArrayFromObjSafe(lit, &n);
-        if (!bp) {
+    if (ty == tbcxTyByteArray)
+    {
+        Tcl_Size n = 0;
+        unsigned char* bp = Tbcx_GetByteArrayFromObjSafe(lit, &n);
+        if (!bp)
+        {
             Tcl_AppendToObj(dst, "(bytes:?)", -1);
             return;
         }
         Tcl_AppendPrintfToObj(dst, "(bytes:%ld)", (long)n);
         return;
     }
-    Tcl_Size    sLen = 0;
-    const char *s    = Tbcx_GetStringFromObjSafe(lit, &sLen);
-    if (!s) {
+    Tcl_Size sLen = 0;
+    const char* s = Tbcx_GetStringFromObjSafe(lit, &sLen);
+    if (!s)
+    {
         Tcl_AppendToObj(dst, "(null)", -1);
         return;
     }
-    if (sLen <= maxChars) {
+    if (sLen <= maxChars)
+    {
         Tcl_AppendToObj(dst, "\"", 1);
         AppendEscaped(dst, s, sLen);
         Tcl_AppendToObj(dst, "\"", 1);
-    } else {
+    }
+    else
+    {
         Tcl_AppendToObj(dst, "\"", 1);
         AppendEscaped(dst, s, maxChars);
         Tcl_AppendToObj(dst, "...\"", -1);
@@ -160,22 +164,27 @@ static void AppendLitPreview(Tcl_Obj *dst, Tcl_Obj *lit, Tcl_Size maxChars) {
 }
 
 /* Helper: look up local variable name from ByteCode, returns "" for unnamed. */
-static const char *LocalName(ByteCode *bc, Tcl_Size idx, Tcl_Size *outLen) {
+static const char* LocalName(ByteCode* bc, Tcl_Size idx, Tcl_Size* outLen)
+{
     static const char empty[] = "";
     if (outLen)
         *outLen = 0;
     if (!bc)
         return empty;
     /* Try LocalCache first */
-    if (bc->localCachePtr && idx >= 0 && idx < bc->localCachePtr->numVars) {
-        Tcl_Obj **names = (Tcl_Obj **)&bc->localCachePtr->varName0;
+    if (bc->localCachePtr && idx >= 0 && idx < bc->localCachePtr->numVars)
+    {
+        Tcl_Obj** names = (Tcl_Obj**)&bc->localCachePtr->varName0;
         if (names[idx])
             return Tbcx_GetStringFromObjSafe(names[idx], outLen);
     }
     /* Fallback: walk Proc compiled locals */
-    if (bc->procPtr) {
-        for (CompiledLocal *cl = bc->procPtr->firstLocalPtr; cl; cl = cl->nextPtr) {
-            if (cl->frameIndex == idx && cl->nameLength > 0) {
+    if (bc->procPtr)
+    {
+        for (CompiledLocal* cl = bc->procPtr->firstLocalPtr; cl; cl = cl->nextPtr)
+        {
+            if (cl->frameIndex == idx && cl->nameLength > 0)
+            {
                 if (outLen)
                     *outLen = (Tcl_Size)cl->nameLength;
                 return cl->name;
@@ -198,150 +207,180 @@ static const char *LocalName(ByteCode *bc, Tcl_Size idx, Tcl_Size *outLen) {
  *   - Richer annotations: literal value previews, variable names, jump targets
  * ========================================================================== */
 
-static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
-    if (!bc || !bc->codeStart || bc->numCodeBytes <= 0) {
+static void TbcxDisassembleCode(ByteCode* bc, Tcl_Obj* dst, const char* title)
+{
+    if (!bc || !bc->codeStart || bc->numCodeBytes <= 0)
+    {
         Tcl_AppendPrintfToObj(dst, "  Disassembly (%s): (empty)\n", title ? title : "");
         return;
     }
 
-    const InstructionDesc *instTable = (const InstructionDesc *)TclGetInstructionTable();
-    const unsigned char   *code      = bc->codeStart;
-    Tcl_Size               len       = bc->numCodeBytes;
+    const InstructionDesc* instTable = (const InstructionDesc*)TclGetInstructionTable();
+    const unsigned char* code = bc->codeStart;
+    Tcl_Size len = bc->numCodeBytes;
 
     Tcl_AppendPrintfToObj(dst, "  Disassembly (%s):\n", title ? title : "");
 
     Tcl_Size pc = 0;
-    while (pc < len) {
+    while (pc < len)
+    {
         unsigned int opcode = code[pc];
 
         /* Unknown opcode — hex dump and advance 1 byte */
-        if (opcode > LAST_INST_OPCODE) {
+        if (opcode > LAST_INST_OPCODE)
+        {
             Tcl_AppendPrintfToObj(dst, "    (%4" TCL_Z_MODIFIER "d) ??? 0x%02x\n", pc, opcode);
             pc++;
             continue;
         }
 
-        const InstructionDesc *desc = &instTable[opcode];
+        const InstructionDesc* desc = &instTable[opcode];
         Tcl_AppendPrintfToObj(dst, "    (%4" TCL_Z_MODIFIER "d) %-20s", pc, desc->name);
 
         /* Safety: if numBytes extends past the code block, print what we can
            and stop.  This handles truncated/corrupt bytecode gracefully. */
-        if (pc + desc->numBytes > len) {
+        if (pc + desc->numBytes > len)
+        {
             Tcl_AppendToObj(dst, " <truncated>\n", -1);
             break;
         }
 
         /* Decode operands — offset past the 1-byte opcode */
-        const unsigned char *op         = code + pc + 1;
-        int                  opOff      = 0;  /* byte offset into operand area */
-        Tcl_Size             lvtIdx     = -1; /* LVT index for variable annotation */
-        int                  jumpTarget = -1; /* computed jump target for offset annotation */
-        Tcl_Size             litIdx     = -1; /* literal pool index for value annotation */
+        const unsigned char* op = code + pc + 1;
+        int opOff = 0;        /* byte offset into operand area */
+        Tcl_Size lvtIdx = -1; /* LVT index for variable annotation */
+        int jumpTarget = -1;  /* computed jump target for offset annotation */
+        Tcl_Size litIdx = -1; /* literal pool index for value annotation */
 
-        for (int i = 0; i < desc->numOperands; i++) {
-            switch (desc->opTypes[i]) {
-            case OPERAND_INT1: {
-                int val = (int)(int8_t)op[opOff];
-                Tcl_AppendPrintfToObj(dst, " %d", val);
-                opOff += 1;
-                break;
-            }
-            case OPERAND_INT4: {
-                int32_t val = (int32_t)(((int32_t)(int8_t)op[opOff] << 24) | (op[opOff + 1] << 16) | (op[opOff + 2] << 8) | op[opOff + 3]);
-                Tcl_AppendPrintfToObj(dst, " %d", (int)val);
-                opOff += 4;
-                break;
-            }
-            case OPERAND_UINT1: {
-                unsigned val = op[opOff];
-                Tcl_AppendPrintfToObj(dst, " %u", val);
-                opOff += 1;
-                break;
-            }
-            case OPERAND_UINT4: {
-                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
-                Tcl_AppendPrintfToObj(dst, " %u", val);
-                opOff += 4;
-                break;
-            }
-            case OPERAND_IDX4: {
-                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
-                Tcl_AppendPrintfToObj(dst, " %u", val);
-                opOff += 4;
-                break;
-            }
-            case OPERAND_LVT1: {
-                unsigned val = op[opOff];
-                Tcl_AppendPrintfToObj(dst, " %%v%u", val);
-                lvtIdx = (Tcl_Size)val;
-                opOff += 1;
-                break;
-            }
-            case OPERAND_LVT4: {
-                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
-                Tcl_AppendPrintfToObj(dst, " %%v%u", val);
-                lvtIdx = (Tcl_Size)val;
-                opOff += 4;
-                break;
-            }
-            case OPERAND_AUX4: {
-                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
-                Tcl_AppendPrintfToObj(dst, " aux#%u", val);
-                opOff += 4;
-                break;
-            }
-            case OPERAND_OFFSET1: {
-                int val    = (int)(int8_t)op[opOff];
-                jumpTarget = (int)pc + val;
-                Tcl_AppendPrintfToObj(dst, " %+d", val);
-                opOff += 1;
-                break;
-            }
-            case OPERAND_OFFSET4: {
-                int32_t val = (int32_t)(((int32_t)(int8_t)op[opOff] << 24) | (op[opOff + 1] << 16) | (op[opOff + 2] << 8) | op[opOff + 3]);
-                jumpTarget  = (int)pc + val;
-                Tcl_AppendPrintfToObj(dst, " %+d", (int)val);
-                opOff += 4;
-                break;
-            }
-            case OPERAND_LIT1: {
-                unsigned val = op[opOff];
-                Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
-                if (litIdx < 0)
-                    litIdx = (Tcl_Size)val;
-                opOff += 1;
-                break;
-            }
-            case OPERAND_LIT4: {
-                uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) | ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
-                Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
-                if (litIdx < 0)
-                    litIdx = (Tcl_Size)val;
-                opOff += 4;
-                break;
-            }
-            case OPERAND_SCLS1: {
-                unsigned val = op[opOff];
-                Tcl_AppendPrintfToObj(dst, " scls=%u", val);
-                opOff += 1;
-                break;
-            }
-            case OPERAND_NONE:
-                /* Padding slot — no bytes to consume, nothing to print. */
-                break;
-            default:
-                /* Unknown operand type — print the raw byte value and
-                   the numeric type ID for diagnostic purposes.  Consume
-                   1 byte (the most common size for flag/mode operands
-                   added in newer Tcl versions). */
-                if (opOff < desc->numBytes - 1) {
+        for (int i = 0; i < desc->numOperands; i++)
+        {
+            switch (desc->opTypes[i])
+            {
+                case OPERAND_INT1:
+                {
+                    int val = (int)(int8_t)op[opOff];
+                    Tcl_AppendPrintfToObj(dst, " %d", val);
+                    opOff += 1;
+                    break;
+                }
+                case OPERAND_INT4:
+                {
+                    int32_t val = (int32_t)(((int32_t)(int8_t)op[opOff] << 24) | (op[opOff + 1] << 16) | (op[opOff + 2] << 8) |
+                                            op[opOff + 3]);
+                    Tcl_AppendPrintfToObj(dst, " %d", (int)val);
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_UINT1:
+                {
                     unsigned val = op[opOff];
                     Tcl_AppendPrintfToObj(dst, " %u", val);
                     opOff += 1;
-                } else {
-                    Tcl_AppendToObj(dst, " ???", -1);
+                    break;
                 }
-                break;
+                case OPERAND_UINT4:
+                {
+                    uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
+                                   ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                    Tcl_AppendPrintfToObj(dst, " %u", val);
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_IDX4:
+                {
+                    uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
+                                   ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                    Tcl_AppendPrintfToObj(dst, " %u", val);
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_LVT1:
+                {
+                    unsigned val = op[opOff];
+                    Tcl_AppendPrintfToObj(dst, " %%v%u", val);
+                    lvtIdx = (Tcl_Size)val;
+                    opOff += 1;
+                    break;
+                }
+                case OPERAND_LVT4:
+                {
+                    uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
+                                   ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                    Tcl_AppendPrintfToObj(dst, " %%v%u", val);
+                    lvtIdx = (Tcl_Size)val;
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_AUX4:
+                {
+                    uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
+                                   ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                    Tcl_AppendPrintfToObj(dst, " aux#%u", val);
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_OFFSET1:
+                {
+                    int val = (int)(int8_t)op[opOff];
+                    jumpTarget = (int)pc + val;
+                    Tcl_AppendPrintfToObj(dst, " %+d", val);
+                    opOff += 1;
+                    break;
+                }
+                case OPERAND_OFFSET4:
+                {
+                    int32_t val = (int32_t)(((int32_t)(int8_t)op[opOff] << 24) | (op[opOff + 1] << 16) | (op[opOff + 2] << 8) |
+                                            op[opOff + 3]);
+                    jumpTarget = (int)pc + val;
+                    Tcl_AppendPrintfToObj(dst, " %+d", (int)val);
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_LIT1:
+                {
+                    unsigned val = op[opOff];
+                    Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
+                    if (litIdx < 0)
+                        litIdx = (Tcl_Size)val;
+                    opOff += 1;
+                    break;
+                }
+                case OPERAND_LIT4:
+                {
+                    uint32_t val = ((uint32_t)op[opOff] << 24) | ((uint32_t)op[opOff + 1] << 16) |
+                                   ((uint32_t)op[opOff + 2] << 8) | (uint32_t)op[opOff + 3];
+                    Tcl_AppendPrintfToObj(dst, " %%lit%u", val);
+                    if (litIdx < 0)
+                        litIdx = (Tcl_Size)val;
+                    opOff += 4;
+                    break;
+                }
+                case OPERAND_SCLS1:
+                {
+                    unsigned val = op[opOff];
+                    Tcl_AppendPrintfToObj(dst, " scls=%u", val);
+                    opOff += 1;
+                    break;
+                }
+                case OPERAND_NONE:
+                    /* Padding slot — no bytes to consume, nothing to print. */
+                    break;
+                default:
+                    /* Unknown operand type — print the raw byte value and
+                       the numeric type ID for diagnostic purposes.  Consume
+                       1 byte (the most common size for flag/mode operands
+                       added in newer Tcl versions). */
+                    if (opOff < desc->numBytes - 1)
+                    {
+                        unsigned val = op[opOff];
+                        Tcl_AppendPrintfToObj(dst, " %u", val);
+                        opOff += 1;
+                    }
+                    else
+                    {
+                        Tcl_AppendToObj(dst, " ???", -1);
+                    }
+                    break;
             }
         }
 
@@ -350,16 +389,19 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
         /* Literal value preview for any instruction with a literal-pool
            operand (OPERAND_LIT1/LIT4).  Operand-type-driven — no
            instruction name checks needed. */
-        if (litIdx >= 0 && litIdx < bc->numLitObjects && bc->objArrayPtr[litIdx]) {
+        if (litIdx >= 0 && litIdx < bc->numLitObjects && bc->objArrayPtr[litIdx])
+        {
             Tcl_AppendToObj(dst, " \t# ", -1);
             AppendLitPreview(dst, bc->objArrayPtr[litIdx], 48);
         }
 
         /* Variable name annotation for LVT operands */
-        if (lvtIdx >= 0) {
-            Tcl_Size    nLen = 0;
-            const char *nm   = LocalName(bc, lvtIdx, &nLen);
-            if (nLen > 0) {
+        if (lvtIdx >= 0)
+        {
+            Tcl_Size nLen = 0;
+            const char* nm = LocalName(bc, lvtIdx, &nLen);
+            if (nLen > 0)
+            {
                 Tcl_AppendToObj(dst, " \t# \"", -1);
                 AppendEscaped(dst, nm, nLen);
                 Tcl_AppendToObj(dst, "\"", 1);
@@ -367,7 +409,8 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
         }
 
         /* Jump target annotation */
-        if (jumpTarget >= 0) {
+        if (jumpTarget >= 0)
+        {
             Tcl_AppendPrintfToObj(dst, " \t# -> pc %d", jumpTarget);
         }
 
@@ -376,37 +419,48 @@ static void TbcxDisassembleCode(ByteCode *bc, Tcl_Obj *dst, const char *title) {
     }
 }
 
-static int DumpLiteralValue(Tcl_Obj *lit, Tcl_Obj *dst) {
-    if (!lit) {
+static int DumpLiteralValue(Tcl_Obj* lit, Tcl_Obj* dst)
+{
+    if (!lit)
+    {
         Tcl_AppendToObj(dst, "(null)", -1);
         return TCL_OK;
     }
-    const Tcl_ObjType *ty = lit->typePtr;
+    const Tcl_ObjType* ty = lit->typePtr;
     /* In Tcl 9.1 the integer types were unified: tbcxTyBignum == tbcxTyInt.
        Probe with WideInt first to label small integers correctly. */
-    if (ty == tbcxTyBignum || ty == tbcxTyInt) {
+    if (ty == tbcxTyBignum || ty == tbcxTyInt)
+    {
         Tcl_WideInt wv = 0;
-        if (Tcl_GetWideIntFromObj(NULL, lit, &wv) == TCL_OK) {
+        if (Tcl_GetWideIntFromObj(NULL, lit, &wv) == TCL_OK)
+        {
             Tcl_AppendPrintfToObj(dst, "(int) %" TCL_LL_MODIFIER "d", (long long)wv);
-        } else {
+        }
+        else
+        {
             /* True bignum — doesn't fit in 64 bits */
-            Tcl_Size    n = 0;
-            const char *s = Tbcx_GetStringFromObjSafe(lit, &n);
+            Tcl_Size n = 0;
+            const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
             Tcl_AppendToObj(dst, "(bignum) ", -1);
             AppendEscaped(dst, s, n);
         }
         return TCL_OK;
-    } else if (tbcxTyBoolean && tbcxTyBoolean != tbcxTyInt && ty == tbcxTyBoolean) {
+    }
+    else if (tbcxTyBoolean && tbcxTyBoolean != tbcxTyInt && ty == tbcxTyBoolean)
+    {
         int b = 0;
-        if (Tcl_GetBooleanFromObj(NULL, lit, &b) != TCL_OK) {
+        if (Tcl_GetBooleanFromObj(NULL, lit, &b) != TCL_OK)
+        {
             Tcl_AppendToObj(dst, "(boolean:invalid)", -1);
             return TCL_OK;
         }
         Tcl_AppendPrintfToObj(dst, "(boolean) %s", b ? "true" : "false");
         return TCL_OK;
-    } else if (ty == tbcxTyByteArray) {
-        Tcl_Size       n = 0;
-        unsigned char *p = Tbcx_GetByteArrayFromObjSafe(lit, &n);
+    }
+    else if (ty == tbcxTyByteArray)
+    {
+        Tcl_Size n = 0;
+        unsigned char* p = Tbcx_GetByteArrayFromObjSafe(lit, &n);
         Tcl_AppendPrintfToObj(dst, "(bytearray) %ld bytes", (long)n);
         if (n)
             Tcl_AppendToObj(dst, " (hex:", -1);
@@ -417,30 +471,41 @@ static int DumpLiteralValue(Tcl_Obj *lit, Tcl_Obj *dst) {
         if (n)
             Tcl_AppendToObj(dst, ")", -1);
         return TCL_OK;
-    } else if (ty == tbcxTyDict) {
-        Tcl_Size    n = 0;
-        const char *s = Tbcx_GetStringFromObjSafe(lit, &n);
+    }
+    else if (ty == tbcxTyDict)
+    {
+        Tcl_Size n = 0;
+        const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
         Tcl_AppendToObj(dst, "(dict) ", -1);
         AppendEscaped(dst, s, n);
         return TCL_OK;
-    } else if (ty == tbcxTyDouble) {
+    }
+    else if (ty == tbcxTyDouble)
+    {
         double d = 0;
-        if (Tcl_GetDoubleFromObj(NULL, lit, &d) != TCL_OK) {
+        if (Tcl_GetDoubleFromObj(NULL, lit, &d) != TCL_OK)
+        {
             Tcl_AppendToObj(dst, "(double:invalid)", -1);
             return TCL_OK;
         }
         Tcl_AppendPrintfToObj(dst, "(double) %.17g", d);
         return TCL_OK;
-    } else if (ty == tbcxTyList) {
+    }
+    else if (ty == tbcxTyList)
+    {
         Tcl_AppendToObj(dst, "(list) ", -1);
         Tcl_AppendObjToObj(dst, lit);
         return TCL_OK;
-    } else if (ty == tbcxTyBytecode) {
+    }
+    else if (ty == tbcxTyBytecode)
+    {
         Tcl_AppendToObj(dst, "(bytecode)", -1);
         return TCL_OK;
-    } else {
-        Tcl_Size    n = 0;
-        const char *s = Tbcx_GetStringFromObjSafe(lit, &n);
+    }
+    else
+    {
+        Tcl_Size n = 0;
+        const char* s = Tbcx_GetStringFromObjSafe(lit, &n);
         Tcl_AppendToObj(dst, "(string) \"", -1);
         AppendEscaped(dst, s, n);
         Tcl_AppendToObj(dst, "\"", 1);
@@ -448,84 +513,99 @@ static int DumpLiteralValue(Tcl_Obj *lit, Tcl_Obj *dst) {
     }
 }
 
-static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst) {
+static void DumpAuxArray(AuxData* auxArr, uint32_t numAux, Tcl_Obj* dst)
+{
     if (!numAux)
         return;
     Tcl_AppendToObj(dst, "  AuxData:\n", -1);
 
-    for (uint32_t i = 0; i < numAux; i++) {
-        const AuxDataType *ty        = auxArr[i].type;
-        const char        *tn        = (ty && ty->name) ? ty->name : "(unknown)";
-        ClientData         cd        = auxArr[i].clientData;
+    for (uint32_t i = 0; i < numAux; i++)
+    {
+        const AuxDataType* ty = auxArr[i].type;
+        const char* tn = (ty && ty->name) ? ty->name : "(unknown)";
+        ClientData cd = auxArr[i].clientData;
 
         /* Be defensive: never dereference clientData unless we are really sure
            of the aux type.  Recognize by pointer *or* by type name, so we stay
            robust across builds where we only have the name. */
-        int                isJTStr   = (ty == tbcxAuxJTStr) || (tn && strcmp(tn, "JumptableInfo") == 0);
-        int                isJTNum   = (ty == tbcxAuxJTNum) || (tn && strcmp(tn, "JumptableNumInfo") == 0);
-        int                isDictUpd = (ty == tbcxAuxDictUpdate) || (tn && strcmp(tn, "DictUpdateInfo") == 0);
-        int                isNewFor  = (ty == tbcxAuxNewForeach) || (tn && strcmp(tn, "NewForeachInfo") == 0);
+        int isJTStr = (ty == tbcxAuxJTStr) || (tn && strcmp(tn, "JumptableInfo") == 0);
+        int isJTNum = (ty == tbcxAuxJTNum) || (tn && strcmp(tn, "JumptableNumInfo") == 0);
+        int isDictUpd = (ty == tbcxAuxDictUpdate) || (tn && strcmp(tn, "DictUpdateInfo") == 0);
+        int isNewFor = (ty == tbcxAuxNewForeach) || (tn && strcmp(tn, "NewForeachInfo") == 0);
 
         Tcl_AppendPrintfToObj(dst, "    #%u: %s", i, tn);
 
-        if (!cd) {
+        if (!cd)
+        {
             Tcl_AppendToObj(dst, " (no data)\n", -1);
             continue;
         }
 
-        if (isJTStr) {
-            JumptableInfo *info = (JumptableInfo *)cd;
+        if (isJTStr)
+        {
+            JumptableInfo* info = (JumptableInfo*)cd;
             Tcl_AppendToObj(dst, " (jumptable:str)\n", -1);
             /* Iterate the string-keyed hash in a safe way */
             Tcl_HashSearch s;
-            Tcl_HashEntry *e;
-            for (e = Tcl_FirstHashEntry(&info->hashTable, &s); e; e = Tcl_NextHashEntry(&s)) {
-                const char *k      = (const char *)Tcl_GetHashKey(&info->hashTable, e);
-                int         target = PTR2INT(Tcl_GetHashValue(e));
+            Tcl_HashEntry* e;
+            for (e = Tcl_FirstHashEntry(&info->hashTable, &s); e; e = Tcl_NextHashEntry(&s))
+            {
+                const char* k = (const char*)Tcl_GetHashKey(&info->hashTable, e);
+                int target = PTR2INT(Tcl_GetHashValue(e));
                 Tcl_AppendPrintfToObj(dst, "      \"%s\" -> pc %d\n", k ? k : "", target);
             }
             continue;
         }
 
-        if (isJTNum) {
-            JumptableNumInfo *info = (JumptableNumInfo *)cd;
+        if (isJTNum)
+        {
+            JumptableNumInfo* info = (JumptableNumInfo*)cd;
             Tcl_AppendToObj(dst, " (jumptable:num)\n", -1);
             /* Tcl core and the loader use TCL_ONE_WORD_KEYS on every
                platform.  The loader rejects serialized values that cannot
                be represented by the evaluator's pointer-sized key. */
             Tcl_HashSearch s;
-            Tcl_HashEntry *e;
-            for (e = Tcl_FirstHashEntry(&info->hashTable, &s); e; e = Tcl_NextHashEntry(&s)) {
-                int         target = PTR2INT(Tcl_GetHashValue(e));
-                Tcl_WideInt key = (Tcl_WideInt)(intptr_t)
-                    Tcl_GetHashKey(&info->hashTable, e);
-                Tcl_AppendPrintfToObj(dst,
-                    "      %" TCL_LL_MODIFIER "d -> pc %d\n",
-                    (long long)key, target);
+            Tcl_HashEntry* e;
+            for (e = Tcl_FirstHashEntry(&info->hashTable, &s); e; e = Tcl_NextHashEntry(&s))
+            {
+                int target = PTR2INT(Tcl_GetHashValue(e));
+                Tcl_WideInt key = (Tcl_WideInt)(intptr_t)Tcl_GetHashKey(&info->hashTable, e);
+                Tcl_AppendPrintfToObj(dst, "      %" TCL_LL_MODIFIER "d -> pc %d\n", (long long)key, target);
             }
             continue;
         }
 
-        if (isDictUpd) {
-            DictUpdateInfo *info = (DictUpdateInfo *)cd;
+        if (isDictUpd)
+        {
+            DictUpdateInfo* info = (DictUpdateInfo*)cd;
             Tcl_AppendToObj(dst, " (dictupdate)\n", -1);
             Tcl_AppendPrintfToObj(dst, "      %" TCL_Z_MODIFIER "d variable indices:", info->length);
-            for (Tcl_Size k = 0; k < info->length; k++) {
+            for (Tcl_Size k = 0; k < info->length; k++)
+            {
                 Tcl_AppendPrintfToObj(dst, " %" TCL_Z_MODIFIER "d", info->varIndices[k]);
             }
             Tcl_AppendToObj(dst, "\n", 1);
             continue;
         }
 
-        if (isNewFor) {
-            ForeachInfo *info = (ForeachInfo *)cd;
+        if (isNewFor)
+        {
+            ForeachInfo* info = (ForeachInfo*)cd;
             Tcl_AppendToObj(dst, " (newForeach)\n", -1);
-            Tcl_AppendPrintfToObj(dst, "      lists=%" TCL_Z_MODIFIER "d, firstTmp=%" TCL_Z_MODIFIER "d, loopCtTmp=%" TCL_Z_MODIFIER "d\n", info->numLists, info->firstValueTemp, info->loopCtTemp);
-            for (Tcl_Size L = 0; L < info->numLists; L++) {
-                ForeachVarList *vl = info->varLists[L];
+            Tcl_AppendPrintfToObj(dst,
+                                  "      lists=%" TCL_Z_MODIFIER "d, firstTmp=%" TCL_Z_MODIFIER "d, loopCtTmp=%" TCL_Z_MODIFIER
+                                  "d\n",
+                                  info->numLists,
+                                  info->firstValueTemp,
+                                  info->loopCtTemp);
+            for (Tcl_Size L = 0; L < info->numLists; L++)
+            {
+                ForeachVarList* vl = info->varLists[L];
                 Tcl_AppendPrintfToObj(dst, "      list#%" TCL_Z_MODIFIER "d vars:", L);
-                if (vl) {
-                    for (Tcl_Size j = 0; j < vl->numVars; j++) {
+                if (vl)
+                {
+                    for (Tcl_Size j = 0; j < vl->numVars; j++)
+                    {
                         Tcl_Size vi = vl->varIndexes[j];
                         Tcl_AppendPrintfToObj(dst, " %" TCL_Z_MODIFIER "d", vi);
                     }
@@ -540,37 +620,56 @@ static void DumpAuxArray(AuxData *auxArr, uint32_t numAux, Tcl_Obj *dst) {
     }
 }
 
-static void DumpExceptions(ExceptionRange *exArr, uint32_t numEx, Tcl_Obj *dst) {
+static void DumpExceptions(ExceptionRange* exArr, uint32_t numEx, Tcl_Obj* dst)
+{
     if (!numEx)
         return;
     Tcl_AppendToObj(dst, "  Exception Ranges:\n", -1);
-    for (uint32_t i = 0; i < numEx; i++) {
-        ExceptionRange *er = &exArr[i];
-        const char     *t  = (er->type == LOOP_EXCEPTION_RANGE) ? "loop" : (er->type == CATCH_EXCEPTION_RANGE) ? "catch" : "other";
-        Tcl_AppendPrintfToObj(dst, "    #%u: %s [pc %" TCL_Z_MODIFIER "d .. %" TCL_Z_MODIFIER "d]", i, t, er->codeOffset, er->codeOffset + er->numCodeBytes);
-        if (er->type == LOOP_EXCEPTION_RANGE) {
-            Tcl_AppendPrintfToObj(dst, ", continue->pc %" TCL_Z_MODIFIER "d, break->pc %" TCL_Z_MODIFIER "d\n", er->continueOffset, er->breakOffset);
-        } else if (er->type == CATCH_EXCEPTION_RANGE) {
+    for (uint32_t i = 0; i < numEx; i++)
+    {
+        ExceptionRange* er = &exArr[i];
+        const char* t = (er->type == LOOP_EXCEPTION_RANGE) ? "loop" : (er->type == CATCH_EXCEPTION_RANGE) ? "catch" : "other";
+        Tcl_AppendPrintfToObj(dst,
+                              "    #%u: %s [pc %" TCL_Z_MODIFIER "d .. %" TCL_Z_MODIFIER "d]",
+                              i,
+                              t,
+                              er->codeOffset,
+                              er->codeOffset + er->numCodeBytes);
+        if (er->type == LOOP_EXCEPTION_RANGE)
+        {
+            Tcl_AppendPrintfToObj(dst,
+                                  ", continue->pc %" TCL_Z_MODIFIER "d, break->pc %" TCL_Z_MODIFIER "d\n",
+                                  er->continueOffset,
+                                  er->breakOffset);
+        }
+        else if (er->type == CATCH_EXCEPTION_RANGE)
+        {
             Tcl_AppendPrintfToObj(dst, ", catch->pc %" TCL_Z_MODIFIER "d\n", er->catchOffset);
-        } else {
+        }
+        else
+        {
             Tcl_AppendToObj(dst, "\n", 1);
         }
     }
 }
 
-static void DumpLocals(ByteCode *bc, Tcl_Obj *dst) {
-    if (!bc) {
+static void DumpLocals(ByteCode* bc, Tcl_Obj* dst)
+{
+    if (!bc)
+    {
         Tcl_AppendToObj(dst, "  Locals: 0\n", -1);
         return;
     }
     /* 1) LocalCache present (top-level or proc/method with cache) */
-    if (bc->localCachePtr && bc->localCachePtr->numVars > 0) {
-        Tcl_Size  n     = (Tcl_Size)bc->localCachePtr->numVars;
-        Tcl_Obj **namev = (Tcl_Obj **)&bc->localCachePtr->varName0; /* Tcl 9.1 */
+    if (bc->localCachePtr && bc->localCachePtr->numVars > 0)
+    {
+        Tcl_Size n = (Tcl_Size)bc->localCachePtr->numVars;
+        Tcl_Obj** namev = (Tcl_Obj**)&bc->localCachePtr->varName0; /* Tcl 9.1 */
         Tcl_AppendPrintfToObj(dst, "  Locals (%" TCL_Z_MODIFIER "d):\n", n);
-        for (Tcl_Size i = 0; i < n; i++) {
-            Tcl_Size    ln = 0;
-            const char *s  = namev[i] ? Tbcx_GetStringFromObjSafe(namev[i], &ln) : "";
+        for (Tcl_Size i = 0; i < n; i++)
+        {
+            Tcl_Size ln = 0;
+            const char* s = namev[i] ? Tbcx_GetStringFromObjSafe(namev[i], &ln) : "";
             Tcl_AppendPrintfToObj(dst, "    [%" TCL_Z_MODIFIER "d] \"", i);
             AppendEscaped(dst, s, ln);
             Tcl_AppendToObj(dst, "\"\n", 2);
@@ -578,14 +677,16 @@ static void DumpLocals(ByteCode *bc, Tcl_Obj *dst) {
         return;
     }
     /* 2) Fallback: compiled locals from the Proc, if any */
-    if (bc->procPtr && bc->procPtr->numCompiledLocals > 0) {
-        Proc          *p  = bc->procPtr;
-        Tcl_Size       n  = (Tcl_Size)p->numCompiledLocals;
-        CompiledLocal *cl = p->firstLocalPtr;
+    if (bc->procPtr && bc->procPtr->numCompiledLocals > 0)
+    {
+        Proc* p = bc->procPtr;
+        Tcl_Size n = (Tcl_Size)p->numCompiledLocals;
+        CompiledLocal* cl = p->firstLocalPtr;
         Tcl_AppendPrintfToObj(dst, "  Locals (%" TCL_Z_MODIFIER "d) [from Proc]:\n", n);
-        for (; cl; cl = cl->nextPtr) {
-            const char *nm = cl->name;                 /* trailing array (always valid) */
-            Tcl_Size    ln = (Tcl_Size)cl->nameLength; /* exact length from compiler */
+        for (; cl; cl = cl->nextPtr)
+        {
+            const char* nm = cl->name;              /* trailing array (always valid) */
+            Tcl_Size ln = (Tcl_Size)cl->nameLength; /* exact length from compiler */
             Tcl_AppendPrintfToObj(dst, "    [%" TCL_Z_MODIFIER "d] \"", (Tcl_Size)cl->frameIndex);
             AppendEscaped(dst, nm, ln);
             Tcl_AppendToObj(dst, "\"", 1);
@@ -601,20 +702,28 @@ static void DumpLocals(ByteCode *bc, Tcl_Obj *dst) {
     Tcl_AppendToObj(dst, "  Locals: 0\n", -1);
 }
 
-static void DumpBCDetails(Tcl_Obj *bcObj, Tcl_Obj *dst) {
+static void DumpBCDetails(Tcl_Obj* bcObj, Tcl_Obj* dst)
+{
     if (!bcObj)
         return;
-    ByteCode *bc = NULL;
-    bc           = TbcxGetByteCode(bcObj);
+    ByteCode* bc = NULL;
+    bc = TbcxGetByteCode(bcObj);
     if (!bc)
         return;
 
-    Tcl_AppendPrintfToObj(dst, "  code=%ld, stack=%ld, lits=%ld, aux=%ld, except=%ld\n", (long)bc->numCodeBytes, (long)bc->maxStackDepth, (long)bc->numLitObjects, (long)bc->numAuxDataItems,
+    Tcl_AppendPrintfToObj(dst,
+                          "  code=%ld, stack=%ld, lits=%ld, aux=%ld, except=%ld\n",
+                          (long)bc->numCodeBytes,
+                          (long)bc->maxStackDepth,
+                          (long)bc->numLitObjects,
+                          (long)bc->numAuxDataItems,
                           (long)bc->numExceptRanges);
     DumpLocals(bc, dst);
-    if (bc->numLitObjects > 0) {
+    if (bc->numLitObjects > 0)
+    {
         Tcl_AppendToObj(dst, "  Literals:\n", -1);
-        for (Tcl_Size i = 0; i < bc->numLitObjects; i++) {
+        for (Tcl_Size i = 0; i < bc->numLitObjects; i++)
+        {
             Tcl_AppendPrintfToObj(dst, "    [%ld] ", (long)i);
             DumpLiteralValue(bc->objArrayPtr[i], dst);
             Tcl_AppendToObj(dst, "\n", 1);
@@ -625,11 +734,12 @@ static void DumpBCDetails(Tcl_Obj *bcObj, Tcl_Obj *dst) {
 }
 
 /* Convenience wrapper: extract ByteCode* from a Tcl_Obj and disassemble. */
-static void DisassembleBCObj(Tcl_Obj *bcObj, Tcl_Obj *dst, const char *title) {
+static void DisassembleBCObj(Tcl_Obj* bcObj, Tcl_Obj* dst, const char* title)
+{
     if (!bcObj)
         return;
-    ByteCode *bcPtr = NULL;
-    bcPtr           = TbcxGetByteCode(bcObj);
+    ByteCode* bcPtr = NULL;
+    bcPtr = TbcxGetByteCode(bcObj);
     TbcxDisassembleCode(bcPtr, dst, title);
 }
 
@@ -640,42 +750,46 @@ static void DisassembleBCObj(Tcl_Obj *bcObj, Tcl_Obj *dst, const char *title) {
  * is responsible for top-level cleanup (topBC, out, channel).
  * ========================================================================== */
 
-static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
+static int DumpProcsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
+{
     uint32_t numProcs = 0;
     if (!Tbcx_R_U32(r, &numProcs))
         return TCL_ERROR;
-    if (numProcs > TBCX_MAX_PROCS) {
-        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
-            "tbcx: numProcs %u exceeds limit %u", numProcs, TBCX_MAX_PROCS));
+    if (numProcs > TBCX_MAX_PROCS)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: numProcs %u exceeds limit %u", numProcs, TBCX_MAX_PROCS));
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "\nProcs: %u\n", numProcs);
 
-    for (uint32_t i = 0; i < numProcs; i++) {
-        char    *nameC = NULL;
+    for (uint32_t i = 0; i < numProcs; i++)
+    {
+        char* nameC = NULL;
         uint32_t nameL = 0;
-        char    *nsC   = NULL;
-        uint32_t nsL   = 0;
-        char    *argsC = NULL;
+        char* nsC = NULL;
+        uint32_t nsL = 0;
+        char* argsC = NULL;
         uint32_t argsL = 0;
 
         if (!Tbcx_R_LPString(r, &nameC, &nameL))
             return TCL_ERROR;
-        if (!Tbcx_R_LPString(r, &nsC, &nsL)) {
+        if (!Tbcx_R_LPString(r, &nsC, &nsL))
+        {
             Tcl_Free(nameC);
             return TCL_ERROR;
         }
-        if (!Tbcx_R_LPString(r, &argsC, &argsL)) {
+        if (!Tbcx_R_LPString(r, &argsC, &argsL))
+        {
             Tcl_Free(nameC);
             Tcl_Free(nsC);
             return TCL_ERROR;
         }
 
-        Tcl_Obj *nameFqn = Tcl_NewStringObj(nameC, (Tcl_Size)nameL);
+        Tcl_Obj* nameFqn = Tcl_NewStringObj(nameC, (Tcl_Size)nameL);
         Tcl_IncrRefCount(nameFqn);
-        Tcl_Obj *nsObj = Tcl_NewStringObj(nsC, (Tcl_Size)nsL);
+        Tcl_Obj* nsObj = Tcl_NewStringObj(nsC, (Tcl_Size)nsL);
         Tcl_IncrRefCount(nsObj);
-        Tcl_Obj *argsObj = Tcl_NewStringObj(argsC, (Tcl_Size)argsL);
+        Tcl_Obj* argsObj = Tcl_NewStringObj(argsC, (Tcl_Size)argsL);
         Tcl_IncrRefCount(argsObj);
         Tcl_Free(nameC);
         Tcl_Free(nsC);
@@ -692,10 +806,10 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
 
         /* Body source text.  Its policy, rather than its length, determines
          * whether an empty value means stripped or an exact empty body. */
-        char    *bodySrcC   = NULL;
-        uint32_t bodySrcL   = 0;
-        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_PROC,
-                &bodySrcC, &bodySrcL)) {
+        char* bodySrcC = NULL;
+        uint32_t bodySrcL = 0;
+        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_PROC, &bodySrcC, &bodySrcL))
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(nameFqn);
@@ -705,13 +819,13 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         if (bodySrcC)
             Tcl_Free(bodySrcC);
 
-        Namespace *nsPtr = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(nsObj), NULL, 0);
+        Namespace* nsPtr = (Namespace*)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(nsObj), NULL, 0);
         if (!nsPtr)
-            nsPtr = (Namespace *)Tcl_GetGlobalNamespace(interp);
-        uint32_t nLoc   = 0;
-        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, nsPtr, &nLoc, 0, 1,
-            NULL);
-        if (!bodyBC) {
+            nsPtr = (Namespace*)Tcl_GetGlobalNamespace(interp);
+        uint32_t nLoc = 0;
+        Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, interp, nsPtr, &nLoc, 0, 1, NULL);
+        if (!bodyBC)
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nsObj);
             Tcl_DecrRefCount(nameFqn);
@@ -730,23 +844,25 @@ static int DumpProcsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
     return TCL_OK;
 }
 
-static int DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
+static int DumpClassesSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
+{
     uint32_t numClasses = 0;
     if (!Tbcx_R_U32(r, &numClasses))
         return TCL_ERROR;
-    if (numClasses > TBCX_MAX_CLASSES) {
-        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
-            "tbcx: numClasses %u exceeds limit %u", numClasses, TBCX_MAX_CLASSES));
+    if (numClasses > TBCX_MAX_CLASSES)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: numClasses %u exceeds limit %u", numClasses, TBCX_MAX_CLASSES));
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "\nClasses: %u\n", numClasses);
 
-    for (uint32_t c = 0; c < numClasses; c++) {
-        char    *cls = NULL;
-        uint32_t cl  = 0;
+    for (uint32_t c = 0; c < numClasses; c++)
+    {
+        char* cls = NULL;
+        uint32_t cl = 0;
         if (!Tbcx_R_LPString(r, &cls, &cl))
             return TCL_ERROR;
-        Tcl_Obj *clsObj = Tcl_NewStringObj(cls, (Tcl_Size)cl);
+        Tcl_Obj* clsObj = Tcl_NewStringObj(cls, (Tcl_Size)cl);
         Tcl_IncrRefCount(clsObj);
         Tcl_Free(cls);
         Tcl_AppendToObj(out, "  - class ", -1);
@@ -754,20 +870,23 @@ static int DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendToObj(out, "\n", 1);
 
         uint32_t nSup = 0;
-        if (!Tbcx_R_U32(r, &nSup)) {
+        if (!Tbcx_R_U32(r, &nSup))
+        {
             Tcl_DecrRefCount(clsObj);
             return TCL_ERROR;
         }
-        if (nSup > 1024u) {
-            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
-                "tbcx: nSuperclasses %u exceeds limit 1024", nSup));
+        if (nSup > 1024u)
+        {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: nSuperclasses %u exceeds limit 1024", nSup));
             Tcl_DecrRefCount(clsObj);
             return TCL_ERROR;
         }
-        for (uint32_t s = 0; s < nSup; s++) {
-            char    *su = NULL;
+        for (uint32_t s = 0; s < nSup; s++)
+        {
+            char* su = NULL;
             uint32_t sl = 0;
-            if (!Tbcx_R_LPString(r, &su, &sl)) {
+            if (!Tbcx_R_LPString(r, &su, &sl))
+            {
                 Tcl_DecrRefCount(clsObj);
                 return TCL_ERROR;
             }
@@ -778,79 +897,87 @@ static int DumpClassesSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
     return TCL_OK;
 }
 
-static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
+static int DumpMethodsSection(TbcxIn* r, Tcl_Interp* interp, Tcl_Obj* out)
+{
     uint32_t numMethods = 0;
     if (!Tbcx_R_U32(r, &numMethods))
         return TCL_ERROR;
-    if (numMethods > TBCX_MAX_METHODS) {
-        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
-            "tbcx: numMethods %u exceeds limit %u", numMethods, TBCX_MAX_METHODS));
+    if (numMethods > TBCX_MAX_METHODS)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("tbcx: numMethods %u exceeds limit %u", numMethods, TBCX_MAX_METHODS));
         return TCL_ERROR;
     }
     Tcl_AppendPrintfToObj(out, "\nMethods: %u\n", numMethods);
 
-    for (uint32_t m = 0; m < numMethods; m++) {
-        char    *clsf = NULL;
+    for (uint32_t m = 0; m < numMethods; m++)
+    {
+        char* clsf = NULL;
         uint32_t clsL = 0;
         if (!Tbcx_R_LPString(r, &clsf, &clsL))
             return TCL_ERROR;
-        Tcl_Obj *clsFqn = Tcl_NewStringObj(clsf, (Tcl_Size)clsL);
+        Tcl_Obj* clsFqn = Tcl_NewStringObj(clsf, (Tcl_Size)clsL);
         Tcl_IncrRefCount(clsFqn);
         Tcl_Free(clsf);
 
         uint8_t kind = 0;
-        if (!Tbcx_R_U8(r, &kind)) {
+        if (!Tbcx_R_U8(r, &kind))
+        {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
 
         /* scope byte — read immediately after kind. */
         uint8_t scope = 0;
-        if (!Tbcx_R_U8(r, &scope)) {
+        if (!Tbcx_R_U8(r, &scope))
+        {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
         /* origin byte (class-definition vs object-definition) — after scope. */
         uint8_t origin = 0;
-        if (!Tbcx_R_U8(r, &origin)) {
+        if (!Tbcx_R_U8(r, &origin))
+        {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
-        if (Tbcx_ValidateMethodMetadata(interp, kind, scope, origin) != TCL_OK) {
+        if (Tbcx_ValidateMethodMetadata(interp, kind, scope, origin) != TCL_OK)
+        {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
 
-        char    *mname = NULL;
-        uint32_t mnL   = 0;
-        if (!Tbcx_R_LPString(r, &mname, &mnL)) {
+        char* mname = NULL;
+        uint32_t mnL = 0;
+        if (!Tbcx_R_LPString(r, &mname, &mnL))
+        {
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
-        Tcl_Obj *nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
+        Tcl_Obj* nameObj = Tcl_NewStringObj(mname, (Tcl_Size)mnL);
         Tcl_IncrRefCount(nameObj);
         Tcl_Free(mname);
-        if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && mnL != 0) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj(
-                "tbcx: constructor/destructor record has a method name", -1));
+        if ((kind == TBCX_METH_CTOR || kind == TBCX_METH_DTOR) && mnL != 0)
+        {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: constructor/destructor record has a method name", -1));
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
 
-        char    *args = NULL;
-        uint32_t aL   = 0;
-        if (!Tbcx_R_LPString(r, &args, &aL)) {
+        char* args = NULL;
+        uint32_t aL = 0;
+        if (!Tbcx_R_LPString(r, &args, &aL))
+        {
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
             return TCL_ERROR;
         }
-        Tcl_Obj *argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
+        Tcl_Obj* argsObj = Tcl_NewStringObj(args, (Tcl_Size)aL);
         Tcl_IncrRefCount(argsObj);
         Tcl_Free(args);
-        if (kind == TBCX_METH_DTOR && aL != 0) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj(
-                "tbcx: destructor record has arguments", -1));
+        if (kind == TBCX_METH_DTOR && aL != 0)
+        {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: destructor record has arguments", -1));
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -859,7 +986,7 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
 
         Tcl_AppendToObj(out, "  - ", -1);
         Tcl_AppendObjToObj(out, clsFqn);
-        const char *kname = (kind == TBCX_METH_INST)    ? "::method "
+        const char* kname = (kind == TBCX_METH_INST)    ? "::method "
                             : (kind == TBCX_METH_CLASS) ? "::classmethod "
                             : (kind == TBCX_METH_CTOR)  ? "::constructor "
                             : (kind == TBCX_METH_DTOR)  ? "::destructor "
@@ -868,7 +995,7 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendPrintfToObj(out, " %s", kname);
         Tcl_AppendObjToObj(out, nameObj);
         Tcl_AppendToObj(out, "\n", 1);
-        const char *scopeName = (scope == TBCX_MSCOPE_PUBLIC)         ? "public"
+        const char* scopeName = (scope == TBCX_MSCOPE_PUBLIC)         ? "public"
                                 : (scope == TBCX_MSCOPE_UNEXPORTED)   ? "unexported"
                                 : (scope == TBCX_MSCOPE_TRUE_PRIVATE) ? "true-private"
                                                                       : "default";
@@ -879,10 +1006,10 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         Tcl_AppendToObj(out, "\n", 1);
 
         /* Body source text — see proc loop above. */
-        char    *bodySrcC = NULL;
+        char* bodySrcC = NULL;
         uint32_t bodySrcL = 0;
-        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_METHOD,
-                &bodySrcC, &bodySrcL)) {
+        if (!Tbcx_ReadExecutableSource(r, TBCX_EXEC_SOURCE_METHOD, &bodySrcC, &bodySrcL))
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -892,13 +1019,13 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         if (bodySrcC)
             Tcl_Free(bodySrcC);
 
-        Namespace *clsNs = (Namespace *)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(clsFqn), NULL, 0);
+        Namespace* clsNs = (Namespace*)Tcl_FindNamespace(interp, Tbcx_GetStringSafe(clsFqn), NULL, 0);
         if (!clsNs)
-            clsNs = (Namespace *)Tcl_GetGlobalNamespace(interp);
-        uint32_t nLoc   = 0;
-        Tcl_Obj *bodyBC = Tbcx_ReadBlock(r, interp, clsNs, &nLoc, 0, 1,
-            NULL);
-        if (!bodyBC) {
+            clsNs = (Namespace*)Tcl_GetGlobalNamespace(interp);
+        uint32_t nLoc = 0;
+        Tcl_Obj* bodyBC = Tbcx_ReadBlock(r, interp, clsNs, &nLoc, 0, 1, NULL);
+        if (!bodyBC)
+        {
             Tcl_DecrRefCount(argsObj);
             Tcl_DecrRefCount(nameObj);
             Tcl_DecrRefCount(clsFqn);
@@ -909,8 +1036,8 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
         /* Use method name for the disassembly title; for constructors
            and destructors the name field is empty, so fall back to the
            kind label (e.g. "constructor", "destructor"). */
-        const char *disTitle  = Tbcx_GetStringSafe(nameObj);
-        const char *kindLabel = (kind == TBCX_METH_CTOR) ? "constructor" : (kind == TBCX_METH_DTOR) ? "destructor" : NULL;
+        const char* disTitle = Tbcx_GetStringSafe(nameObj);
+        const char* kindLabel = (kind == TBCX_METH_CTOR) ? "constructor" : (kind == TBCX_METH_DTOR) ? "destructor" : NULL;
         if ((!disTitle || !disTitle[0]) && kindLabel)
             disTitle = kindLabel;
         DisassembleBCObj(bodyBC, out, disTitle);
@@ -934,9 +1061,11 @@ static int DumpMethodsSection(TbcxIn *r, Tcl_Interp *interp, Tcl_Obj *out) {
  * Thread:     must be called on the interp-owning thread.
  * ========================================================================== */
 
-int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const objv[]) {
+int Tbcx_DumpObjCmd(TCL_UNUSED(void*), Tcl_Interp* interp, Tcl_Size objc, Tcl_Obj* const objv[])
+{
     TBCX_CHECK_INTERP_THREAD(interp);
-    if (objc != 2) {
+    if (objc != 2)
+    {
         Tcl_WrongNumArgs(interp, 1, objv, "filename");
         return TCL_ERROR;
     }
@@ -944,17 +1073,20 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     Tcl_Channel in = Tcl_FSOpenFileChannel(interp, objv[1], "r", 0);
     if (!in)
         return TCL_ERROR;
-    if (Tbcx_CheckBinaryChan(interp, in) != TCL_OK) {
+    if (Tbcx_CheckBinaryChan(interp, in) != TCL_OK)
+    {
         Tcl_Close(interp, in);
         return TCL_ERROR;
     }
 
-    TbcxArtifactImage *image = NULL;
-    if (Tbcx_ReadArtifactImage(interp, in, &image) != TCL_OK) {
+    TbcxArtifactImage* image = NULL;
+    if (Tbcx_ReadArtifactImage(interp, in, &image) != TCL_OK)
+    {
         Tcl_Close(interp, in);
         return TCL_ERROR;
     }
-    if (Tbcx_PreflightArtifact(interp, image) != TCL_OK) {
+    if (Tbcx_PreflightArtifact(interp, image) != TCL_OK)
+    {
         Tbcx_ArtifactImageRelease(image);
         Tcl_Close(interp, in);
         return TCL_ERROR;
@@ -964,8 +1096,10 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
     Tbcx_R_InitImage(&r, interp, image);
     TbcxHeader H;
     memset(&H, 0, sizeof(H));
-    if (!Tbcx_ReadHeader(&r, &H) || r.err) {
-        if (H.sourcePath) {
+    if (!Tbcx_ReadHeader(&r, &H) || r.err)
+    {
+        if (H.sourcePath)
+        {
             Tcl_DecrRefCount(H.sourcePath);
         }
         Tbcx_ArtifactImageRelease(image);
@@ -973,60 +1107,68 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         return TCL_ERROR;
     }
 
-    Tcl_Obj *out = Tcl_NewObj();
+    Tcl_Obj* out = Tcl_NewObj();
     Tcl_IncrRefCount(out);
     int rc = TCL_ERROR;
 
     /* Header */
     Tcl_AppendToObj(out, "TBCX Header:\n", -1);
-    Tcl_AppendPrintfToObj(out, "  magic = 0x%08X ('%c''%c''%c''%c')\n", H.magic, (H.magic) & 0xFF, (H.magic >> 8) & 0xFF, (H.magic >> 16) & 0xFF, (H.magic >> 24) & 0xFF);
+    Tcl_AppendPrintfToObj(out,
+                          "  magic = 0x%08X ('%c''%c''%c''%c')\n",
+                          H.magic,
+                          (H.magic) & 0xFF,
+                          (H.magic >> 8) & 0xFF,
+                          (H.magic >> 16) & 0xFF,
+                          (H.magic >> 24) & 0xFF);
     Tcl_AppendPrintfToObj(out, "  format = %u\n", H.format);
-    Tcl_AppendPrintfToObj(out, "  tcl_version = %u.%u.%u (type %u)\n", (unsigned)((H.tcl_version >> 24) & 0xFFu), (unsigned)((H.tcl_version >> 16) & 0xFFu), (unsigned)((H.tcl_version >> 8) & 0xFFu),
+    Tcl_AppendPrintfToObj(out,
+                          "  tcl_version = %u.%u.%u (type %u)\n",
+                          (unsigned)((H.tcl_version >> 24) & 0xFFu),
+                          (unsigned)((H.tcl_version >> 16) & 0xFFu),
+                          (unsigned)((H.tcl_version >> 8) & 0xFFu),
                           (unsigned)(H.tcl_version & 0xFFu));
-    Tcl_AppendPrintfToObj(out, "  top: code=%" PRIu64 ", except=%u, lits=%u, aux=%u, locals=%u, stack=%u\n", H.codeLenTop, H.numExceptTop, H.numLitsTop, H.numAuxTop,
-                          H.numLocalsTop, H.maxStackTop);
-    if (H.sourcePath) {
+    Tcl_AppendPrintfToObj(out,
+                          "  top: code=%" PRIu64 ", except=%u, lits=%u, aux=%u, locals=%u, stack=%u\n",
+                          H.codeLenTop,
+                          H.numExceptTop,
+                          H.numLitsTop,
+                          H.numAuxTop,
+                          H.numLocalsTop,
+                          H.maxStackTop);
+    if (H.sourcePath)
+    {
         Tcl_Size pl = 0;
-        const char *ps = Tbcx_GetStringFromObjSafe(H.sourcePath, &pl);
+        const char* ps = Tbcx_GetStringFromObjSafe(H.sourcePath, &pl);
         Tcl_AppendPrintfToObj(out, "  source = %s\n", ps);
-    } else {
+    }
+    else
+    {
         Tcl_AppendToObj(out, "  source = <inline or channel>\n", -1);
     }
-    const char *policyName = image->sourcePolicy ==
-            TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY
-        ? "strict-compiled-only"
-        : image->sourcePolicy == TBCX_BLOCK_POLICY_INCLUDE_SOURCE
-        ? "include-source" : "legacy";
+    const char* policyName = image->sourcePolicy == TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY ? "strict-compiled-only"
+                             : image->sourcePolicy == TBCX_BLOCK_POLICY_INCLUDE_SOURCE     ? "include-source"
+                                                                                           : "legacy";
     Tcl_AppendPrintfToObj(out, "  sourcePolicy = %s\n", policyName);
-    Tcl_AppendPrintfToObj(out,
-        "  executableSourceFields = %" TCL_SIZE_MODIFIER "d\n",
-        image->executableSourceFieldCount);
-    Tcl_AppendPrintfToObj(out,
-        "  nonemptyExecutableSourceFields = %" TCL_SIZE_MODIFIER "d\n",
-        image->nonemptyExecutableSourceFieldCount);
-    Tcl_AppendPrintfToObj(out,
-        "  executableSourceBytes = %" PRIu64 "\n",
-        image->executableSourceBytes);
+    Tcl_AppendPrintfToObj(out, "  executableSourceFields = %" TCL_SIZE_MODIFIER "d\n", image->executableSourceFieldCount);
+    Tcl_AppendPrintfToObj(
+        out, "  nonemptyExecutableSourceFields = %" TCL_SIZE_MODIFIER "d\n", image->nonemptyExecutableSourceFieldCount);
+    Tcl_AppendPrintfToObj(out, "  executableSourceBytes = %" PRIu64 "\n", image->executableSourceBytes);
 
     /* Top-level block */
-    Namespace *curNs   = (Namespace *)Tcl_GetGlobalNamespace(interp);
-    uint32_t   dummyNL = 0;
-    uint32_t   topPolicy = TBCX_BLOCK_POLICY_LEGACY;
-    Tcl_Obj   *topBC   = Tbcx_ReadBlock(&r, interp, curNs, &dummyNL, 0, 1,
-        &topPolicy);
+    Namespace* curNs = (Namespace*)Tcl_GetGlobalNamespace(interp);
+    uint32_t dummyNL = 0;
+    uint32_t topPolicy = TBCX_BLOCK_POLICY_LEGACY;
+    Tcl_Obj* topBC = Tbcx_ReadBlock(&r, interp, curNs, &dummyNL, 0, 1, &topPolicy);
     if (!topBC)
         goto cleanup_no_topbc;
     Tcl_IncrRefCount(topBC);
-    ByteCode *parsedTop = TbcxGetByteCode(topBC);
+    ByteCode* parsedTop = TbcxGetByteCode(topBC);
     if (!parsedTop || H.codeLenTop != (uint64_t)parsedTop->numCodeBytes ||
-        H.numExceptTop != (uint32_t)parsedTop->numExceptRanges ||
-        H.numLitsTop != (uint32_t)parsedTop->numLitObjects ||
-        H.numAuxTop != (uint32_t)parsedTop->numAuxDataItems ||
-        H.numLocalsTop != dummyNL ||
-        H.maxStackTop != (uint32_t)parsedTop->maxStackDepth ||
-        topPolicy != image->sourcePolicy) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj(
-            "tbcx: top-level header/block metadata mismatch", -1));
+        H.numExceptTop != (uint32_t)parsedTop->numExceptRanges || H.numLitsTop != (uint32_t)parsedTop->numLitObjects ||
+        H.numAuxTop != (uint32_t)parsedTop->numAuxDataItems || H.numLocalsTop != dummyNL ||
+        H.maxStackTop != (uint32_t)parsedTop->maxStackDepth || topPolicy != image->sourcePolicy)
+    {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: top-level header/block metadata mismatch", -1));
         goto cleanup;
     }
     Tcl_AppendToObj(out, "\nTop-level block:\n", -1);
@@ -1042,16 +1184,12 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
         goto cleanup;
     if (!Tbcx_R_AtEOF(&r))
         goto cleanup;
-    if (r.executableSourceFieldCount !=
-            image->executableSourceFieldCount ||
-        r.nonemptyExecutableSourceFieldCount !=
-            image->nonemptyExecutableSourceFieldCount ||
-        r.executableSourceBytes != image->executableSourceBytes) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj(
-            "tbcx: preflight/materialization source accounting mismatch",
-            -1));
-        Tcl_SetErrorCode(interp, "TBCX", "LOAD", "SOURCE", "ACCOUNTING",
-            NULL);
+    if (r.executableSourceFieldCount != image->executableSourceFieldCount ||
+        r.nonemptyExecutableSourceFieldCount != image->nonemptyExecutableSourceFieldCount ||
+        r.executableSourceBytes != image->executableSourceBytes)
+    {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tbcx: preflight/materialization source accounting mismatch", -1));
+        Tcl_SetErrorCode(interp, "TBCX", "LOAD", "SOURCE", "ACCOUNTING", NULL);
         goto cleanup;
     }
 
@@ -1060,14 +1198,16 @@ int Tbcx_DumpObjCmd(TCL_UNUSED(void *), Tcl_Interp *interp, Tcl_Size objc, Tcl_O
 cleanup:
     Tcl_DecrRefCount(topBC);
 cleanup_no_topbc:
-    if (H.sourcePath) {
+    if (H.sourcePath)
+    {
         Tcl_DecrRefCount(H.sourcePath);
         H.sourcePath = NULL;
     }
     if (Tcl_Close(interp, in) != TCL_OK)
         rc = TCL_ERROR;
     Tbcx_ArtifactImageRelease(image);
-    if (rc == TCL_OK) {
+    if (rc == TCL_OK)
+    {
         Tcl_SetObjResult(interp, out);
     }
     Tcl_DecrRefCount(out);

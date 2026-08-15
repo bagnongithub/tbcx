@@ -27,21 +27,15 @@
 #include "tclTomMath.h"
 
 #define TBCX_MAGIC 0x58434254u
-/* TBCX_FORMAT 93u — current on-wire format for Tcl 9.1.
+/* TBCX_FORMAT 93u is the on-wire format for Tcl 9.1. The loader accepts
+ * format 93 artifacts and requires an exact Tcl producer-version match.
  *
- * Format 93 preserves the artifact compiler's final instruction stream
- * verbatim.
- * Format 92 artifacts are deliberately rejected: their startCommand
- * instructions may have been irreversibly replaced at save time, so the
- * loader cannot restore Tcl's command-limit, cancellation, or epoch-check
- * semantics.
- *
- * The former top-block reserved u32 selects the executable-source policy.
- * A default strict artifact writes empty proc, method, BYTESRC, and lambda
- * source LPStrings; -include-source retains their authored bytes for
- * introspection only. Both new policies execute PRECOMPILED material. The
- * loader substitutes a diagnostic string representation for stripped proc,
- * method, and lambda bodies without treating it as executable fallback.
+ * The top-block policy word selects source-backed, strict compiled-only, or
+ * include-source behavior. Strict artifacts contain empty proc, method,
+ * BYTESRC, and lambda source LPStrings. Include-source artifacts retain those
+ * bytes for introspection. Both nonzero policies execute PRECOMPILED material.
+ * Stripped proc, method, and lambda objects receive diagnostic string
+ * representations.
  *
  * Each method record carries a `scope` u8 immediately AFTER `kind` and
  * before `name` (see TBCX_MSCOPE_*); it records the TclOO visibility the
@@ -57,15 +51,11 @@
  * (non-literal) body is never patched from a stale same-key record. */
 #define TBCX_FORMAT 93u
 
-/* Format-93 top-block source policy.  The field was reserved in the r91
- * layout, so new artifacts remain format 93 while older loaders reject them
- * loudly.  Nested block policy fields are always zero. */
+/* Format-93 top-block source policy. Nested block policy fields are zero. */
 #define TBCX_BLOCK_POLICY_LEGACY 0u
 #define TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY (1u << 0)
 #define TBCX_BLOCK_POLICY_INCLUDE_SOURCE (1u << 1)
-#define TBCX_BLOCK_POLICY_MASK                                              \
-    (TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY |                              \
-     TBCX_BLOCK_POLICY_INCLUDE_SOURCE)
+#define TBCX_BLOCK_POLICY_MASK (TBCX_BLOCK_POLICY_STRICT_COMPILED_ONLY | TBCX_BLOCK_POLICY_INCLUDE_SOURCE)
 
 /* Method visibility scope (method record `scope` u8).  Mirrors the
  * TclOO SCOPE_FLAGS (PUBLIC_METHOD / unexported / TRUE_PRIVATE_METHOD),
@@ -80,41 +70,25 @@
  * TbcxCtx.saveFlags and consulted where per-site behavior changes.
  * Wire format is unaffected by the flags themselves — they only alter
  * what the save side chooses to emit. */
-#define TBCX_SAVE_FL_INCLUDE_SOURCE 0x1u /* retain exact proc, method,
-                                            BYTESRC, and lambda source
-                                            LPStrings for introspection;
-                                            execution remains compiled */
+#define TBCX_SAVE_FL_INCLUDE_SOURCE                                                                                              \
+    0x1u /* retain exact proc, method,                                                                                           \
+            BYTESRC, and lambda source                                                                                           \
+            LPStrings for introspection;                                                                                         \
+            execution remains compiled */
 
-/* Diagnostic sentinel installed as body string-rep when the artifact was
- * written without -include-source (the default).  Two-line shape matches
- * ActiveState TclPro tclcompiler's canonical pattern (Compiler8.html,
- * "Example 1: Cloning Procedures"), validated by 25 years of production
- * use in TclPro/ActiveTcl/TclDevKit:
- *
- *     1. A `#` comment line that shows up as the top of any error
- *        traceback, making the cause visible at a glance without
- *        requiring readers to parse the error message.
- *     2. An `error` call so that if downstream code round-trips this
- *        body — e.g.
- *            proc new {} [info body original]
- *            new
- *        — the resulting proc fails loudly at invocation rather than
- *        silently running as a no-op.
- *
- * Newline separator between the two statements; bodies become two-
- * statement scripts. `info body`, `info frame`, and error traces all
- * display this string directly, so the diagnostic is visible in
- * every consumption path. */
-#define TBCX_STRIPPED_SOURCE_SENTINEL                                                \
-    "# tbcx: body source stripped at save time; info body unavailable\n"             \
+/* Two-line string representation for proc and method bodies in strict
+ * artifacts. Introspection returns this value, and evaluating a copied body
+ * raises the diagnostic error on its second command. */
+#define TBCX_STRIPPED_SOURCE_SENTINEL                                                                                            \
+    "# tbcx: body source stripped at save time; info body unavailable\n"                                                         \
     "error \"tbcx: introspection-based cloning is not supported for this artifact\""
 
 /* Diagnostic body used only for the in-memory string representation of a
  * strict lambda.  It is never serialized as executable source.  A new string
  * object reconstructed from the diagnostic lambda has no TBCX provenance and
  * therefore fails with a stable error instead of executing an empty body. */
-#define TBCX_STRIPPED_LAMBDA_SENTINEL                                      \
-    "return -code error -errorcode {TBCX EVAL LAMBDA STRIPPED} "          \
+#define TBCX_STRIPPED_LAMBDA_SENTINEL                                                                                            \
+    "return -code error -errorcode {TBCX EVAL LAMBDA STRIPPED} "                                                                 \
     "{tbcx: stripped lambda identity was lost}"
 
 /* Thread-ownership assertion.  Verifies that the current thread is the
@@ -124,29 +98,26 @@
  * Fires assert() on violation — use for internal helpers and void-
  * returning callbacks where TCL_ERROR cannot be propagated. */
 #if defined(TBCX_THREAD_CHECKS) || !defined(NDEBUG)
-#define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                                                                                                  \
-    do {                                                                                                                                                                                               \
-        Interp *_tbcx_iPtr = (Interp *)(ip);                                                                                                                                                           \
-        assert(_tbcx_iPtr->threadId == Tcl_GetCurrentThread() && "TBCX: must be called from the interp-owning thread");                                                                                \
+#define TBCX_ASSERT_INTERP_THREAD(ip)                                                                                            \
+    do                                                                                                                           \
+    {                                                                                                                            \
+        Interp* _tbcx_iPtr = (Interp*)(ip);                                                                                      \
+        assert(_tbcx_iPtr->threadId == Tcl_GetCurrentThread() && "TBCX: must be called from the interp-owning thread");          \
     } while (0)
 #else
 #define TBCX_ASSERT_INTERP_THREAD(ip) ((void)0)
 #endif
 
-/* Thread-ownership check for Tcl command entry points.  Always active
- * in all builds (debug and release).  Returns TCL_ERROR with a
- * diagnostic message instead of crashing — use at the four public
- * Tcl commands (save, load, dump, gc) where the caller can handle
- * the error through the normal Tcl result channel.
- *
- * Cost: one pointer comparison + one Tcl_GetCurrentThread() call per
- * command invocation — negligible relative to I/O and compilation. */
-#define TBCX_CHECK_INTERP_THREAD(ip)                                                                                                                                                                   \
-    do {                                                                                                                                                                                               \
-        if (((Interp *)(ip))->threadId != Tcl_GetCurrentThread()) {                                                                                                                                    \
-            Tcl_SetObjResult((ip), Tcl_NewStringObj("tbcx: called from non-owning thread", -1));                                                                                                       \
-            return TCL_ERROR;                                                                                                                                                                          \
-        }                                                                                                                                                                                              \
+/* Thread-ownership check for Tcl command entry points. Always active in all
+ * builds. Returns TCL_ERROR through the interpreter result channel. */
+#define TBCX_CHECK_INTERP_THREAD(ip)                                                                                             \
+    do                                                                                                                           \
+    {                                                                                                                            \
+        if (((Interp*)(ip))->threadId != Tcl_GetCurrentThread())                                                                 \
+        {                                                                                                                        \
+            Tcl_SetObjResult((ip), Tcl_NewStringObj("tbcx: called from non-owning thread", -1));                                 \
+            return TCL_ERROR;                                                                                                    \
+        }                                                                                                                        \
     } while (0)
 
 #define TBCX_LIT_BIGNUM 0u
@@ -180,26 +151,19 @@
 #define TBCX_MORIGIN_CLASS 0u  /* captured from oo::define / oo::class      */
 #define TBCX_MORIGIN_OBJECT 1u /* captured from oo::objdefine               */
 
-/* Per-object/class method STUB body.  The save side replaces a captured
- * method's body with this exact no-op comment in the rewritten builder/stub;
- * the loader patches a method's precompiled body ONLY when the forwarded body
- * equals this sentinel.  A method left VERBATIM by the saver (non-literal
- * name/args/body, or a runtime-variable target) keeps its real body, which is
- * never this sentinel, so it is never overwritten by a precompiled record —
- * even one belonging to another builder that defined the same method name on
- * the same object.  The leading "#\x01" makes it a comment (a no-op if it ever
- * runs before the swap) that no authored body would ever match. */
+/* Method-body sentinel used in rewritten builders. The loader substitutes a
+ * precompiled body only when the forwarded body equals this value. The
+ * leading "#\x01" makes the sentinel a no-op Tcl comment. */
 #define TBCX_METH_STUB_BODY "#\x01tbcx-method-stub"
 #define TBCX_METH_STUB_BODY_LEN (sizeof(TBCX_METH_STUB_BODY) - 1)
 
-/* Indexed proc marker prefix.  The save side emits stub bodies of the
-   form "\x01TBCX<decimal-index>" so that the load-side ProcShim can
-   match by position rather than by FQN — correctly handling conflicting
-   proc definitions across if/else branches. */
+/* Indexed proc marker prefix. Stub bodies have the form
+ * "\x01TBCX<decimal-index>" and are matched positionally by ProcShim. */
 #define TBCX_PROC_MARKER_PFX "\x01TBCX"
 #define TBCX_PROC_MARKER_PFX_LEN 5
 
-typedef struct TbcxHeader {
+typedef struct TbcxHeader
+{
     uint32_t magic;       /* "TBCX" */
     uint32_t format;      /* format version */
     uint32_t tcl_version; /* mmjjppTT */
@@ -211,17 +175,15 @@ typedef struct TbcxHeader {
     uint32_t maxStackTop;
     /* Staging fields — NOT serialized as fixed-size.  sourcePath is
      * written/read as an LPString immediately after maxStackTop. */
-    Tcl_Obj *sourcePath;  /* LPString; NULL or empty = no path */
+    Tcl_Obj* sourcePath; /* LPString; NULL or empty = no path */
 } TbcxHeader;
 
 extern _Atomic int tbcxHostIsLE;
 
-uint32_t           Tbcx_PackTclVersion(void);
+uint32_t Tbcx_PackTclVersion(void);
 
-/* Wire-format caps — production-safe defaults for untrusted input.
- * These limit the maximum values the deserializer will accept from a
- * .tbcx stream.  Combined with Tcl_AttemptAlloc for wire-derived sizes,
- * hostile files cannot crash the process via OOM/panic. */
+/* Maximum values accepted from a .tbcx stream. Wire-derived allocations use
+ * Tcl_AttemptAlloc after checked size arithmetic. */
 #define TBCX_MAX_CODE (64u * 1024u * 1024u)
 #define TBCX_MAX_LITERALS (1u * 1024u * 1024u)
 #define TBCX_MAX_AUX (1u * 1024u * 1024u)
@@ -243,15 +205,17 @@ uint32_t           Tbcx_PackTclVersion(void);
  * and zero length on failure so callers can safely treat the value as
  * an empty string/byte-array in non-fatal scanning/rewrite paths.
  */
-static inline const char *Tbcx_GetStringFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *lenPtr) {
-    const char *s;
+static inline const char* Tbcx_GetStringFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
+{
+    const char* s;
 
     if (lenPtr)
         *lenPtr = 0;
     if (!objPtr)
         return "";
     s = Tcl_GetStringFromObj(objPtr, lenPtr);
-    if (!s) {
+    if (!s)
+    {
         if (lenPtr)
             *lenPtr = 0;
         return "";
@@ -259,8 +223,9 @@ static inline const char *Tbcx_GetStringFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *l
     return s;
 }
 
-static inline const char *Tbcx_GetStringSafe(Tcl_Obj *objPtr) {
-    const char *s;
+static inline const char* Tbcx_GetStringSafe(Tcl_Obj* objPtr)
+{
+    const char* s;
 
     if (!objPtr)
         return "";
@@ -268,22 +233,24 @@ static inline const char *Tbcx_GetStringSafe(Tcl_Obj *objPtr) {
     return s ? s : "";
 }
 
-static inline unsigned char *Tbcx_GetByteArrayFromObjSafe(Tcl_Obj *objPtr, Tcl_Size *lenPtr) {
+static inline unsigned char* Tbcx_GetByteArrayFromObjSafe(Tcl_Obj* objPtr, Tcl_Size* lenPtr)
+{
     /* const: sentinel byte must never be written through the returned pointer.
      * Cast to non-const on return to match Tcl_GetByteArrayFromObj signature;
      * callers that only need the bytes for reading are safe. */
     static const unsigned char emptyByte = 0;
-    unsigned char             *p;
+    unsigned char* p;
 
     if (lenPtr)
         *lenPtr = 0;
     if (!objPtr)
-        return (unsigned char *)&emptyByte;
+        return (unsigned char*)&emptyByte;
     p = Tcl_GetByteArrayFromObj(objPtr, lenPtr);
-    if (!p) {
+    if (!p)
+    {
         if (lenPtr)
             *lenPtr = 0;
-        return (unsigned char *)&emptyByte;
+        return (unsigned char*)&emptyByte;
     }
     return p;
 }
@@ -295,15 +262,18 @@ static inline unsigned char *Tbcx_GetByteArrayFromObjSafe(Tcl_Obj *objPtr, Tcl_S
  * wherever an empty-string substitution would silently corrupt identifiers
  * (namespace FQNs, proc/method/class names, shim-name construction, wire-
  * format keys).  Callers must check the return value and propagate error. */
-static inline const char *Tbcx_GetStringFromObjStrict(Tcl_Interp *ip, Tcl_Obj *o, Tcl_Size *len) {
-    const char *s;
-    if (!o) {
+static inline const char* Tbcx_GetStringFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
+{
+    const char* s;
+    if (!o)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetStringFromObj(o, len);
-    if (!s) {
+    if (!s)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
@@ -311,15 +281,18 @@ static inline const char *Tbcx_GetStringFromObjStrict(Tcl_Interp *ip, Tcl_Obj *o
     return s;
 }
 
-static inline const char *Tbcx_GetStringStrict(Tcl_Interp *ip, Tcl_Obj *o) {
-    const char *s;
-    if (!o) {
+static inline const char* Tbcx_GetStringStrict(Tcl_Interp* ip, Tcl_Obj* o)
+{
+    const char* s;
+    if (!o)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     s = Tcl_GetString(o);
-    if (!s) {
+    if (!s)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid string object", -1));
         return NULL;
@@ -327,15 +300,18 @@ static inline const char *Tbcx_GetStringStrict(Tcl_Interp *ip, Tcl_Obj *o) {
     return s;
 }
 
-static inline unsigned char *Tbcx_GetByteArrayFromObjStrict(Tcl_Interp *ip, Tcl_Obj *o, Tcl_Size *len) {
-    unsigned char *p;
-    if (!o) {
+static inline unsigned char* Tbcx_GetByteArrayFromObjStrict(Tcl_Interp* ip, Tcl_Obj* o, Tcl_Size* len)
+{
+    unsigned char* p;
+    if (!o)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object (NULL Tcl_Obj)", -1));
         return NULL;
     }
     p = Tcl_GetByteArrayFromObj(o, len);
-    if (!p) {
+    if (!p)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_NewStringObj("tbcx: expected valid bytearray object", -1));
         return NULL;
@@ -346,18 +322,22 @@ static inline unsigned char *Tbcx_GetByteArrayFromObjStrict(Tcl_Interp *ip, Tcl_
 /* Validate a key string for use with namespace/hash APIs.
  * Rejects embedded NULs and optionally requires absolute namespace form.
  * Returns TCL_OK on success, TCL_ERROR with interp result set on failure. */
-static inline int Tbcx_ValidateKeyString(Tcl_Interp *ip, const char *s, Tcl_Size len, const char *what, int requireAbsoluteNs) {
-    if (!s) {
+static inline int Tbcx_ValidateKeyString(Tcl_Interp* ip, const char* s, Tcl_Size len, const char* what, int requireAbsoluteNs)
+{
+    if (!s)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: missing %s", what));
         return TCL_ERROR;
     }
-    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL) {
+    if (len > 0 && memchr(s, '\0', (size_t)len) != NULL)
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s contains embedded NUL", what));
         return TCL_ERROR;
     }
-    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':')) {
+    if (requireAbsoluteNs && !(len >= 2 && s[0] == ':' && s[1] == ':'))
+    {
         if (ip)
             Tcl_SetObjResult(ip, Tcl_ObjPrintf("tbcx: %s must be absolute", what));
         return TCL_ERROR;
@@ -365,24 +345,17 @@ static inline int Tbcx_ValidateKeyString(Tcl_Interp *ip, const char *s, Tcl_Size
     return TCL_OK;
 }
 
-extern const Tcl_ObjType *tbcxTyBignum;
-extern const Tcl_ObjType *tbcxTyBoolean;
-extern const Tcl_ObjType *tbcxTyByteArray;
-extern const Tcl_ObjType *tbcxTyBytecode;
+extern const Tcl_ObjType* tbcxTyBignum;
+extern const Tcl_ObjType* tbcxTyBoolean;
+extern const Tcl_ObjType* tbcxTyByteArray;
+extern const Tcl_ObjType* tbcxTyBytecode;
 
-/* TbcxGetByteCode — extract ByteCode* from a Tcl_Obj using the runtime
- * type pointer (tbcxTyBytecode), NOT the compile-time &tclByteCodeType.
- *
- * ByteCodeGetInternalRep (from tclCompile.h) uses &tclByteCodeType, which
- * is resolved at LINK time.  In stubs-linked extensions (especially on
- * macOS with two-level namespace), this symbol may resolve to a different
- * address than what Tcl_GetObjType("bytecode") returns at RUNTIME.  When
- * they differ, ByteCodeGetInternalRep silently returns NULL, causing all
- * procPtr/epoch fixups to be skipped — leading to crashes on coroutine
- * yield/resume (procPtr=NULL, SIGSEGV at offset 0x30). */
-static inline ByteCode   *TbcxGetByteCode(Tcl_Obj *objPtr) {
-    const Tcl_ObjInternalRep *irPtr = Tcl_FetchInternalRep(objPtr, tbcxTyBytecode);
-    return irPtr ? (ByteCode *)irPtr->twoPtrValue.ptr1 : NULL;
+/* Extract ByteCode* using the runtime bytecode type registered by Tcl.
+ * Returns NULL when objPtr has no matching internal representation. */
+static inline ByteCode* TbcxGetByteCode(Tcl_Obj* objPtr)
+{
+    const Tcl_ObjInternalRep* irPtr = Tcl_FetchInternalRep(objPtr, tbcxTyBytecode);
+    return irPtr ? (ByteCode*)irPtr->twoPtrValue.ptr1 : NULL;
 }
 
 /* Flags for TbcxFixupByteCode cache handling strategy. */
@@ -390,42 +363,44 @@ static inline ByteCode   *TbcxGetByteCode(Tcl_Obj *objPtr) {
 #define TBCX_FIXUP_CACHE_DROP 1 /* NULL cache for a rebuilt-Proc fallback */
 #define TBCX_FIXUP_CACHE_NONE 2 /* Don't touch LocalCache */
 
-extern const Tcl_ObjType *tbcxTyDict;
-extern const Tcl_ObjType *tbcxTyDouble;
-extern const Tcl_ObjType *tbcxTyInt;
-extern const Tcl_ObjType *tbcxTyLambda;
-extern const Tcl_ObjType *tbcxTyList;
-extern const Tcl_ObjType *tbcxTyProcBody;
+extern const Tcl_ObjType* tbcxTyDict;
+extern const Tcl_ObjType* tbcxTyDouble;
+extern const Tcl_ObjType* tbcxTyInt;
+extern const Tcl_ObjType* tbcxTyLambda;
+extern const Tcl_ObjType* tbcxTyList;
+extern const Tcl_ObjType* tbcxTyProcBody;
 
-extern const AuxDataType *tbcxAuxJTStr;
-extern const AuxDataType *tbcxAuxJTNum;
-extern const AuxDataType *tbcxAuxDictUpdate;
-extern const AuxDataType *tbcxAuxNewForeach;
+extern const AuxDataType* tbcxAuxJTStr;
+extern const AuxDataType* tbcxAuxJTNum;
+extern const AuxDataType* tbcxAuxDictUpdate;
+extern const AuxDataType* tbcxAuxNewForeach;
 
 /* ==========================================================================
  * Buffered I/O wrapper types
  * ========================================================================== */
 
-typedef struct TbcxIn {
-    Tcl_Interp   *interp;
-    Tcl_Channel   chan;
-    int           err;
+typedef struct TbcxIn
+{
+    Tcl_Interp* interp;
+    Tcl_Channel chan;
+    int err;
     /* A validated artifact is materialized from this neutral byte image.
      * When imageBytes is non-NULL, chan is not read. */
-    const unsigned char *imageBytes;
-    Tcl_Size      imageLength;
-    Tcl_Size      imagePos;
-    uint64_t      absoluteOffset;
-    uint32_t      sourcePolicy;
-    Tcl_Size      executableSourceFieldCount;
-    Tcl_Size      nonemptyExecutableSourceFieldCount;
-    uint64_t      executableSourceBytes;
+    const unsigned char* imageBytes;
+    Tcl_Size imageLength;
+    Tcl_Size imagePos;
+    uint64_t absoluteOffset;
+    uint32_t sourcePolicy;
+    Tcl_Size executableSourceFieldCount;
+    Tcl_Size nonemptyExecutableSourceFieldCount;
+    uint64_t executableSourceBytes;
     unsigned char buf[TBCX_BUFSIZE];
-    Tcl_Size      bufPos;  /* next byte to consume */
-    Tcl_Size      bufFill; /* valid bytes in buf */
+    Tcl_Size bufPos;  /* next byte to consume */
+    Tcl_Size bufFill; /* valid bytes in buf */
 } TbcxIn;
 
-typedef enum TbcxExecSourceKind {
+typedef enum TbcxExecSourceKind
+{
     TBCX_EXEC_SOURCE_PROC,
     TBCX_EXEC_SOURCE_METHOD,
     TBCX_EXEC_SOURCE_BYTESRC,
@@ -435,65 +410,74 @@ typedef enum TbcxExecSourceKind {
 /* Interpreter-neutral, same-thread artifact blueprint.  The preflight parser
  * validates directly over these owned bytes and records policy/accounting;
  * materialization then starts a fresh TbcxIn over the same immutable image. */
-typedef struct TbcxArtifactImage {
-    Tcl_Size      refCount;
-    Tcl_ThreadId  ownerThread;
-    unsigned char *bytes;
-    Tcl_Size      length;
-    uint32_t      sourcePolicy;
-    Tcl_Size      executableSourceFieldCount;
-    Tcl_Size      nonemptyExecutableSourceFieldCount;
-    uint64_t      executableSourceBytes;
+typedef struct TbcxArtifactImage
+{
+    Tcl_Size refCount;
+    Tcl_ThreadId ownerThread;
+    unsigned char* bytes;
+    Tcl_Size length;
+    uint32_t sourcePolicy;
+    Tcl_Size executableSourceFieldCount;
+    Tcl_Size nonemptyExecutableSourceFieldCount;
+    uint64_t executableSourceBytes;
 } TbcxArtifactImage;
 
-typedef struct {
-    Tcl_Interp   *interp;
-    Tcl_Channel   chan;
-    int           err;
+typedef struct
+{
+    Tcl_Interp* interp;
+    Tcl_Channel chan;
+    int err;
     unsigned char buf[TBCX_BUFSIZE];
-    Tcl_Size      bufPos;     /* next free position in buf */
-    uint64_t      totalBytes; /* total bytes written (buf flushes + current bufPos) */
+    Tcl_Size bufPos;     /* next free position in buf */
+    uint64_t totalBytes; /* total bytes written (buf flushes + current bufPos) */
 } TbcxOut;
 
 /* ==========================================================================
  * Forward Declarations
  * ========================================================================== */
 
-int               Tbcx_BuildLocals(Tcl_Interp *ip, Tcl_Obj *argsList, CompiledLocal **firstOut, CompiledLocal **lastOut, Tcl_Size *numArgsOut);
-int               Tbcx_CheckBinaryChan(Tcl_Interp *ip, Tcl_Channel ch);
-Tcl_Namespace    *Tbcx_EnsureNamespace(Tcl_Interp *ip, const char *fqn);
-void              Tbcx_FreeLocals(CompiledLocal *first);
-int               Tbcx_ProbeOpenChannel(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_Channel *chPtr);
-int               Tbcx_ProbeReadableFile(Tcl_Interp *interp, Tcl_Obj *pathObj);
-void              Tbcx_R_Init(TbcxIn *r, Tcl_Interp *ip, Tcl_Channel ch);
-void              Tbcx_R_InitImage(TbcxIn *r, Tcl_Interp *ip, const TbcxArtifactImage *image);
-int               Tbcx_R_Bytes(TbcxIn *r, void *p, Tcl_Size n);
-int               Tbcx_R_AtEOF(TbcxIn *r);
-int               Tbcx_R_LPString(TbcxIn *r, char **sp, uint32_t *lenp);
-int               Tbcx_ReadExecutableSource(TbcxIn *r, TbcxExecSourceKind kind, char **sp, uint32_t *lenp);
-int               Tbcx_R_U32(TbcxIn *r, uint32_t *vp);
-int               Tbcx_R_U64(TbcxIn *r, uint64_t *vp);
-int               Tbcx_R_U8(TbcxIn *r, uint8_t *v);
-int               Tbcx_ValidateMethodMetadata(Tcl_Interp *ip, uint8_t kind, uint8_t scope, uint8_t origin);
-void              Tbcx_W_Init(TbcxOut *w, Tcl_Interp *ip, Tcl_Channel ch);
-int               Tbcx_W_Flush(TbcxOut *w);
-Tcl_Obj          *Tbcx_ReadBlock(TbcxIn *r, Tcl_Interp *ip, Namespace *nsForDefault, uint32_t *numLocalsOut, int setPrecompiled, int dumpOnly, uint32_t *topPolicyOut);
-int               Tbcx_ReadHeader(TbcxIn *r, TbcxHeader *H);
-int               Tbcx_ReadArtifactImage(Tcl_Interp *ip, Tcl_Channel ch, TbcxArtifactImage **imageOut);
-int               Tbcx_PreflightArtifact(Tcl_Interp *ip, TbcxArtifactImage *image);
-void              Tbcx_ArtifactImageRelease(TbcxArtifactImage *image);
-const char        *Tbcx_ExecSourceKindName(TbcxExecSourceKind kind);
-int               Tbcx_ValidateBlockPolicy(Tcl_Interp *ip, uint32_t policy);
+int Tbcx_BuildLocals(Tcl_Interp* ip, Tcl_Obj* argsList, CompiledLocal** firstOut, CompiledLocal** lastOut, Tcl_Size* numArgsOut);
+int Tbcx_CheckBinaryChan(Tcl_Interp* ip, Tcl_Channel ch);
+Tcl_Namespace* Tbcx_EnsureNamespace(Tcl_Interp* ip, const char* fqn);
+void Tbcx_FreeLocals(CompiledLocal* first);
+int Tbcx_ProbeOpenChannel(Tcl_Interp* interp, Tcl_Obj* obj, Tcl_Channel* chPtr);
+int Tbcx_ProbeReadableFile(Tcl_Interp* interp, Tcl_Obj* pathObj);
+void Tbcx_R_Init(TbcxIn* r, Tcl_Interp* ip, Tcl_Channel ch);
+void Tbcx_R_InitImage(TbcxIn* r, Tcl_Interp* ip, const TbcxArtifactImage* image);
+int Tbcx_R_Bytes(TbcxIn* r, void* p, Tcl_Size n);
+int Tbcx_R_AtEOF(TbcxIn* r);
+int Tbcx_R_LPString(TbcxIn* r, char** sp, uint32_t* lenp);
+int Tbcx_ReadExecutableSource(TbcxIn* r, TbcxExecSourceKind kind, char** sp, uint32_t* lenp);
+int Tbcx_R_U32(TbcxIn* r, uint32_t* vp);
+int Tbcx_R_U64(TbcxIn* r, uint64_t* vp);
+int Tbcx_R_U8(TbcxIn* r, uint8_t* v);
+int Tbcx_ValidateMethodMetadata(Tcl_Interp* ip, uint8_t kind, uint8_t scope, uint8_t origin);
+void Tbcx_W_Init(TbcxOut* w, Tcl_Interp* ip, Tcl_Channel ch);
+int Tbcx_W_Flush(TbcxOut* w);
+Tcl_Obj* Tbcx_ReadBlock(TbcxIn* r,
+                        Tcl_Interp* ip,
+                        Namespace* nsForDefault,
+                        uint32_t* numLocalsOut,
+                        int setPrecompiled,
+                        int dumpOnly,
+                        uint32_t* topPolicyOut);
+int Tbcx_ReadHeader(TbcxIn* r, TbcxHeader* H);
+int Tbcx_ReadArtifactImage(Tcl_Interp* ip, Tcl_Channel ch, TbcxArtifactImage** imageOut);
+int Tbcx_PreflightArtifact(Tcl_Interp* ip, TbcxArtifactImage* image);
+void Tbcx_ArtifactImageRelease(TbcxArtifactImage* image);
+const char* Tbcx_ExecSourceKindName(TbcxExecSourceKind kind);
+int Tbcx_ValidateBlockPolicy(Tcl_Interp* ip, uint32_t policy);
 #ifdef TBCX_BENCH_COUNTERS
-void              Tbcx_BenchUnsupportedCrossInterpReject(void);
+void Tbcx_BenchUnsupportedCrossInterpReject(void);
 #endif
-void              TbcxApplyShimPurgeAll(Tcl_Interp *ip);
-void              TbcxFixupByteCode(ByteCode *bc, Proc *proc, Tcl_Interp *ip, Namespace *ns, int cacheMode);
-int               TbcxVerifyLoadedBC(ByteCode *bc, Tcl_Interp *ip, const char *label);
+void TbcxApplyShimPurgeAll(Tcl_Interp* ip);
+void TbcxFixupByteCode(ByteCode* bc, Proc* proc, Tcl_Interp* ip, Namespace* ns, int cacheMode);
+int TbcxVerifyLoadedBC(ByteCode* bc, Tcl_Interp* ip, const char* label);
 
 /* Checked multiplication for allocation sizes.  Returns 1 on success
  * (result stored in *out), 0 if the multiplication would overflow size_t. */
-static inline int tbcx_checked_mul(size_t a, size_t b, size_t *out) {
+static inline int tbcx_checked_mul(size_t a, size_t b, size_t* out)
+{
     if (a != 0 && b > SIZE_MAX / a)
         return 0;
     *out = a * b;

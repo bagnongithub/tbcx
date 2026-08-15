@@ -1,17 +1,14 @@
 # -*-Tcl-*-
 # 31-regressions.test — assorted correctness checks.
 #
-#   A. List-literal first-element quoting: a constant-folded [list …] whose
-#      first element needs list-quoting (leading '#', leading space, embedded
-#      braces) must round-trip without re-quoting (a scalar carrying a parasitic
-#      list internal rep must not be re-serialized element-wise, e.g. "#aa" must
-#      not become "{#aa}").
+#   A. List-literal first-element quoting preserves the exact scalar and list
+#      representations.
 #
-#   B. TclOO in-body `export` visibility: a method exported via the `export`
-#      command INSIDE an `oo::class create {…}` / `oo::define {…}` body keeps its
-#      public visibility on load (PrecompClass restores both the export and the
-#      unexport direction), so a PascalCase callback (e.g. DoFlush) stays
-#      externally dispatchable.
+#   B. TclOO in-body export and unexport commands preserve method visibility.
+#
+#   C. Top-level compilation does not borrow the saver's procedure-local slots.
+#
+#   D. The literal classifier models local-array load and store stack effects.
 
 package require -exact tbcx 1.2.1
 package require tcltest 2.5
@@ -65,9 +62,7 @@ test regress.list.5 {list whose '#' is not first is unaffected} -body {
     tbcx::load $out
 } -result {bb #aa}
 
-# Lambda-misdetection variant of R2: a genuine 2-element DATA list whose first
-# element needs list-quoting AND whose second element looks script-like was
-# mis-serialized as a lambda, re-quoting the first element ("#a" -> "{{#a}}").
+# A two-element data list remains data when its second element is script-shaped.
 test regress.list.6 {lambda-shaped data list, leading '#' first elem, lindex} -body {
     set in  [makeFile {return [lindex [list "#a" "set x 1; puts hi"] 0]} regress.list.6-in.tcl]
     set out [makeFile "" regress.list.6-out.tbcx]
@@ -96,10 +91,7 @@ test regress.list.9 {genuine lambda still precompiles and executes} -body {
     tbcx::load $out
 } -result 7
 
-# 3-element lambda-shaped DATA list whose 3rd token is a NON-ABSOLUTE namespace.
-# Mis-serialized as LAMBDA_BC it makes the *whole file* fail to load
-# ("lambda namespace must be absolute") — the round-trip faithfulness guard must
-# reject any 3rd token that ReadLit_LambdaBC would not accept verbatim.
+# A lambda-shaped data list with a relative third element remains ordinary data.
 test regress.list.10 {3-elem data list, non-absolute 3rd token, loads} -body {
     set in  [makeFile {return [list {x} {do; it} "relative"]} regress.list.10-in.tcl]
     set out [makeFile "" regress.list.10-out.tbcx]
@@ -121,8 +113,7 @@ test regress.list.12 {3-elem data list, empty 3rd token, loads} -body {
     tbcx::load $out
 } -result {x {do; it} {}}
 
-# 3rd token exactly "::" — the loader collapses a global-namespace lambda to a
-# 2-element value, silently dropping the 3rd element.  Must round-trip verbatim.
+# A data-list third element equal to "::" is preserved verbatim.
 test regress.list.13 {3-elem data list, "::" 3rd token preserved} -body {
     set in  [makeFile {return [list {x} {do; it} "::"]} regress.list.13-in.tcl]
     set out [makeFile "" regress.list.13-out.tbcx]
@@ -130,8 +121,7 @@ test regress.list.13 {3-elem data list, "::" 3rd token preserved} -body {
     tbcx::load $out
 } -result {x {do; it} ::}
 
-# Counter-test: a genuine 3-element lambda with an ABSOLUTE namespace must STILL
-# serialize as LAMBDA_BC and execute (no over-correction).
+# A genuine three-element lambda retains its absolute namespace and executes.
 test regress.list.14 {genuine 3-elem lambda, absolute ns, executes} -body {
     set in  [makeFile {
         namespace eval ::regns { variable v 100 }
@@ -142,10 +132,8 @@ test regress.list.14 {genuine 3-elem lambda, absolute ns, executes} -body {
     tbcx::load $out
 } -result 105
 
-# Lambda-shaped DATA list whose arg has a DEFAULT with non-canonical bracing.
-# The codec writes defaults as separate literals and re-canonicalises {name
-# default} on load, so a quote-braced default ("x y") was silently re-quoted
-# ({x y}).  The faithfulness check must mirror the name+default split.
+# A lambda-shaped data list preserves noncanonical quoting in an argument
+# default.
 test regress.list.15 {lambda-shaped data list, quote-braced arg default preserved} -body {
     set in  [makeFile {return [list {{a "x y"}} {set z 1; puts $a}]} regress.list.15-in.tcl]
     set out [makeFile "" regress.list.15-out.tbcx]
@@ -153,7 +141,7 @@ test regress.list.15 {lambda-shaped data list, quote-braced arg default preserve
     tbcx::load $out
 } -result {{{a "x y"}} {set z 1; puts $a}}
 
-# Counter-test: a genuine lambda WITH a default still serializes/executes.
+# A genuine lambda with a default argument remains executable.
 test regress.list.16 {genuine lambda with arg default executes} -body {
     set in  [makeFile {return [apply {{a {b 5}} {expr {$a + $b}}} 10]} regress.list.16-in.tcl]
     set out [makeFile "" regress.list.16-out.tbcx]
@@ -220,29 +208,16 @@ test regress.export.4 {lowercase methods stay public (no over-correction)} -body
 } -result {ok cb}
 
 # ---------------------------------------------------------------------------
-# C. Top-level compiled at GLOBAL scope (no borrowed caller-frame locals).
-#    `tbcx::save` is frequently invoked from inside a proc (tcltest bodies and
-#    every save wrapper are procs).  Tcl decides whether `catch … e` / `set v …`
-#    may use compiled LOCALS via EnvHasLVT = (env->procPtr ||
-#    iPtr->varFramePtr->localCachePtr) — so a caller frame carrying a LocalCache
-#    made the saved script's TOP LEVEL compile to that proc's local slots
-#    (storeScalar/loadScalar %vN).  A serialized top-level carries no locals
-#    (numLocals=0), so those instructions indexed a non-existent local array and
-#    SIGSEGV'd at load.  The saver now hides the caller frame's LocalCache (and
-#    compiledProcPtr) for the top-level compile.
+# C. Top-level compilation does not borrow caller-frame locals.
 # ---------------------------------------------------------------------------
-# saveInProc: call tbcx::save from a frame that carries a LocalCache (this proc
-# has many compiled local variables, accessed so the cache is materialised) —
-# that is what made the saved top-level borrow proc-local slots.
+# saveInProc materializes a LocalCache before calling tbcx::save.
 proc saveInProc {in out} {
     set g0 0; set g1 1; set g2 2; set g3 3; set g4 4
     set g5 5; set g6 6; set g7 7; set g8 8; set g9 9
     incr g0 $g9; incr g1 $g8; incr g2 $g7
     tbcx::save $in $out
 }
-# loadFresh: load from the root frame of a fresh interp (where a corrupt
-# top-level referencing local slot N would index a non-existent local array
-# and crash).
+# loadFresh evaluates the artifact from a fresh interpreter's root frame.
 proc loadFresh {out} {
     set i [interp create]
     try {
@@ -268,5 +243,41 @@ test regress.toplevel.catch.options {top-level catch+result var (plain script) s
     saveInProc $in $out
     loadFresh $out
 } -result {1 boom}
+
+# ---------------------------------------------------------------------------
+# D. Literal-classifier local-array stack effects.
+# ---------------------------------------------------------------------------
+
+test regress.classifier.array-load-stack {many local-array reads do not overflow literal classification} -body {
+    set script "proc manyArrayReads {} {\n    array set base {key ok}\n"
+    for {set i 0} {$i < 160} {incr i} {
+        append script "    set value$i " {$base(key)} "\n"
+    }
+    append script {    return $value159
+}
+    append script "}\n"
+    append script {return [manyArrayReads]
+}
+    set in [makeFile $script regress.classifier.array-load-stack-in.tcl]
+    set out [makeFile "" regress.classifier.array-load-stack-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result ok
+
+test regress.classifier.array-store-stack {many local-array writes do not overflow literal classification} -body {
+    set script "proc manyArrayWrites {} {\n    array set base {}\n"
+    for {set i 0} {$i < 160} {incr i} {
+        append script "    set base(key$i) $i\n"
+    }
+    append script {    return $base(key159)
+}
+    append script "}\n"
+    append script {return [manyArrayWrites]
+}
+    set in [makeFile $script regress.classifier.array-store-stack-in.tcl]
+    set out [makeFile "" regress.classifier.array-store-stack-out.tbcx]
+    tbcx::save $in $out
+    tbcx::load $out
+} -result 159
 
 cleanupTests
