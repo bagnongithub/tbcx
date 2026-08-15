@@ -1,0 +1,254 @@
+# -*-Tcl-*-
+# 35-define-context.test — the definition-DSL context, and the words it must
+# not eat.
+#
+# THE DEFECT THIS FILE CLOSES.  A command NAME does not determine which command
+# will run.  TclOO gives `self` two unrelated meanings and the namespace the
+# body is evaluated in decides between them:
+#
+#   * in an `oo::define` / `oo::objdefine` body, `::oo::define::self` takes a
+#     SCRIPT — `self { method x {} {…} }`;
+#   * anywhere else — a method body, a proc, the top level —
+#     `::oo::Helpers::self` takes a DATA WORD — `[self caller]`.
+#
+# The saver classified the second as the first whenever `bc->procPtr == NULL`,
+# read as "not inside a method".  That proxy is FALSE for a nested script: a
+# method body carries a Proc, but the body of a `catch` / `if` / `while` /
+# `for` / `foreach` / `try` inside it is its own ByteCode with a NULL
+# `procPtr`.  So the subcommand word of every `[self caller]` written inside
+# one was classified as a script — and a literal all of whose uses are
+# executable is written out as the EMPTY STRING, because its original slot is
+# assumed unreachable.  The artifact then evaluated `self ""`:
+#
+#     ambiguous subcommand "": must be call, caller, class, filter, method,
+#     namespace, next, object, or target
+#
+# Two properties are therefore under test, and they pull in opposite
+# directions — which is the whole difficulty:
+#
+#   A. OUTSIDE a define body, a `self`/`private` operand is DATA and must
+#      survive the round trip byte-for-byte, however deeply nested the script
+#      that contains it.
+#   B. INSIDE a define body, those same words really do introduce scripts, and
+#      must still be compiled as such — including inside a nested script within
+#      that body, where the context has to be carried down rather than
+#      re-derived.
+#
+# Every arm compares against the VALUE the same source produces when `source`d,
+# never merely against "no error raised": the failure mode was a wrong value
+# quietly caught by the application's own `catch`.
+
+package require -exact tbcx 1.2.1
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+# Round-trip helper: write SCRIPT, save, load, return the result.
+#
+# `%U%` in the script is replaced by a per-arm suffix.  Every artifact runs in
+# THIS interpreter, so two arms that both created a class `K` would collide on
+# the second — a failure that looks like a defect in the saver and is not.
+set dctx_seq 0
+proc dctx_roundtrip {name script} {
+    global dctx_seq
+    set u [incr dctx_seq]
+    set script [string map [list %U% $u] $script]
+    set in  [makeFile $script $name-in.tcl]
+    set out [makeFile "" $name-out.tbcx]
+    tbcx::save $in $out
+    return [tbcx::load $out]
+}
+
+# ---------------------------------------------------------------------------
+# A. `[self SUBCOMMAND]` is DATA outside a define body
+# ---------------------------------------------------------------------------
+
+# The five nested-body kinds that reach the classifier with a NULL `procPtr`.
+# `direct` is the control: it always worked, so a green suite without it would
+# not prove the nested cases were the ones repaired.
+foreach {dctx_case dctx_body} {
+    direct    {return [lindex [self caller] 1]}
+    incatch   {catch {set r [lindex [self caller] 1]} e ; return $r}
+    inif      {if {1} { return [lindex [self caller] 1] }}
+    inwhile   {while {1} { return [lindex [self caller] 1] }}
+    inforeach {foreach x 1 { return [lindex [self caller] 1] }}
+    infor     {for {set i 0} {$i < 1} {incr i} { return [lindex [self caller] 1] }}
+    intry     {try { return [lindex [self caller] 1] } on error {e} { return ERR:$e }}
+} {
+    test define-context.self.$dctx_case \
+        "\[self caller\] in a $dctx_case body keeps its subcommand word" -body {
+        dctx_roundtrip define-context.self.$dctx_case [string map \
+            [list %BODY% $dctx_body] {
+            oo::class create K%U% { method m {} {%BODY%} }
+            oo::class create Caller%U% { method go {k} { return [$k m] } }
+            set k [K%U% new]
+            set c [Caller%U% new]
+            # The caller's OBJECT is element 1 of `self caller`; comparing
+            # against it proves the word `caller` arrived intact, since any
+            # other subcommand answers something else entirely.
+            return [expr {[$c go $k] eq $c ? "OK" : "WRONG"}]
+        }]
+    } -result OK
+}
+
+# It is not specific to `caller`: the defect is in how the SUBCOMMAND WORD is
+# classified, so every subcommand is exposed.
+test define-context.self.subcommands {every self subcommand survives a nested body} -body {
+    dctx_roundtrip define-context.self.subcommands {
+        oo::class create K%U% {
+            method m {} {
+                set out {}
+                catch {lappend out obj=[expr {[self object] eq [self]}]} e1
+                catch {lappend out cls=[expr {[self class] eq "::K%U%"}]} e2
+                catch {lappend out ns=[string match "::oo::*" [self namespace]]} e3
+                catch {lappend out meth=[self method]} e4
+                return [join $out " "]
+            }
+        }
+        return [[K%U% new] m]
+    }
+} -result {obj=1 cls=1 ns=1 meth=m}
+
+# The word is DATA, so it must also survive as data when nothing consumes it as
+# a subcommand at all.  A user command named `self` is already protected by the
+# authored-command table; this is the case that table cannot see, because the
+# command is supplied by the LOADING interpreter.
+test define-context.self.foreign-command {a foreign `self` keeps its operand} -setup {
+    set in  [makeFile {return [self caller]} define-context.self.foreign-in.tcl]
+    set out [makeFile "" define-context.self.foreign-out.tbcx]
+    tbcx::save $in $out
+    # Defined only NOW — at save time `self` was neither authored here nor a
+    # method helper, which is exactly when a name-only classifier guesses.
+    proc self {args} { return "ARGS=<[join $args |]>" }
+} -body {
+    tbcx::load $out
+} -cleanup {
+    rename self {}
+} -result {ARGS=<caller>}
+
+# `private` is the other DSL-only name in the body-command table, with the same
+# exposure: its FIRST operand is a script in a define body and data anywhere
+# else.
+test define-context.private.foreign-command {a foreign `private` keeps its operand} -setup {
+    set in  [makeFile {return [private caller extra]} define-context.private-in.tcl]
+    set out [makeFile "" define-context.private-out.tbcx]
+    tbcx::save $in $out
+    proc private {args} { return "ARGS=<[join $args |]>" }
+} -body {
+    tbcx::load $out
+} -cleanup {
+    rename private {}
+} -result {ARGS=<caller|extra>}
+
+# ---------------------------------------------------------------------------
+# B. Inside a define body the same words DO introduce scripts
+# ---------------------------------------------------------------------------
+
+test define-context.dsl.self-block {`self { … }` in a define body still builds} -body {
+    dctx_roundtrip define-context.dsl.self-block {
+        oo::class create K%U% {}
+        oo::define K%U% {
+            self {
+                method make {} { return "class-method" }
+            }
+        }
+        return [K%U% make]
+    }
+} -result {class-method}
+
+test define-context.dsl.self-method {`self method …` in a define body still builds} -body {
+    dctx_roundtrip define-context.dsl.self-method {
+        oo::class create K%U% {}
+        oo::define K%U% {
+            self method make {x} { return "made:$x" }
+        }
+        return [K%U% make 7]
+    }
+} -result {made:7}
+
+test define-context.dsl.objdefine {`self { … }` in an objdefine body still builds} -body {
+    dctx_roundtrip define-context.dsl.objdefine {
+        oo::class create K%U% {}
+        set o [K%U% new]
+        oo::objdefine $o {
+            method only {} { return "per-object" }
+        }
+        return [$o only]
+    }
+} -result {per-object}
+
+# THE CONTEXT IS CARRIED DOWN, NOT RE-DERIVED.  A define body may itself
+# contain a nested script; the DSL is still in scope inside it, so a rule that
+# only looked at the immediately-enclosing block would stop recognising the
+# builder here.
+test define-context.dsl.nested-script {the DSL survives a nested script in the body} -body {
+    dctx_roundtrip define-context.dsl.nested-script {
+        oo::class create K%U% {}
+        oo::define K%U% {
+            foreach n {a b} {
+                # The body is CONSTANT: `$n` exists while the define body runs,
+                # not when the method later does.
+                method m_$n {} { return "made" }
+            }
+            if {1} {
+                self {
+                    method cm {} { return "class-cm" }
+                }
+            }
+        }
+        set o [K%U% new]
+        return "[$o m_a] [$o m_b] [K%U% cm]"
+    }
+} -result {made made class-cm}
+
+test define-context.dsl.private {`private` in a define body still takes a script} -body {
+    dctx_roundtrip define-context.dsl.private {
+        oo::class create K%U% {
+            private {
+                method hidden {} { return "secret" }
+            }
+            method reveal {} { return [my hidden] }
+        }
+        return [[K%U% new] reveal]
+    }
+} -result {secret}
+
+# ---------------------------------------------------------------------------
+# C. The two contexts in ONE artifact
+# ---------------------------------------------------------------------------
+#
+# The regression that started this: a class whose define body uses the DSL and
+# whose method bodies use the introspection helper — inside nested scripts,
+# which is where the old classifier lost the word.  This is the shape of the
+# real application code that failed (`Decoration::set_owner` guarding on
+# `[lindex [self caller] 1]` inside a `catch`).
+test define-context.mixed {DSL and helper `self` in one artifact} -body {
+    dctx_roundtrip define-context.mixed {
+        oo::class create Owned%U% {
+            variable Owner
+            constructor {} { set Owner "" }
+            method set_owner {a} {
+                set caller ""
+                catch {set caller [lindex [self caller] 1]}
+                if {$caller ne $a} { error "not the owner" }
+                set Owner $a
+                return
+            }
+            method owner {} { return $Owner }
+        }
+        oo::define Owned%U% {
+            self {
+                method describe {} { return "Owned" }
+            }
+        }
+        oo::class create Keeper%U% {
+            method adopt {o} { $o set_owner [self] }
+        }
+        set o [Owned%U% new]
+        set k [Keeper%U% new]
+        $k adopt $o
+        set stranger [catch {$o set_owner $k} e]
+        return "[Owned%U% describe] owned=[expr {[$o owner] eq $k}] stranger=$stranger"
+    }
+} -result {Owned owned=1 stranger=1}
+
+cleanupTests
