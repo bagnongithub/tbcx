@@ -5159,6 +5159,17 @@ static Tcl_Obj* ReadLit_LambdaBC(TbcxIn* r, Tcl_Interp* ip, int depth, int dumpO
     /* Register in ApplyShim for shimmer recovery (skip in dump mode) */
     if (!dumpOnly)
     {
+        /* Match Tcl 9.1.0 SetLambdaFromAny: lambdas own an artificial
+         * Command, and TclGetLambdaFromObj dereferences its namespace.
+         * TclProcCleanupProc releases the command and namespace reference. */
+        Command* cmdPtr = (Command*)Tcl_Alloc(sizeof(Command));
+        memset(cmdPtr, 0, sizeof(*cmdPtr));
+        cmdPtr->nsPtr = nsPtr;
+        nsPtr->refCount++;
+        cmdPtr->objClientData2 = lambda;
+        cmdPtr->refCount = 1;
+        procPtr->cmdPtr = cmdPtr;
+        procPtr->flags = PROC_CMD_OWNED;
         RegisterPrecompiledLambda(ip, lambda, procPtr, nsObj);
         /* The registry now owns the Proc; release the construction ref. */
         assert(procPtr->refCount > 1);
